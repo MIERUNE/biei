@@ -1,0 +1,35 @@
+# Builds the linux/amd64 biei image natively on a Cloud Build worker and pushes
+# it to Artifact Registry. Native amd64 because GKE Autopilot in asia-northeast1
+# schedules amd64 (no T2A for Arm) and a QEMU amd64 cross-build on an Arm Mac is
+# slow. mbgl-core is precompiled (MLN_PRECOMPILE), so the build only compiles
+# biei's Rust + the cxx bridge.
+#
+#   gcloud builds submit --config demo-deploy/cloudbuild.yaml \
+#     --substitutions=_IMAGE=asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev .
+
+substitutions:
+  _IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev
+
+options:
+  # mbgl is precompiled, so 8 vCPU is enough for the remaining Rust + cxx bridge
+  # build. For free-tier-oriented builds, delete `machineType` to use the default
+  # e2-medium worker.
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 30
+
+timeout: 1800s
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1        # required for the `# syntax` + --mount=cache directives
+    args:
+      - build
+      - -f
+      - demo-deploy/Dockerfile
+      - -t
+      - ${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}
