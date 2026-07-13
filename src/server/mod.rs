@@ -26,6 +26,11 @@ use tracing::Instrument;
 
 pub(crate) type HttpError = (StatusCode, String);
 
+pub struct TerrainRuntimeConfig {
+    pub mapterhorn: Option<Arc<MapterhornResolver>>,
+    pub generation_concurrency: usize,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     membership: Membership,
@@ -38,6 +43,18 @@ pub struct AppState {
     /// Per-pod cache of transcoded MLT tiles, keyed by (tileset, tile id).
     /// Populated lazily on first `.mlt` request; see `server::tileset::mlt`.
     mlt_cache: moka::sync::Cache<(crate::interned::TilesetId, u64), bytes::Bytes>,
+    /// Generated contour/hillshade MVTs. Async cache initialization single-flights
+    /// the 3x3 source fetch and CPU generation for each derived tile.
+    derived_tile_cache:
+        moka::future::Cache<server::tileset::terrain::DerivedTileKey, crate::pmtiles::TileData>,
+    /// Decoded Terrarium DEM tiles, shared across derived products and
+    /// neighboring derived tiles (each 3x3 window overlaps its neighbors in six
+    /// of nine sources), so each source tile is WebP-decoded roughly once.
+    dem_tile_cache: moka::sync::Cache<
+        (crate::interned::TilesetId, u64),
+        Arc<server::tileset::terrain::dem::DemTile>,
+    >,
+    terrain_generation_semaphore: Arc<tokio::sync::Semaphore>,
     /// Mapterhorn composite resolver, when a composite tileset is configured.
     mapterhorn: Option<Arc<MapterhornResolver>>,
 }
@@ -50,8 +67,12 @@ impl AppState {
         drain: DrainController,
         provider: ProviderConfig,
         object_store_registry: Arc<ObjectStoreRegistry>,
-        mapterhorn: Option<Arc<MapterhornResolver>>,
+        terrain: TerrainRuntimeConfig,
     ) -> Self {
+        let TerrainRuntimeConfig {
+            mapterhorn,
+            generation_concurrency,
+        } = terrain;
         Self {
             membership,
             metrics,
@@ -69,6 +90,29 @@ impl AppState {
                     u32::try_from(value.len()).unwrap_or(u32::MAX)
                 })
                 .build(),
+            derived_tile_cache: moka::future::Cache::builder()
+                .max_capacity(128 * 1024 * 1024)
+                .weigher(
+                    |_key: &server::tileset::terrain::DerivedTileKey,
+                     value: &crate::pmtiles::TileData| {
+                        u32::try_from(value.bytes.len()).unwrap_or(u32::MAX)
+                    },
+                )
+                .build(),
+            // 64 MiB ≈ 64 decoded 512px DEM tiles (f32) — an 8x8-source-tile
+            // working set, plenty for a viewport of derived tiles.
+            dem_tile_cache: moka::sync::Cache::builder()
+                .max_capacity(64 * 1024 * 1024)
+                .weigher(
+                    |_key: &(crate::interned::TilesetId, u64),
+                     value: &Arc<server::tileset::terrain::dem::DemTile>| {
+                        u32::try_from(value.byte_size()).unwrap_or(u32::MAX)
+                    },
+                )
+                .build(),
+            terrain_generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                generation_concurrency.max(1),
+            )),
         }
     }
 }
@@ -84,6 +128,27 @@ impl AppState {
     /// The configured Mapterhorn composite resolver, if any.
     pub(crate) fn mapterhorn(&self) -> Option<&Arc<MapterhornResolver>> {
         self.mapterhorn.as_ref()
+    }
+
+    pub(crate) fn derived_tile_cache(
+        &self,
+    ) -> &moka::future::Cache<server::tileset::terrain::DerivedTileKey, crate::pmtiles::TileData>
+    {
+        &self.derived_tile_cache
+    }
+
+    /// Decoded-DEM cache backing derived terrain generation.
+    pub(crate) fn dem_tile_cache(
+        &self,
+    ) -> &moka::sync::Cache<
+        (crate::interned::TilesetId, u64),
+        Arc<server::tileset::terrain::dem::DemTile>,
+    > {
+        &self.dem_tile_cache
+    }
+
+    pub(crate) fn terrain_generation_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.terrain_generation_semaphore
     }
 }
 
@@ -131,6 +196,14 @@ fn public_router() -> Router<AppState> {
             "/tilesets/{tileset_id}/{z}/{x}/{y}",
             get(server::tileset::tile_handler),
         )
+        .route(
+            "/tilesets/{tileset_id}/derived/{product}",
+            get(server::tileset::derived_tilejson_handler),
+        )
+        .route(
+            "/tilesets/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+            get(server::tileset::derived_tile_handler),
+        )
         // Namespaced tileset keys ({namespace}/{tileset_id}). Static `preview`
         // / `preview.json` second segments take priority over the namespaced
         // TileJSON route, so they stay reachable as flat-tileset previews.
@@ -149,6 +222,14 @@ fn public_router() -> Router<AppState> {
         .route(
             "/tilesets/{namespace}/{tileset_id}/{z}/{x}/{y}",
             get(server::tileset::namespaced_tile_handler),
+        )
+        .route(
+            "/tilesets/{namespace}/{tileset_id}/derived/{product}",
+            get(server::tileset::namespaced_derived_tilejson_handler),
+        )
+        .route(
+            "/tilesets/{namespace}/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+            get(server::tileset::namespaced_derived_tile_handler),
         )
         .route("/styles/{*style_path}", get(server::style::style_handler))
         .route(

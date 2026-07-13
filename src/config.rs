@@ -38,6 +38,7 @@ pub struct Config {
     pub mapterhorn_maxzoom: Option<u8>,
     /// How long an absent Mapterhorn detail archive stays negative-cached.
     pub mapterhorn_negative_ttl: Duration,
+    pub terrain_generation_concurrency: usize,
 }
 
 /// CLI flags and environment variables for configuring the server.
@@ -124,6 +125,13 @@ pub struct Cli {
         default_value_t = 3600
     )]
     mapterhorn_negative_ttl_secs: u64,
+    /// Maximum number of contour/hillshade tiles generated concurrently per pod.
+    #[arg(
+        long = "terrain-generation-concurrency",
+        env = "ISKR_TERRAIN_GENERATION_CONCURRENCY",
+        default_value_t = 2
+    )]
+    terrain_generation_concurrency: usize,
 }
 
 impl Config {
@@ -215,6 +223,7 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             mapterhorn_maxzoom: cli.mapterhorn_maxzoom,
             mapterhorn_negative_ttl: Duration::from_secs(cli.mapterhorn_negative_ttl_secs),
+            terrain_generation_concurrency: cli.terrain_generation_concurrency.max(1),
         })
     }
 }
@@ -257,6 +266,7 @@ mod tests {
             mapterhorn_tileset: None,
             mapterhorn_maxzoom: None,
             mapterhorn_negative_ttl_secs: 3600,
+            terrain_generation_concurrency: 2,
         }
     }
 
@@ -290,6 +300,7 @@ mod tests {
 
         assert_eq!(config.internal_listen_addr, "0.0.0.0:9090".parse().unwrap());
         assert!(config.membership.seed_nodes.is_empty());
+        assert_eq!(config.terrain_generation_concurrency, 2);
     }
 
     #[test]

@@ -93,10 +93,14 @@ async fn serve_preview(
         .await
         .map_err(|e| tileset_error_response(&e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tileset not found".to_string()))?;
+    let is_mapterhorn = state
+        .mapterhorn()
+        .is_some_and(|resolver| resolver.matches(&tileset_id));
     let html = preview_html(
         &tileset_id,
         query.encoding.as_deref(),
         info.header.tile_type,
+        is_mapterhorn,
     );
     debug!(
         endpoint = "preview",
@@ -153,12 +157,14 @@ async fn serve_preview_style(
         .mapterhorn()
         .filter(|resolver| resolver.matches(&tileset_id))
         .map(|resolver| resolver.maxzoom());
+    let is_mapterhorn = maxzoom_override.is_some();
     let style = preview_style(
         &tileset_id,
         &base_url,
         &info,
         query.encoding.as_deref(),
         maxzoom_override,
+        is_mapterhorn,
     );
     debug!(
         endpoint = "preview_style",
@@ -174,6 +180,7 @@ pub(crate) fn render_preview_html(
     style_url: &str,
     terrain_control: &str,
     format_toggle: bool,
+    terrain_products: bool,
 ) -> String {
     PREVIEW_HTML_TEMPLATE
         .replace("__TITLE__", title)
@@ -184,9 +191,18 @@ pub(crate) fn render_preview_html(
             "__FORMAT_TOGGLE__",
             if format_toggle { "true" } else { "false" },
         )
+        .replace(
+            "__TERRAIN_PRODUCTS__",
+            if terrain_products { "true" } else { "false" },
+        )
 }
 
-fn preview_html(tileset_id: &TilesetId, encoding: Option<&str>, tile_type: TileType) -> String {
+fn preview_html(
+    tileset_id: &TilesetId,
+    encoding: Option<&str>,
+    tile_type: TileType,
+    is_mapterhorn: bool,
+) -> String {
     let is_vector = !matches!(
         tile_type,
         TileType::Png | TileType::Jpeg | TileType::Webp | TileType::Avif
@@ -200,7 +216,14 @@ fn preview_html(tileset_id: &TilesetId, encoding: Option<&str>, tile_type: TileT
             "mvt"
         };
         let style_url = format!("/tilesets/{tileset_id}/preview.json?encoding={fmt}");
-        return render_preview_html(&title, &style_url, "", true);
+        return render_preview_html(&title, &style_url, "", true, false);
+    }
+    if is_mapterhorn {
+        let style_url = format!(
+            "/tilesets/{tileset_id}/preview.json?v={}",
+            super::terrain::DERIVED_TILE_REVISION
+        );
+        return render_preview_html(&title, &style_url, "", false, true);
     }
     // Raster / raster-dem: `encoding` selects the DEM hillshade scheme, no toggle.
     let style_url = match encoding {
@@ -212,7 +235,7 @@ fn preview_html(tileset_id: &TilesetId, encoding: Option<&str>, tile_type: TileT
     } else {
         ""
     };
-    render_preview_html(&title, &style_url, terrain_control, false)
+    render_preview_html(&title, &style_url, terrain_control, false, false)
 }
 
 fn preview_style(
@@ -221,7 +244,16 @@ fn preview_style(
     info: &TilesetInfo,
     encoding: Option<&str>,
     maxzoom_override: Option<u8>,
+    is_mapterhorn: bool,
 ) -> Value {
+    if is_mapterhorn {
+        return preview_style_mapterhorn(
+            tileset_id,
+            base_url,
+            info,
+            maxzoom_override.unwrap_or(info.header.max_zoom),
+        );
+    }
     match info.header.tile_type {
         TileType::Png | TileType::Jpeg | TileType::Webp | TileType::Avif => {
             if let Some(dem) = encoding.and_then(DemEncoding::from_str) {
@@ -232,6 +264,159 @@ fn preview_style(
         }
         _ => preview_style_vector(tileset_id, base_url, info, encoding, maxzoom_override),
     }
+}
+
+fn preview_style_mapterhorn(
+    tileset_id: &TilesetId,
+    base_url: &str,
+    info: &TilesetInfo,
+    maxzoom: u8,
+) -> Value {
+    let shade_opacity = |shadow| {
+        let mut expression = vec![json!("match"), json!(["get", "level"])];
+        for (level, opacity) in super::terrain::hillshade_opacity_stops(shadow) {
+            expression.push(json!(level));
+            expression.push(json!(opacity));
+        }
+        expression.push(json!(0));
+        Value::Array(expression)
+    };
+    let shadow_opacity = shade_opacity(true);
+    let highlight_opacity = shade_opacity(false);
+    let terrain_tiles = format!("{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}.webp");
+    let derived_tiles = |product: &str| {
+        format!(
+            "{base_url}/tilesets/{tileset_id}/derived/{product}/{{z}}/{{x}}/{{y}}.mvt?v={}",
+            super::terrain::DERIVED_TILE_REVISION
+        )
+    };
+    json!({
+        "version": 8,
+        "name": format!("preview - {tileset_id}"),
+        "center": [info.header.center_longitude, info.header.center_latitude],
+        "zoom": info.header.center_zoom,
+        "sources": {
+            "raw-terrain": {
+                "type": "raster",
+                "tiles": [terrain_tiles],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": maxzoom,
+                "tileSize": 512
+            },
+            "terrain-dem": {
+                "type": "raster-dem",
+                "tiles": [terrain_tiles],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": maxzoom,
+                "tileSize": 512,
+                "encoding": "terrarium"
+            },
+            "vector-hillshade": {
+                "type": "vector",
+                "tiles": [derived_tiles("hillshade")],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": maxzoom
+            },
+            "isolines": {
+                "type": "vector",
+                "tiles": [derived_tiles("contours")],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": maxzoom
+            }
+        },
+        "layers": [
+            {
+                "id": "terrain-background",
+                "type": "background",
+                "paint": { "background-color": "#c9ccca" }
+            },
+            {
+                "id": "raw-raster",
+                "type": "raster",
+                "source": "raw-terrain",
+                "layout": { "visibility": "none" },
+                "paint": { "raster-resampling": "linear" }
+            },
+            {
+                "id": "raster-hillshade",
+                "type": "hillshade",
+                "source": "terrain-dem",
+                "paint": {
+                    "hillshade-illumination-direction": 315,
+                    "hillshade-illumination-anchor": "map",
+                    "hillshade-method": "standard",
+                    "hillshade-exaggeration": 0.5,
+                    "hillshade-shadow-color": "#253033",
+                    "hillshade-highlight-color": "#ffffff",
+                    "hillshade-accent-color": "#657074"
+                }
+            },
+            {
+                "id": "vector-hillshade-shadow",
+                "type": "fill",
+                "source": "vector-hillshade",
+                "source-layer": "hillshade",
+                "filter": ["==", ["get", "class"], "shadow"],
+                "layout": { "visibility": "none" },
+                "paint": {
+                    "fill-color": "#253033",
+                    "fill-outline-color": "rgba(0, 0, 0, 0)",
+                    "fill-opacity": shadow_opacity,
+                    "fill-antialias": true
+                }
+            },
+            {
+                "id": "vector-hillshade-highlight",
+                "type": "fill",
+                "source": "vector-hillshade",
+                "source-layer": "hillshade",
+                "filter": ["==", ["get", "class"], "highlight"],
+                "layout": { "visibility": "none" },
+                "paint": {
+                    "fill-color": "#ffffff",
+                    "fill-outline-color": "rgba(0, 0, 0, 0)",
+                    "fill-opacity": highlight_opacity,
+                    "fill-antialias": true
+                }
+            },
+            {
+                "id": "isolines",
+                "type": "line",
+                "source": "isolines",
+                "source-layer": "contours",
+                "layout": { "visibility": "none" },
+                "paint": {
+                    "line-color": "#273238",
+                    "line-opacity": 0.82,
+                    "line-width": ["match", ["get", "level"], 1, 1.35, 0.7]
+                }
+            },
+            {
+                "id": "isoline-labels",
+                "type": "symbol",
+                "source": "isolines",
+                "source-layer": "contours",
+                "filter": ["==", ["get", "level"], 1],
+                "layout": {
+                    "visibility": "none",
+                    "symbol-placement": "line",
+                    "symbol-spacing": 180,
+                    "text-field": ["concat", ["to-string", ["get", "ele"]], " m"],
+                    "text-font": ["Noto Sans", "Arial", "Helvetica", "sans-serif"],
+                    "text-size": 11,
+                    "text-max-angle": 35,
+                    "text-padding": 4,
+                    "text-keep-upright": true
+                },
+                "paint": {
+                    "text-color": "#20292c",
+                    "text-halo-color": "rgba(235, 238, 236, 0.9)",
+                    "text-halo-width": 1.25,
+                    "text-halo-blur": 0.5
+                }
+            }
+        ]
+    })
 }
 
 fn preview_style_dem(
@@ -546,11 +731,12 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::{BufMut, BytesMut};
+    use serde_json::json;
 
-    use super::preview_style;
+    use super::{preview_html, preview_style};
     use crate::{
         interned::TilesetId,
-        pmtiles::{Header, Metadata},
+        pmtiles::{Header, Metadata, TileType},
         storage::TilesetInfo,
     };
 
@@ -595,6 +781,7 @@ mod tests {
             &info(4),
             Some("terrarium"),
             Some(16),
+            false,
         );
 
         assert_eq!(style["sources"]["dem"]["maxzoom"], 16);
@@ -609,8 +796,103 @@ mod tests {
             &info(1),
             None,
             Some(16),
+            false,
         );
 
         assert_eq!(style["sources"]["preview"]["maxzoom"], 16);
+    }
+
+    #[test]
+    fn mapterhorn_preview_exposes_all_terrain_products() {
+        let tileset_id =
+            TilesetId::try_from("mapterhorn/planet".to_string()).expect("valid tileset id");
+        let style = preview_style(
+            &tileset_id,
+            "https://ishikari.example",
+            &info(4),
+            None,
+            Some(17),
+            true,
+        );
+
+        assert_eq!(style["sources"]["raw-terrain"]["tileSize"], 512);
+        assert_eq!(style["sources"]["terrain-dem"]["encoding"], "terrarium");
+        assert_eq!(style["sources"]["vector-hillshade"]["maxzoom"], 17);
+        assert_eq!(
+            style["sources"]["isolines"]["tiles"][0],
+            format!(
+                "https://ishikari.example/tilesets/mapterhorn/planet/derived/contours/{{z}}/{{x}}/{{y}}.mvt?v={}",
+                super::super::terrain::DERIVED_TILE_REVISION
+            )
+        );
+        let layer_ids = style["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|layer| layer["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(layer_ids.contains(&"raw-raster"));
+        assert!(layer_ids.contains(&"raster-hillshade"));
+        assert!(layer_ids.contains(&"vector-hillshade-shadow"));
+        assert!(layer_ids.contains(&"vector-hillshade-highlight"));
+        assert!(layer_ids.contains(&"isolines"));
+        assert!(layer_ids.contains(&"isoline-labels"));
+        let layer = |id| {
+            style["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|layer| layer["id"] == id)
+                .unwrap()
+        };
+        assert_eq!(layer("raw-raster")["layout"]["visibility"], "none");
+        assert!(layer("raster-hillshade")["layout"].is_null());
+        assert_eq!(
+            layer("isoline-labels")["layout"]["text-field"],
+            json!(["concat", ["to-string", ["get", "ele"]], " m"])
+        );
+        assert_eq!(
+            layer("isoline-labels")["filter"],
+            json!(["==", ["get", "level"], 1])
+        );
+        assert_eq!(layer("isoline-labels")["layout"]["symbol-spacing"], 180);
+        let mut level_counts = Vec::new();
+        for layer_id in ["vector-hillshade-shadow", "vector-hillshade-highlight"] {
+            let layer = layer(layer_id);
+            assert_eq!(layer["paint"]["fill-outline-color"], "rgba(0, 0, 0, 0)");
+            assert_eq!(layer["paint"]["fill-antialias"], true);
+            let opacity = layer["paint"]["fill-opacity"].as_array().unwrap();
+            level_counts.push((opacity.len() - 3) / 2);
+        }
+        let expected_levels = super::super::terrain::hillshade_opacity_stops(true).len()
+            + super::super::terrain::hillshade_opacity_stops(false).len();
+        assert_eq!(level_counts.iter().sum::<usize>(), expected_levels);
+        assert!(level_counts[0] > level_counts[1]);
+        assert_eq!(
+            layer("raster-hillshade")["paint"]["hillshade-illumination-anchor"],
+            "map"
+        );
+        assert_eq!(
+            layer("raster-hillshade")["paint"]["hillshade-exaggeration"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn terrain_controls_are_enabled_only_for_mapterhorn_preview() {
+        let tileset_id = TilesetId::new_unchecked("mapterhorn/planet");
+        let mapterhorn = preview_html(&tileset_id, None, TileType::Webp, true);
+        let ordinary = preview_html(&tileset_id, None, TileType::Webp, false);
+
+        assert!(mapterhorn.contains("const TERRAIN_PRODUCTS = true"));
+        assert!(mapterhorn.contains("Vector hillshade"));
+        assert!(mapterhorn.contains("let terrainMode = \"hillshade\""));
+        let hillshade = mapterhorn.find("[\"hillshade\", \"Hillshade\"]").unwrap();
+        let raw = mapterhorn.find("[\"raw\", \"Raw raster\"]").unwrap();
+        let vector = mapterhorn
+            .find("[\"vector\", \"Vector hillshade\"]")
+            .unwrap();
+        assert!(hillshade < vector && vector < raw);
+        assert!(ordinary.contains("const TERRAIN_PRODUCTS = false"));
     }
 }

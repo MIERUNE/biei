@@ -14,11 +14,13 @@ bytes = "1"
 chitchat = "0.11"
 clap = { version = "4.6", features = ["derive", "env"] }
 fast_hilbert = "2"
+fast-mvt = { version = "0.4", default-features = false, features = ["writer"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", default-features = false, features = ["webp"] }
 internment = { version = "0.8", default-features = false, features = ["arc"] }
 mlt-core = { version = "0.12", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
-object_store = { version = "0.13", features = ["aws", "gcp", "http"] }
+object_store = { version = "0.14", features = ["aws", "gcp", "http"] }
 prometheus = "0.14"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2"] }
 serde = { version = "1", features = ["derive"] }

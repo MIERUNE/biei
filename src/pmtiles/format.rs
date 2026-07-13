@@ -13,6 +13,7 @@ const MAX_TILE_ID: u64 = 6_148_914_691_236_517_204;
 pub(crate) const MLT_CONTENT_TYPE: &str = "application/vnd.maplibre-tile";
 
 /// Tile payload bytes and the HTTP metadata needed to serve them.
+#[derive(Clone)]
 pub struct TileData {
     pub bytes: Bytes,
     pub content_type: &'static str,

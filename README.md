@@ -9,6 +9,9 @@ Ishikari focuses on large-scale PMTiles serving workloads:
 
 - **Backend request batching** - reduces object storage requests, traffic, and latency.
 - **Distributed cache** - uses gossip membership, locality-aware routing, and caching tuned for Hilbert-sorted PMTiles archives.
+- Other features worth mentioning
+  - Generate vectorized hillshade from raster DEM
+  - Generate contours (isolines) from raster DEM
 
 LICENSE: MIT OR Apache-2.0
 

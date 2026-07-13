@@ -10,7 +10,7 @@ use ishikari::{
     membership::Membership,
     metrics::NodeMetrics,
     server::{
-        AppState, provider::ProviderConfig, run_http_server,
+        AppState, TerrainRuntimeConfig, provider::ProviderConfig, run_http_server,
         tileset::mapterhorn::MapterhornResolver,
     },
     storage::{ObjectStoreRegistry, ResourceResolver, ResourceResolverConfig},
@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         max_fetch_chunks = config.max_fetch_chunks,
         artificial_backend_delay_ms = config.artificial_backend_delay_ms,
         tile_cache_max_bytes = config.tile_cache_max_bytes,
+        terrain_generation_concurrency = config.terrain_generation_concurrency,
         "starting node"
     );
 
@@ -116,7 +117,10 @@ async fn main() -> Result<()> {
             drain.clone(),
             provider,
             object_store_registry,
-            mapterhorn,
+            TerrainRuntimeConfig {
+                mapterhorn,
+                generation_concurrency: config.terrain_generation_concurrency,
+            },
         ),
         config.http_listen_addr,
         config.internal_listen_addr,

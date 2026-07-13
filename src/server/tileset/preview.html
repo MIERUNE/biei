@@ -21,6 +21,70 @@
                 padding: 8px 10px;
                 border-radius: 6px;
                 font: 12px/1.4 sans-serif;
+                box-sizing: border-box;
+                max-width: calc(100vw - 76px);
+            }
+            .preview-controls {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-top: 7px;
+            }
+            .preview-segmented {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                overflow: hidden;
+                border: 1px solid #b8bec1;
+                border-radius: 5px;
+            }
+            .preview-segmented button {
+                min-height: 28px;
+                border: 0;
+                border-right: 1px solid #b8bec1;
+                padding: 3px 9px;
+                background: #fff;
+                color: #30373a;
+                cursor: pointer;
+                font: inherit;
+                white-space: nowrap;
+            }
+            .preview-segmented button:last-child {
+                border-right: 0;
+            }
+            .preview-segmented button[aria-pressed="true"] {
+                background: #2f5550;
+                color: #fff;
+            }
+            .preview-switch {
+                display: inline-flex;
+                min-height: 28px;
+                align-items: center;
+                gap: 5px;
+                padding: 0 7px;
+                border: 1px solid #b8bec1;
+                border-radius: 5px;
+                background: #fff;
+                color: #30373a;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .preview-switch input {
+                margin: 0;
+            }
+            @media (max-width: 560px) {
+                .preview-controls {
+                    flex-direction: column;
+                    align-items: stretch;
+                    gap: 6px;
+                }
+                .preview-segmented button {
+                    padding-right: 5px;
+                    padding-left: 5px;
+                    white-space: normal;
+                }
+                .preview-switch {
+                    width: fit-content;
+                }
             }
             .feature-popup .maplibregl-popup-content {
                 max-width: 320px;
@@ -75,12 +139,13 @@
             // maplibre-gl 6.x is ESM-only (no UMD global) and exposes named
             // exports, so import the namespace as `maplibregl`.
             import * as maplibregl from "https://unpkg.com/maplibre-gl@__MAPLIBRE_GL_VERSION__/dist/maplibre-gl.mjs";
+            const TERRAIN_PRODUCTS = __TERRAIN_PRODUCTS__;
             const map = new maplibregl.Map({
                 container: "map",
                 style: "__STYLE_URL__",
                 hash: true,
             });
-            map.showTileBoundaries = true;
+            map.showTileBoundaries = !TERRAIN_PRODUCTS;
             const popup = new maplibregl.Popup({
                 closeButton: false,
                 closeOnClick: false,
@@ -91,6 +156,69 @@
             map.addControl(new maplibregl.NavigationControl(), "top-right");
             map.addControl(new maplibregl.GlobeControl(), "top-right");
             __TERRAIN_CONTROL__
+
+            if (TERRAIN_PRODUCTS) {
+                const overlay = document.querySelector(".overlay") || document.body;
+                const controls = document.createElement("div");
+                controls.className = "preview-controls";
+
+                const segmented = document.createElement("div");
+                segmented.className = "preview-segmented";
+                segmented.setAttribute("role", "group");
+                segmented.setAttribute("aria-label", "Terrain display");
+                controls.appendChild(segmented);
+
+                let terrainMode = "hillshade";
+                let isolinesEnabled = false;
+                const modeButtons = [];
+                const layerVisibility = (layerId, visible) => {
+                    if (map.getLayer(layerId)) {
+                        map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
+                    }
+                };
+                const applyTerrainDisplay = () => {
+                    layerVisibility("raw-raster", terrainMode === "raw");
+                    layerVisibility("raster-hillshade", terrainMode === "hillshade");
+                    layerVisibility("vector-hillshade-shadow", terrainMode === "vector");
+                    layerVisibility("vector-hillshade-highlight", terrainMode === "vector");
+                    layerVisibility("isolines", isolinesEnabled);
+                    layerVisibility("isoline-labels", isolinesEnabled);
+                    modeButtons.forEach((button) =>
+                        button.setAttribute("aria-pressed", String(button.dataset.mode === terrainMode)),
+                    );
+                };
+
+                for (const [mode, label] of [
+                    ["hillshade", "Hillshade"],
+                    ["vector", "Vector hillshade"],
+                    ["raw", "Raw raster"],
+                ]) {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.textContent = label;
+                    button.dataset.mode = mode;
+                    button.setAttribute("aria-pressed", String(mode === terrainMode));
+                    button.addEventListener("click", () => {
+                        terrainMode = mode;
+                        applyTerrainDisplay();
+                    });
+                    modeButtons.push(button);
+                    segmented.appendChild(button);
+                }
+
+                const isolineSwitch = document.createElement("label");
+                isolineSwitch.className = "preview-switch";
+                const isolineInput = document.createElement("input");
+                isolineInput.type = "checkbox";
+                isolineInput.addEventListener("change", () => {
+                    isolinesEnabled = isolineInput.checked;
+                    applyTerrainDisplay();
+                });
+                isolineSwitch.append(isolineInput, document.createTextNode("Isolines"));
+                controls.appendChild(isolineSwitch);
+                overlay.appendChild(controls);
+                map.on("load", applyTerrainDisplay);
+            }
 
             // MVT/MLT tile-format toggle (vector previews only). Reloads the
             // style with the source pointed at `?encoding=mvt|mlt`.

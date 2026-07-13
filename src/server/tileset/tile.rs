@@ -130,7 +130,7 @@ async fn serve_tile(
 /// Mapterhorn composite rules. Returns the archive's tileset id to serve, or
 /// `None` to respond 404 (a z>12 detail region with no detail archive). Tiles
 /// that aren't the composite tileset pass straight through.
-async fn resolve_archive(
+pub(super) async fn resolve_archive(
     state: &AppState,
     tileset_id: TilesetId,
     z: u8,
@@ -174,6 +174,14 @@ async fn resolve_archive(
             Err(tileset_error_response(&error))
         }
     }
+}
+
+/// Builds the standard tile payload response, including transport encoding and
+/// the public tile cache policy. Shared by stored and generated tile products.
+pub(super) fn tile_data_response(tile: TileData) -> Response {
+    TilesetResponse::from(tile)
+        .with_cache_control(cache::TILE)
+        .into_response()
 }
 
 /// Serves the internal tile endpoint used for node-to-node forwarding.

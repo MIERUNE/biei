@@ -81,7 +81,7 @@ fn serve_style_preview(style_key: &str) -> Result<Response, HttpError> {
         "/styles/{}/style.json?encoding=mvt",
         path_percent_encode_segments(style_key)
     );
-    let html = render_preview_html(&format!("style {style_key}"), &style_url, "", true);
+    let html = render_preview_html(&format!("style {style_key}"), &style_url, "", true, false);
     Ok(([(header::CACHE_CONTROL, cache::PREVIEW)], Html(html)).into_response())
 }
 

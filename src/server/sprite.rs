@@ -102,7 +102,7 @@ async fn fetch_sprite_bytes_local(
         SPRITE_JSON_CONTENT_TYPES
     };
     let body = fetch_limited_bytes_with_content_type(
-        &state,
+        state,
         upstream,
         max_bytes,
         "sprite",
