@@ -20,6 +20,12 @@ use crate::types::{
 };
 use crate::worker::{WorkerCmd, worker_loop};
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PickTier {
     WarmComfort,
@@ -145,9 +151,9 @@ pub struct PoolSnapshotter {
 
 impl PoolSnapshotter {
     /// Encode current per-slot (loaded_profile, queue) into a flat KV map
-    /// suitable for `GossipBus::set` calls.
+    /// suitable for a batched `GossipBus::set_many` call.
     pub fn snapshot_kvs(&self) -> NodeKvs {
-        let s = self.state.lock().expect("pool state poisoned");
+        let s = lock_unpoisoned(&self.state);
         let mut out = NodeKvs::new();
         for (i, qd) in self.queue_depths.iter().enumerate() {
             let depth = qd.load(Ordering::Relaxed);
@@ -158,7 +164,7 @@ impl PoolSnapshotter {
     }
 
     pub fn snapshot_workers(&self) -> Vec<WorkerView> {
-        let s = self.state.lock().expect("pool state poisoned");
+        let s = lock_unpoisoned(&self.state);
         self.queue_depths
             .iter()
             .enumerate()
@@ -287,7 +293,7 @@ impl WorkerPool {
     ///   5. Transient overload: warm-for-profile up to admission cap.
     ///   6. Fallback: saturated warm-for-profile → reject path.
     fn pick_local(&self, task: &InternalTask, prepared_profile: Option<&PreparedProfile>) -> usize {
-        let s = self.state.lock().expect("pool state poisoned");
+        let s = lock_unpoisoned(&self.state);
         let queue_depths: Vec<usize> = (0..self.workers.len()).map(|i| self.queue_at(i)).collect();
         let task_profile = task.worker_profile();
         let profile_counts = profile_counts(&s.loaded);
@@ -353,7 +359,7 @@ impl WorkerPool {
             .map(|source| source.stable_source_id());
         self.activity.record(task_profile.clone(), Instant::now());
         {
-            let mut s = self.state.lock().expect("pool state poisoned");
+            let mut s = lock_unpoisoned(&self.state);
             s.mark_loaded(idx, task_profile);
             if let Some(source_id) = addlayer_source_id {
                 s.mark_addlayer_source(idx, source_id);
@@ -382,13 +388,13 @@ impl WorkerPool {
                     crate::types::TaskResult::Failed { .. }
                         | crate::types::TaskResult::Rejected { .. }
                 ) {
-                    let mut s = self.state.lock().expect("pool state poisoned");
+                    let mut s = lock_unpoisoned(&self.state);
                     s.clear_loaded(idx);
                 }
                 Ok(outcome)
             }
             Err(_) => {
-                let mut s = self.state.lock().expect("pool state poisoned");
+                let mut s = lock_unpoisoned(&self.state);
                 s.clear_loaded(idx);
                 Err(ProcessError::QueueDisconnected)
             }
@@ -886,7 +892,7 @@ mod tests {
             crate::types::TaskResult::Failed { .. }
         ));
         {
-            let state = pool.state.lock().expect("pool state poisoned");
+            let state = lock_unpoisoned(&pool.state);
             assert_eq!(state.loaded[0], None);
         }
         pool.shutdown().await;
@@ -950,7 +956,7 @@ mod tests {
             }
         ));
         {
-            let state = pool.state.lock().expect("pool state poisoned");
+            let state = lock_unpoisoned(&pool.state);
             assert_eq!(state.loaded[0], None);
         }
         pool.shutdown().await;

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -15,17 +15,19 @@ use chitchat::transport::UdpTransport;
 use chitchat::{
     ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState, spawn_chitchat,
 };
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::gossip::GossipBus;
 use crate::options::Options;
-use crate::types::{ClusterView, NodeId, NodeStateView};
+use crate::types::{ClusterView, NodeId, NodeKvs, NodeStateView};
 
 const CLUSTER_ID: &str = "biei-production-v1";
 const KV_NODE_ID: &str = "node-id";
 const KV_ADVERTISE_ADDR: &str = "advertise-addr";
 const KV_DRAINING: &str = "draining";
 const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(300);
+const PEER_ADDRESS_CACHE_TTL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct Membership {
@@ -36,6 +38,40 @@ struct MembershipInner {
     self_node_id: NodeId,
     handle: ChitchatHandle,
     requires_peer_for_readiness: bool,
+    peer_addresses: Mutex<PeerAddressCacheState>,
+    peer_addresses_changed: Notify,
+}
+
+struct CachedPeerAddresses {
+    expires_at: Instant,
+    addresses: HashMap<NodeId, SocketAddr>,
+}
+
+#[derive(Default)]
+struct PeerAddressCacheState {
+    snapshot: Option<CachedPeerAddresses>,
+    refreshing: bool,
+}
+
+struct PeerAddressRefreshGuard {
+    inner: Arc<MembershipInner>,
+    completed: bool,
+}
+
+impl Drop for PeerAddressRefreshGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self
+            .inner
+            .peer_addresses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.refreshing = false;
+        drop(state);
+        self.inner.peer_addresses_changed.notify_waiters();
+    }
 }
 
 impl Membership {
@@ -94,6 +130,8 @@ impl Membership {
                 self_node_id: options.node_id.clone(),
                 handle,
                 requires_peer_for_readiness: !options.gossip_seeds.is_empty(),
+                peer_addresses: Mutex::new(PeerAddressCacheState::default()),
+                peer_addresses_changed: Notify::new(),
             }),
         })
     }
@@ -109,19 +147,83 @@ impl Membership {
     }
 
     pub async fn advertise_addr_of(&self, node_id: &NodeId) -> Option<SocketAddr> {
+        enum Lookup {
+            Return(Option<SocketAddr>),
+            Refresh,
+            Wait,
+        }
+
+        loop {
+            let notified = self.inner.peer_addresses_changed.notified();
+            let lookup = {
+                let mut state = self
+                    .inner
+                    .peer_addresses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match state.snapshot.as_ref() {
+                    Some(snapshot) if snapshot.expires_at > Instant::now() => {
+                        Lookup::Return(snapshot.addresses.get(node_id).copied())
+                    }
+                    Some(snapshot) if state.refreshing => {
+                        // The address snapshot is a routing hint. Serve it
+                        // briefly while one caller refreshes, rather than
+                        // stampeding on the chitchat lock at every expiry.
+                        Lookup::Return(snapshot.addresses.get(node_id).copied())
+                    }
+                    Some(_) | None if !state.refreshing => {
+                        state.refreshing = true;
+                        Lookup::Refresh
+                    }
+                    None => Lookup::Wait,
+                    Some(_) => unreachable!("refreshing stale snapshot handled above"),
+                }
+            };
+
+            match lookup {
+                Lookup::Return(address) => return address,
+                Lookup::Wait => notified.await,
+                Lookup::Refresh => {
+                    // Cancellation while awaiting chitchat must not leave the
+                    // cache permanently marked as refreshing.
+                    let mut refresh_guard = PeerAddressRefreshGuard {
+                        inner: Arc::clone(&self.inner),
+                        completed: false,
+                    };
+                    let addresses = self.load_peer_addresses().await;
+                    let address = addresses.get(node_id).copied();
+                    let mut state = self
+                        .inner
+                        .peer_addresses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.snapshot = Some(CachedPeerAddresses {
+                        expires_at: Instant::now() + PEER_ADDRESS_CACHE_TTL,
+                        addresses,
+                    });
+                    state.refreshing = false;
+                    drop(state);
+                    refresh_guard.completed = true;
+                    self.inner.peer_addresses_changed.notify_waiters();
+                    return address;
+                }
+            }
+        }
+    }
+
+    async fn load_peer_addresses(&self) -> HashMap<NodeId, SocketAddr> {
         self.inner
             .handle
             .with_chitchat(|c| {
                 let live = live_node_ids(c);
-                c.node_states().iter().find_map(|(cid, state)| {
-                    if cid.node_id.as_ref() != node_id.as_str()
-                        || !live.contains(cid)
-                        || is_draining(state)
-                    {
-                        return None;
-                    }
-                    state_value(state, KV_ADVERTISE_ADDR)?.parse().ok()
-                })
+                c.node_states()
+                    .iter()
+                    .filter(|(cid, state)| live.contains(cid) && !is_draining(state))
+                    .filter_map(|(cid, state)| {
+                        let address = state_value(state, KV_ADVERTISE_ADDR)?.parse().ok()?;
+                        Some((NodeId::from(cid.node_id.as_ref()), address))
+                    })
+                    .collect()
             })
             .await
     }
@@ -150,6 +252,21 @@ impl GossipBus for Membership {
             .handle
             .with_chitchat(|c| {
                 c.self_node_state().set(&key, &value);
+            })
+            .await;
+    }
+
+    async fn set_many(&self, node_id: NodeId, kvs: NodeKvs) {
+        if node_id != self.inner.self_node_id || kvs.is_empty() {
+            return;
+        }
+        self.inner
+            .handle
+            .with_chitchat(|c| {
+                let state = c.self_node_state();
+                for (key, value) in &kvs {
+                    state.set(key, value);
+                }
             })
             .await;
     }

@@ -10,6 +10,7 @@ async-trait.workspace = true
 biei = { path = "../biei" }
 bytes.workspace = true
 chitchat.workspace = true
+clap.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 rand_xoshiro.workspace = true

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,10 +16,11 @@ use chitchat::{
     ChitchatConfig, ChitchatHandle, ChitchatId, ChitchatMessage, FailureDetectorConfig,
     spawn_chitchat,
 };
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use biei::gossip::GossipBus;
-use biei::types::{ClusterView, NodeId, NodeStateView};
+use biei::types::{ClusterView, NodeId, NodeKvs, NodeStateView};
 
 /// `GossipBus` impl backed by N real `chitchat` instances (one per simulator
 /// node) talking over a shared in-process transport with a configurable
@@ -33,8 +34,12 @@ use biei::types::{ClusterView, NodeId, NodeStateView};
 /// keyed by `(view_epoch, generated_at)` short-circuits repeat reads from
 /// concurrent `handle_incoming` tasks landing on the same paused-time tick.
 pub struct ChitchatGossipBus {
-    members: Vec<NodeId>,
-    handles: HashMap<NodeId, ChitchatHandle>,
+    members: RwLock<Vec<NodeId>>,
+    handles: RwLock<HashMap<NodeId, ChitchatHandle>>,
+    addrs: RwLock<HashMap<NodeId, SocketAddr>>,
+    transport: SimTransport,
+    gossip_interval: Duration,
+    next_port: AtomicU32,
     view_epoch: AtomicU64,
     view_cache: Mutex<Option<CachedView>>,
 }
@@ -50,65 +55,99 @@ impl ChitchatGossipBus {
         gossip_interval: Duration,
         hop_latency: Duration,
     ) -> Result<Self> {
-        let transport = SimTransport {
-            inner: ChannelTransport::default(),
-            hop_latency,
-        };
-
-        let addrs: HashMap<NodeId, SocketAddr> = members
-            .iter()
-            .enumerate()
-            .map(|(i, nid)| {
-                let port: u16 = 10_000 + i as u16;
-                let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-                (nid.clone(), addr)
-            })
-            .collect();
-        let all_addr_strings: Vec<String> = addrs.values().map(|a| a.to_string()).collect();
-
-        let mut handles = HashMap::new();
-        for nid in &members {
-            let addr = addrs[nid];
-            let chitchat_id = ChitchatId::new(nid.to_string(), 0, addr);
-            let seed_nodes: Vec<String> = all_addr_strings
-                .iter()
-                .filter(|s| *s != &addr.to_string())
-                .cloned()
-                .collect();
-            let config = ChitchatConfig {
-                chitchat_id,
-                cluster_id: "biei-sim".to_string(),
-                gossip_interval,
-                listen_addr: addr,
-                seed_nodes,
-                failure_detector_config: FailureDetectorConfig::default(),
-                marked_for_deletion_grace_period: Duration::from_secs(3_600),
-                catchup_callback: None,
-                extra_liveness_predicate: None,
-            };
-            let handle = spawn_chitchat(config, vec![], &transport).await?;
-            handles.insert(nid.clone(), handle);
-        }
-
-        Ok(Self {
-            members,
-            handles,
+        let bus = Self {
+            members: RwLock::new(Vec::new()),
+            handles: RwLock::new(HashMap::new()),
+            addrs: RwLock::new(HashMap::new()),
+            transport: SimTransport {
+                inner: ChannelTransport::default(),
+                hop_latency,
+            },
+            gossip_interval,
+            next_port: AtomicU32::new(10_000),
             view_epoch: AtomicU64::new(0),
             view_cache: Mutex::new(None),
-        })
+        };
+        for member in members {
+            if let Err(error) = bus.add_node(member).await {
+                bus.shutdown_all().await;
+                return Err(error);
+            }
+        }
+        Ok(bus)
     }
 
-    pub async fn shutdown(self) {
-        for (_, h) in self.handles {
+    pub async fn add_node(&self, node_id: NodeId) -> Result<()> {
+        if self.handles.read().await.contains_key(&node_id) {
+            anyhow::bail!("duplicate simulator node {node_id}");
+        }
+        let port: u16 = self
+            .next_port
+            .fetch_add(1, Ordering::Relaxed)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("simulator exhausted chitchat listen ports"))?;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let seed_nodes = self
+            .addrs
+            .read()
+            .await
+            .values()
+            .map(ToString::to_string)
+            .collect();
+        let config = ChitchatConfig {
+            chitchat_id: ChitchatId::new(node_id.to_string(), 0, addr),
+            cluster_id: "biei-sim".to_string(),
+            gossip_interval: self.gossip_interval,
+            listen_addr: addr,
+            seed_nodes,
+            failure_detector_config: FailureDetectorConfig::default(),
+            marked_for_deletion_grace_period: Duration::from_secs(3_600),
+            catchup_callback: None,
+            extra_liveness_predicate: None,
+        };
+        let handle = spawn_chitchat(config, vec![], &self.transport).await?;
+        self.handles.write().await.insert(node_id.clone(), handle);
+        self.addrs.write().await.insert(node_id.clone(), addr);
+        self.members.write().await.push(node_id);
+        self.invalidate_view();
+        Ok(())
+    }
+
+    pub async fn remove_node(&self, node_id: &NodeId) -> Result<()> {
+        let handle = self.handles.write().await.remove(node_id);
+        self.addrs.write().await.remove(node_id);
+        self.members
+            .write()
+            .await
+            .retain(|member| member != node_id);
+        self.invalidate_view();
+        if let Some(handle) = handle {
+            handle.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_all(&self) {
+        let handles = std::mem::take(&mut *self.handles.write().await);
+        self.members.write().await.clear();
+        self.addrs.write().await.clear();
+        self.invalidate_view();
+        for (_, h) in handles {
             let _ = h.shutdown().await;
         }
+    }
+
+    fn invalidate_view(&self) {
+        self.view_epoch.fetch_add(1, Ordering::AcqRel);
+        *self.view_cache.lock().expect("view cache poisoned") = None;
     }
 }
 
 #[async_trait]
 impl GossipBus for ChitchatGossipBus {
     async fn set(&self, node_id: NodeId, key: String, value: String) {
-        let Some(handle) = self.handles.get(&node_id) else {
+        let handles = self.handles.read().await;
+        let Some(handle) = handles.get(&node_id) else {
             return;
         };
         handle
@@ -116,8 +155,25 @@ impl GossipBus for ChitchatGossipBus {
                 c.self_node_state().set(&key, &value);
             })
             .await;
-        self.view_epoch.fetch_add(1, Ordering::AcqRel);
-        *self.view_cache.lock().expect("view cache poisoned") = None;
+        drop(handles);
+        self.invalidate_view();
+    }
+
+    async fn set_many(&self, node_id: NodeId, kvs: NodeKvs) {
+        let handles = self.handles.read().await;
+        let Some(handle) = handles.get(&node_id) else {
+            return;
+        };
+        handle
+            .with_chitchat(|c| {
+                let state = c.self_node_state();
+                for (key, value) in &kvs {
+                    state.set(key, value);
+                }
+            })
+            .await;
+        drop(handles);
+        self.invalidate_view();
     }
 
     async fn view(&self) -> ClusterView {
@@ -134,12 +190,14 @@ impl GossipBus for ChitchatGossipBus {
             return cached.view.clone();
         }
 
+        let members = self.members.read().await.clone();
+        let handles = self.handles.read().await;
         // Always sample from `members[0]`'s chitchat snapshot — never
         // `handles.iter().next()`, which would be HashMap-order-dependent
         // and produce a non-reproducible view across runs.
-        let Some(handle) = self.members.first().and_then(|nid| self.handles.get(nid)) else {
+        let Some(handle) = members.first().and_then(|nid| handles.get(nid)) else {
             return ClusterView {
-                members: self.members.clone(),
+                members,
                 states: HashMap::new(),
                 generated_at: now,
             };
@@ -157,7 +215,7 @@ impl GossipBus for ChitchatGossipBus {
             })
             .await;
         let view = ClusterView {
-            members: self.members.clone(),
+            members,
             states,
             generated_at: now,
         };

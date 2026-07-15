@@ -13,6 +13,10 @@ use tokio::time::Instant;
 
 use biei::types::{RejectionReason, RouteTier, TaskOutcome, TaskResult};
 
+const LATENCY_HISTOGRAM_BOUNDS_MS: &[u64] = &[
+    5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 5_000, 10_000,
+];
+
 #[derive(Debug, Clone)]
 struct TaskRecord {
     arrived_at: Instant,
@@ -38,8 +42,28 @@ struct TaskRecord {
 /// `TaskRecord` derived from a `TaskOutcome`. Workload tasks call this
 /// directly after their `handle_incoming(...).await`.
 pub struct MetricsCollector {
-    records: Mutex<Vec<TaskRecord>>,
-    cpu_render_permits_total: usize,
+    state: Mutex<MetricsState>,
+}
+
+#[derive(Default)]
+struct MetricsState {
+    records: Vec<TaskRecord>,
+    observation: MetricsObservation,
+    cpu_capacity_events: Vec<(Instant, usize)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MetricsObservation {
+    pub total: usize,
+    pub completed: usize,
+    pub rejected: usize,
+    pub failed: usize,
+    pub cold_starts: usize,
+    pub style_swaps: usize,
+    pub tasks_with_sources: usize,
+    pub source_loads: usize,
+    pub source_hits: usize,
+    pub tier_counts: HashMap<RouteTier, usize>,
 }
 
 impl MetricsCollector {
@@ -49,8 +73,10 @@ impl MetricsCollector {
 
     pub fn with_cpu_render_permits(cpu_render_permits_total: usize) -> Self {
         Self {
-            records: Mutex::new(Vec::new()),
-            cpu_render_permits_total,
+            state: Mutex::new(MetricsState {
+                cpu_capacity_events: vec![(Instant::now(), cpu_render_permits_total)],
+                ..MetricsState::default()
+            }),
         }
     }
 
@@ -105,11 +131,47 @@ impl MetricsCollector {
                 failure_error: Some(error),
             },
         };
-        self.records.lock().expect("metrics poisoned").push(record);
+        let mut state = self.state.lock().expect("metrics poisoned");
+        let observation = &mut state.observation;
+        observation.total += 1;
+        if let Some(tier) = record.route_tier {
+            observation.completed += 1;
+            *observation.tier_counts.entry(tier).or_default() += 1;
+            observation.cold_starts += usize::from(record.cold_start);
+            observation.style_swaps += usize::from(record.style_swap);
+            observation.tasks_with_sources += usize::from(record.had_source);
+            observation.source_loads += usize::from(record.source_loaded);
+            observation.source_hits += usize::from(record.had_source && !record.source_loaded);
+        } else if record.rejection_reason.is_some() {
+            observation.rejected += 1;
+        } else {
+            observation.failed += 1;
+        }
+        state.records.push(record);
+    }
+
+    pub(crate) fn observation(&self) -> MetricsObservation {
+        self.state
+            .lock()
+            .expect("metrics poisoned")
+            .observation
+            .clone()
+    }
+
+    pub(crate) fn set_cpu_render_permits_total(&self, total: usize) {
+        let mut state = self.state.lock().expect("metrics poisoned");
+        if state
+            .cpu_capacity_events
+            .last()
+            .is_none_or(|(_, current)| *current != total)
+        {
+            state.cpu_capacity_events.push((Instant::now(), total));
+        }
     }
 
     pub fn report(&self, sla: Duration) -> Report {
-        let records = self.records.lock().expect("metrics poisoned");
+        let state = self.state.lock().expect("metrics poisoned");
+        let records = &state.records;
         let total = records.len();
         let completed: Vec<&TaskRecord> = records
             .iter()
@@ -122,6 +184,7 @@ impl MetricsCollector {
             .map(|r| r.completed_at.unwrap().duration_since(r.arrived_at))
             .collect();
         latencies.sort();
+        let latency_histogram = build_latency_histogram(&latencies);
 
         let percentile = |q: f64| -> Duration {
             if latencies.is_empty() {
@@ -191,8 +254,14 @@ impl MetricsCollector {
             0.0
         };
         let cpu_render_peak_inflight = peak_inflight(&completed);
-        let cpu_render_utilization_pct = if self.cpu_render_permits_total > 0 {
-            cpu_render_avg_inflight / self.cpu_render_permits_total as f64 * 100.0
+        let cpu_render_permits_total = state
+            .cpu_capacity_events
+            .last()
+            .map_or(0, |(_, permits)| *permits);
+        let avg_cpu_capacity =
+            average_capacity(&state.cpu_capacity_events, first_arrival, last_completion);
+        let cpu_render_utilization_pct = if avg_cpu_capacity > 0.0 {
+            cpu_render_avg_inflight / avg_cpu_capacity * 100.0
         } else {
             0.0
         };
@@ -212,6 +281,7 @@ impl MetricsCollector {
             latency_p95: percentile(0.95),
             latency_p99: percentile(0.99),
             latency_max: latencies.last().copied().unwrap_or(Duration::ZERO),
+            latency_histogram,
             cold_starts,
             style_swaps,
             overflow_admissions,
@@ -220,13 +290,62 @@ impl MetricsCollector {
             source_hits,
             tier_counts,
             elapsed,
-            cpu_render_permits_total: self.cpu_render_permits_total,
+            cpu_render_permits_total,
             cpu_render_busy,
             cpu_render_avg_inflight,
             cpu_render_peak_inflight,
             cpu_render_utilization_pct,
         }
     }
+}
+
+fn build_latency_histogram(latencies: &[Duration]) -> Vec<LatencyHistogramBucket> {
+    let mut counts = vec![0; LATENCY_HISTOGRAM_BOUNDS_MS.len() + 1];
+    for latency in latencies {
+        let bucket = LATENCY_HISTOGRAM_BOUNDS_MS
+            .iter()
+            .position(|bound_ms| *latency <= Duration::from_millis(*bound_ms))
+            .unwrap_or(LATENCY_HISTOGRAM_BOUNDS_MS.len());
+        counts[bucket] += 1;
+    }
+
+    counts
+        .into_iter()
+        .enumerate()
+        .map(|(index, count)| LatencyHistogramBucket {
+            upper_bound: LATENCY_HISTOGRAM_BOUNDS_MS
+                .get(index)
+                .map(|bound_ms| Duration::from_millis(*bound_ms)),
+            count,
+        })
+        .collect()
+}
+
+fn average_capacity(
+    events: &[(Instant, usize)],
+    start: Option<Instant>,
+    end: Option<Instant>,
+) -> f64 {
+    let (Some(start), Some(end)) = (start, end) else {
+        return events.last().map_or(0.0, |(_, value)| *value as f64);
+    };
+    if end <= start {
+        return events.last().map_or(0.0, |(_, value)| *value as f64);
+    }
+    let mut current = events
+        .iter()
+        .take_while(|(at, _)| *at <= start)
+        .last()
+        .map_or(0, |(_, value)| *value);
+    let mut cursor = start;
+    let mut capacity_seconds = 0.0;
+    for (at, value) in events.iter().filter(|(at, _)| *at > start && *at < end) {
+        capacity_seconds += at.duration_since(cursor).as_secs_f64() * current as f64;
+        cursor = *at;
+        current = *value;
+    }
+    capacity_seconds += end.duration_since(cursor).as_secs_f64() * current as f64;
+    capacity_seconds / end.duration_since(start).as_secs_f64()
 }
 
 fn peak_inflight(records: &[&TaskRecord]) -> usize {
@@ -271,6 +390,9 @@ pub struct Report {
     pub latency_p95: Duration,
     pub latency_p99: Duration,
     pub latency_max: Duration,
+    /// Non-cumulative completed-request latency counts. The final bucket has
+    /// no upper bound and contains values above 10 seconds.
+    pub latency_histogram: Vec<LatencyHistogramBucket>,
     pub cold_starts: usize,
     pub style_swaps: usize,
     /// Number of tasks that landed between the soft queue limit (BL) and hard
@@ -291,6 +413,12 @@ pub struct Report {
     pub cpu_render_avg_inflight: f64,
     pub cpu_render_peak_inflight: usize,
     pub cpu_render_utilization_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyHistogramBucket {
+    pub upper_bound: Option<Duration>,
+    pub count: usize,
 }
 
 impl Report {
@@ -408,5 +536,42 @@ impl Report {
             self.tasks_with_sources,
             pct_complete(self.tasks_with_sources),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{LATENCY_HISTOGRAM_BOUNDS_MS, average_capacity, build_latency_histogram};
+
+    #[test]
+    fn averages_capacity_across_churn_events() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(10);
+        let events = vec![(start, 2), (start + Duration::from_secs(5), 4)];
+
+        assert_eq!(average_capacity(&events, Some(start), Some(end)), 3.0);
+    }
+
+    #[test]
+    fn latency_histogram_is_fixed_and_accounts_for_every_sample() {
+        let latencies = [
+            Duration::ZERO,
+            Duration::from_millis(5),
+            Duration::from_millis(6),
+            Duration::from_millis(10_001),
+        ];
+
+        let buckets = build_latency_histogram(&latencies);
+
+        assert_eq!(buckets.len(), LATENCY_HISTOGRAM_BOUNDS_MS.len() + 1);
+        assert_eq!(buckets.iter().map(|bucket| bucket.count).sum::<usize>(), 4);
+        assert_eq!(buckets[0].count, 2);
+        assert_eq!(buckets[1].count, 1);
+        assert_eq!(buckets.last().expect("overflow bucket").count, 1);
+        assert_eq!(buckets.last().expect("overflow bucket").upper_bound, None);
     }
 }

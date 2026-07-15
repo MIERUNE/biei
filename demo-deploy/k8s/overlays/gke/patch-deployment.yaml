@@ -21,6 +21,8 @@ spec:
               value: "http://ishikari:8080/styles/{style_id}/style.json"
             - name: BIEI_TILESET_URL_TEMPLATE
               value: "http://ishikari:8080/tilesets/{tileset_id}"
+            - name: BIEI_MLN_RESOURCE_PRIVATE_HOSTS
+              value: "ishikari"
           resources:
             requests:
               cpu: "2"

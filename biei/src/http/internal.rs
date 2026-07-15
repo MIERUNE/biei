@@ -1,5 +1,6 @@
 //! Internal peer-to-peer HTTP forwarding.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,20 +11,28 @@ use axum::body::{Body, Bytes};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use bytes::BytesMut;
+use futures_util::{StreamExt, stream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::drain::DrainController;
-use crate::http::REQUEST_ID_HEADER;
+use crate::http::{REQUEST_ID_HEADER, request_id_from_headers};
 use crate::node::Node;
 use crate::transport::{ForwardError, Transport};
-use crate::types::{FailureKind, NodeId, RejectionReason, RenderOutput, RequestId};
+#[cfg(test)]
+use crate::types::RequestId;
+use crate::types::{FailureKind, NodeId, RejectionReason, RenderOutput};
+#[cfg(test)]
+use crate::wire::encode_response_body;
 use crate::wire::{
-    ForwardRequest, ForwardResponse, OutcomeHeader, OutcomeResult, decode_response_body,
-    encode_response_body,
+    ForwardRequest, ForwardResponse, OutcomeHeader, OutcomeResult, decode_response_bytes,
+    encode_response_header,
 };
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const BIEI_RESPONSE_CONTENT_TYPE: &str = "application/x-biei-forward-response";
 const MAX_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_FORWARD_RESPONSE_BODY_BYTES: usize = 48 * 1024 * 1024;
 
 #[async_trait]
 pub trait PeerResolver: Send + Sync {
@@ -41,17 +50,41 @@ impl PeerResolver for crate::membership::Membership {
 pub struct InternalForwardEndpoint {
     node: Node,
     drain: Option<DrainController>,
+    admission: Arc<Semaphore>,
 }
 
 impl InternalForwardEndpoint {
+    #[cfg(test)]
     pub fn with_drain(node: Node, drain: DrainController) -> Self {
+        Self::with_drain_and_limit(node, drain, 1)
+    }
+
+    pub fn with_drain_and_limit(node: Node, drain: DrainController, limit: usize) -> Self {
         Self {
             node,
             drain: Some(drain),
+            admission: Arc::new(Semaphore::new(limit.max(1))),
         }
     }
 
+    #[cfg(test)]
     pub async fn handle(&self, headers: &HeaderMap, body: Bytes) -> Response {
+        let Some(permit) = self.try_admit() else {
+            return overloaded_response();
+        };
+        self.handle_admitted(headers, body, permit).await
+    }
+
+    pub(crate) fn try_admit(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.admission).try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn handle_admitted(
+        &self,
+        headers: &HeaderMap,
+        body: Bytes,
+        _permit: OwnedSemaphorePermit,
+    ) -> Response {
         if !is_json_content_type(headers) {
             return response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -90,6 +123,15 @@ impl InternalForwardEndpoint {
         let (outcome, output) = OutcomeHeader::from_task_outcome(outcome, style_id);
         response_from_outcome(outcome, output)
     }
+}
+
+pub(crate) fn overloaded_response() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("retry-after", "1")
+        .body(Body::from("internal forward busy"))
+        .unwrap_or_else(|_| Response::new(Body::from("internal forward busy")))
 }
 
 pub struct HttpTransport {
@@ -148,11 +190,27 @@ impl Transport for HttpTransport {
                 "peer returned {status} without {BIEI_RESPONSE_CONTENT_TYPE} response body"
             )));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| ForwardError::Retryable(format!("read response body: {err}")))?;
-        let (outcome, image_bytes) = decode_response_body(&bytes)
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_FORWARD_RESPONSE_BODY_BYTES as u64)
+        {
+            return Err(ForwardError::Fatal(
+                "peer forward response body exceeds size limit".to_string(),
+            ));
+        }
+        let mut body = BytesMut::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk
+                .map_err(|err| ForwardError::Retryable(format!("read response body: {err}")))?;
+            if body.len().saturating_add(chunk.len()) > MAX_FORWARD_RESPONSE_BODY_BYTES {
+                return Err(ForwardError::Fatal(
+                    "peer forward response body exceeds size limit".to_string(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let (outcome, image_bytes) = decode_response_bytes(body.freeze())
             .map_err(|err| ForwardError::Fatal(format!("decode forward response body: {err}")))?;
 
         if !status.is_success() {
@@ -173,7 +231,7 @@ impl Transport for HttpTransport {
 
         let output = match outcome.completed_format() {
             Some(format) => Some(RenderOutput {
-                bytes: bytes::Bytes::copy_from_slice(image_bytes),
+                bytes: image_bytes,
                 format,
             }),
             None => {
@@ -190,18 +248,15 @@ fn response(status: StatusCode, body: Vec<u8>, content_type: &'static str) -> Re
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, content_type)
-        .body(Body::from(body.clone()))
-        .unwrap_or_else(|_| Response::new(Body::from(body)))
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 fn response_from_outcome(outcome: OutcomeHeader, output: Option<RenderOutput>) -> Response {
     let status = status_for_outcome(&outcome);
     let request_id = outcome.request_id.as_str().to_string();
-    let image_bytes = output
-        .as_ref()
-        .map_or(&[][..], |output| output.bytes.as_ref());
-    let body = match encode_response_body(&outcome, image_bytes) {
-        Ok(body) => body,
+    let header = match encode_response_header(&outcome) {
+        Ok(header) => header,
         Err(err) => {
             return response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -210,20 +265,17 @@ fn response_from_outcome(outcome: OutcomeHeader, output: Option<RenderOutput>) -
             );
         }
     };
+    let image = output.map_or_else(Bytes::new, |output| output.bytes);
+    let body = Body::from_stream(stream::iter([
+        Ok::<Bytes, Infallible>(header),
+        Ok::<Bytes, Infallible>(image),
+    ]));
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, BIEI_RESPONSE_CONTENT_TYPE)
         .header(REQUEST_ID_HEADER, request_id)
-        .body(Body::from(body.clone()))
-        .unwrap_or_else(|_| Response::new(Body::from(body)))
-}
-
-fn request_id_from_headers(headers: &HeaderMap) -> Option<RequestId> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(RequestId::from_string)
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 fn status_for_outcome(outcome: &OutcomeHeader) -> StatusCode {
@@ -768,5 +820,29 @@ mod tests {
         assert_eq!(info.route_tier, RouteTier::Tier2HrwBl);
         assert_eq!(output.format, ImageFormat::Png);
         assert_eq!(output.bytes.as_ref(), &[9, 8, 7, 6]);
+    }
+
+    #[tokio::test]
+    async fn internal_forward_admission_is_independent_and_bounded() {
+        let node_id = NodeId::from("peer-a");
+        let node = spawn_test_node(
+            node_id.clone(),
+            vec![Box::new(FakeRenderer::new(vec![1])) as BoxRenderer],
+            Arc::new(StaticGossip {
+                view: peer_only_view(node_id),
+            }),
+            Arc::new(UnexpectedTransport),
+            test_catalog(),
+        );
+        let endpoint = InternalForwardEndpoint::with_drain_and_limit(
+            node,
+            crate::drain::DrainController::new(),
+            1,
+        );
+
+        let permit = endpoint.try_admit().expect("first request is admitted");
+        assert!(endpoint.try_admit().is_none());
+        drop(permit);
+        assert!(endpoint.try_admit().is_some());
     }
 }

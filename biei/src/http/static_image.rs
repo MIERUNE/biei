@@ -28,43 +28,16 @@ pub(crate) fn parse_static_path(
     sla_budget: Duration,
     now: Instant,
 ) -> Result<InternalTask, IngressError> {
-    let (style_id, overlays, position, size_format) = match parts {
-        [style_id, "static", position, size_format] => (
-            resolve_style_id(&[*style_id])?,
-            Vec::new(),
-            *position,
-            *size_format,
-        ),
-        [style_id, "static", overlay, position, size_format] => {
+    let static_index = parts
+        .iter()
+        .rposition(|part| *part == "static")
+        .ok_or_else(|| invalid("static path is missing the static segment"))?;
+    let style_id = resolve_style_id(&parts[..static_index])?;
+    let (overlays, position, size_format) = match &parts[static_index..] {
+        ["static", position, size_format] => (Vec::new(), *position, *size_format),
+        ["static", overlay, position, size_format] => {
             let overlays = parse_static_overlays(overlay)?;
-            (
-                resolve_style_id(&[*style_id])?,
-                overlays,
-                *position,
-                *size_format,
-            )
-        }
-        [username, style_name, "static", position, size_format] => (
-            resolve_style_id(&[*username, *style_name])?,
-            Vec::new(),
-            *position,
-            *size_format,
-        ),
-        [
-            username,
-            style_name,
-            "static",
-            overlay,
-            position,
-            size_format,
-        ] => {
-            let overlays = parse_static_overlays(overlay)?;
-            (
-                resolve_style_id(&[*username, *style_name])?,
-                overlays,
-                *position,
-                *size_format,
-            )
+            (overlays, *position, *size_format)
         }
         _ => {
             return Err(invalid(

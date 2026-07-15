@@ -1,8 +1,11 @@
 //! Node-local rendered image cache.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use moka::sync::Cache;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::types::{
@@ -11,23 +14,57 @@ use crate::types::{
     SourceHash, StaticOverlay, TaskOutcome, TaskResult,
 };
 
+// Rendered output freshness is independent from the style revision: base
+// tiles and other referenced resources may change at stable URLs. Keep the
+// cache useful for burst coalescing without serving such output indefinitely.
+const RENDER_OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Clone, Default)]
 pub struct RenderOutputCache {
-    inner: Option<Cache<RenderCacheKey, Arc<RenderOutput>>>,
+    inner: Option<Arc<RenderOutputCacheInner>>,
+}
+
+struct RenderOutputCacheInner {
+    cache: Cache<RenderCacheKey, Arc<RenderOutput>>,
+    in_flight: Mutex<HashMap<RenderCacheKey, watch::Sender<u64>>>,
+}
+
+pub(crate) enum RenderCacheLookup {
+    Disabled,
+    Hit(RenderOutput),
+    Leader(RenderFlightLeader),
+    Wait(watch::Receiver<u64>),
+}
+
+/// Owns one cache key's render flight. Dropping the guard always wakes
+/// followers, including when rendering fails or the leader future is aborted.
+pub(crate) struct RenderFlightLeader {
+    inner: Arc<RenderOutputCacheInner>,
+    key: Option<RenderCacheKey>,
 }
 
 impl RenderOutputCache {
     pub fn new(max_capacity_bytes: u64) -> Self {
+        Self::with_ttl(max_capacity_bytes, RENDER_OUTPUT_CACHE_TTL)
+    }
+
+    fn with_ttl(max_capacity_bytes: u64, ttl: Duration) -> Self {
         if max_capacity_bytes == 0 {
             return Self { inner: None };
         }
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
+            .time_to_live(ttl)
             .weigher(|_key: &RenderCacheKey, output: &Arc<RenderOutput>| {
                 output.bytes.len().clamp(1, u32::MAX as usize) as u32
             })
             .build();
-        Self { inner: Some(cache) }
+        Self {
+            inner: Some(Arc::new(RenderOutputCacheInner {
+                cache,
+                in_flight: Mutex::new(HashMap::new()),
+            })),
+        }
     }
 
     pub fn is_enabled_for(&self, task: &InternalTask) -> bool {
@@ -38,26 +75,71 @@ impl RenderOutputCache {
                 .is_none_or(|s| s.policy == CachePolicy::Cacheable)
     }
 
-    pub fn get(&self, task: &InternalTask) -> Option<RenderOutput> {
-        let cache = self.inner.as_ref()?;
-        cache
-            .get(&RenderCacheKey::from_task(task))
-            .map(|output| (*output).clone())
-    }
-
-    pub fn insert_from_outcome(&self, task: &InternalTask, outcome: &TaskOutcome) -> bool {
+    /// Returns a cache hit, joins an existing render, or elects this caller as
+    /// the sole renderer for the request key.
+    pub(crate) fn lookup_or_join(&self, task: &InternalTask) -> RenderCacheLookup {
         if !self.is_enabled_for(task) {
-            return false;
+            return RenderCacheLookup::Disabled;
         }
-        let Some(cache) = &self.inner else {
-            return false;
+        let Some(inner) = &self.inner else {
+            return RenderCacheLookup::Disabled;
         };
+        let key = RenderCacheKey::from_task(task);
+        if let Some(output) = inner.cache.get(&key) {
+            return RenderCacheLookup::Hit((*output).clone());
+        }
+
+        let mut in_flight = lock_unpoisoned(&inner.in_flight);
+        // Close the race with a leader that inserted between the first cache
+        // lookup and acquiring the flight lock.
+        if let Some(output) = inner.cache.get(&key) {
+            return RenderCacheLookup::Hit((*output).clone());
+        }
+        if let Some(changed) = in_flight.get(&key) {
+            return RenderCacheLookup::Wait(changed.subscribe());
+        }
+
+        let (changed, _) = watch::channel(0);
+        in_flight.insert(key.clone(), changed);
+        drop(in_flight);
+        RenderCacheLookup::Leader(RenderFlightLeader {
+            inner: Arc::clone(inner),
+            key: Some(key),
+        })
+    }
+}
+
+impl RenderFlightLeader {
+    pub(crate) fn insert_from_outcome(&self, outcome: &TaskOutcome) -> bool {
         let TaskResult::Completed { output, .. } = &outcome.result else {
             return false;
         };
-        cache.insert(RenderCacheKey::from_task(task), Arc::new(output.clone()));
+        let Some(key) = &self.key else {
+            return false;
+        };
+        self.inner
+            .cache
+            .insert(key.clone(), Arc::new(output.clone()));
         true
     }
+}
+
+impl Drop for RenderFlightLeader {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let changed = lock_unpoisoned(&self.inner.in_flight).remove(&key);
+        if let Some(changed) = changed {
+            changed.send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -573,19 +655,101 @@ mod tests {
         let rendered = output(&[1, 2, 3], ImageFormat::Png);
         let outcome = completed_outcome(&t, rendered.clone());
 
-        assert!(cache.insert_from_outcome(&t, &outcome));
-        assert_eq!(cache.get(&t), Some(rendered));
+        let leader = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("cache miss should elect a leader"),
+        };
+        assert!(leader.insert_from_outcome(&outcome));
+        drop(leader);
+        match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Hit(output) => assert_eq!(output, rendered),
+            _ => panic!("inserted output should be a cache hit"),
+        }
+    }
+
+    #[test]
+    fn rendered_output_expires_even_when_the_key_is_stable() {
+        let cache = RenderOutputCache::with_ttl(1024, Duration::from_millis(10));
+        let t = task(0, None);
+        let leader = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("cache miss should elect a leader"),
+        };
+        assert!(
+            leader
+                .insert_from_outcome(&completed_outcome(&t, output(&[1, 2, 3], ImageFormat::Png),))
+        );
+        drop(leader);
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(matches!(
+            cache.lookup_or_join(&t),
+            RenderCacheLookup::Leader(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookup_joins_leader_and_observes_inserted_output() {
+        let cache = RenderOutputCache::new(1024);
+        let t = task(0, None);
+        let leader = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("first cache miss should lead the render"),
+        };
+        let mut changed = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Wait(changed) => changed,
+            _ => panic!("concurrent cache miss should wait for the leader"),
+        };
+        let rendered = output(&[1, 2, 3], ImageFormat::Png);
+
+        assert!(leader.insert_from_outcome(&completed_outcome(&t, rendered.clone())));
+        drop(leader);
+        tokio::time::timeout(Duration::from_secs(1), changed.changed())
+            .await
+            .expect("leader completion should wake followers")
+            .expect("flight notification should remain open");
+
+        match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Hit(output) => assert_eq!(output, rendered),
+            _ => panic!("follower should observe the leader's cached output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_failed_leader_wakes_follower_for_new_election() {
+        let cache = RenderOutputCache::new(1024);
+        let t = task(0, None);
+        let leader = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("first cache miss should lead the render"),
+        };
+        let mut changed = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Wait(changed) => changed,
+            _ => panic!("concurrent cache miss should wait for the leader"),
+        };
+
+        drop(leader);
+        tokio::time::timeout(Duration::from_secs(1), changed.changed())
+            .await
+            .expect("failed leader should wake followers")
+            .expect("flight notification should remain open");
+
+        assert!(matches!(
+            cache.lookup_or_join(&t),
+            RenderCacheLookup::Leader(_)
+        ));
     }
 
     #[test]
     fn disabled_cache_never_hits_or_inserts() {
         let cache = RenderOutputCache::new(0);
         let t = task(0, None);
-        let outcome = completed_outcome(&t, output(&[1, 2, 3], ImageFormat::Png));
 
         assert!(!cache.is_enabled_for(&t));
-        assert!(!cache.insert_from_outcome(&t, &outcome));
-        assert_eq!(cache.get(&t), None);
+        assert!(matches!(
+            cache.lookup_or_join(&t),
+            RenderCacheLookup::Disabled
+        ));
     }
 
     #[test]

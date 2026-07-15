@@ -15,7 +15,6 @@ use crate::types::{DeadlineStage, RejectionReason, RouteTier, TaskOutcome, TaskR
 /// types — the caller (HTTP layer) extracts these from its worker snapshot.
 pub struct WorkerGaugeSample {
     pub worker: String,
-    pub style_id: String,
     pub render_mode: &'static str,
     pub scale: &'static str,
     pub queue_depth: i64,
@@ -30,6 +29,12 @@ pub struct RuntimeGauges {
     pub membership_live: Option<i64>,
     pub cpu_permits_inuse: i64,
     pub draining: bool,
+    pub renderer_total: i64,
+    pub renderer_available: i64,
+    pub renderer_orphaned: i64,
+    pub renderer_replacements_succeeded: u64,
+    pub renderer_replacements_exhausted: u64,
+    pub renderer_replacements_failed: u64,
 }
 
 pub const ROUTE_TIERS: [RouteTier; 5] = [
@@ -255,6 +260,12 @@ impl NodeMetrics {
         self.render_output_cache.with_label_values(&["miss"]).inc();
     }
 
+    pub fn record_render_output_cache_coalesced(&self) {
+        self.render_output_cache
+            .with_label_values(&["coalesced"])
+            .inc();
+    }
+
     pub fn record_render_output_cache_insert(&self) {
         self.render_output_cache
             .with_label_values(&["insert"])
@@ -262,7 +273,11 @@ impl NodeMetrics {
     }
 
     pub fn gather(&self) -> Vec<MetricFamily> {
-        self.registry.gather()
+        // Node-scoped metrics plus the process-global Rust FileSource metrics
+        // (empty until the file source is registered).
+        let mut families = self.registry.gather();
+        families.extend(crate::renderer::file_source::gather_metrics());
+        families
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -282,7 +297,7 @@ impl NodeMetrics {
                 "biei_queue_depth",
                 "Current queued tasks per renderer worker.",
             ),
-            &["node", "worker", "style_id", "render_mode", "scale"],
+            &["node", "worker", "render_mode", "scale"],
         )
         .expect("valid queue gauge");
         let worker_loaded = IntGaugeVec::new(
@@ -311,6 +326,30 @@ impl NodeMetrics {
             &["node"],
         )
         .expect("valid drain-state gauge");
+        let renderer_slots = IntGaugeVec::new(
+            Opts::new(
+                "biei_renderer_slots",
+                "Configured and currently available renderer slots.",
+            ),
+            &["node", "state"],
+        )
+        .expect("valid renderer-slots gauge");
+        let renderer_orphaned = IntGaugeVec::new(
+            Opts::new(
+                "biei_renderer_orphan_threads",
+                "Detached native renderer threads that have not returned.",
+            ),
+            &["node"],
+        )
+        .expect("valid renderer-orphan gauge");
+        let renderer_replacements = IntCounterVec::new(
+            Opts::new(
+                "biei_renderer_replacements_total",
+                "Renderer actor replacement attempts by outcome.",
+            ),
+            &["node", "outcome"],
+        )
+        .expect("valid renderer-replacements counter");
 
         for collector in [
             Box::new(queue_depth.clone()) as Box<dyn prometheus::core::Collector>,
@@ -318,6 +357,9 @@ impl NodeMetrics {
             Box::new(membership_size.clone()),
             Box::new(cpu_permits_inuse.clone()),
             Box::new(drain_state.clone()),
+            Box::new(renderer_slots.clone()),
+            Box::new(renderer_orphaned.clone()),
+            Box::new(renderer_replacements.clone()),
         ] {
             registry
                 .register(collector)
@@ -326,13 +368,7 @@ impl NodeMetrics {
 
         for worker in &runtime.workers {
             queue_depth
-                .with_label_values(&[
-                    node,
-                    &worker.worker,
-                    &worker.style_id,
-                    worker.render_mode,
-                    worker.scale,
-                ])
+                .with_label_values(&[node, &worker.worker, worker.render_mode, worker.scale])
                 .set(worker.queue_depth);
             worker_loaded
                 .with_label_values(&[node, &worker.worker])
@@ -347,6 +383,24 @@ impl NodeMetrics {
         drain_state
             .with_label_values(&[node])
             .set(i64::from(runtime.draining));
+        renderer_slots
+            .with_label_values(&[node, "total"])
+            .set(runtime.renderer_total);
+        renderer_slots
+            .with_label_values(&[node, "available"])
+            .set(runtime.renderer_available);
+        renderer_orphaned
+            .with_label_values(&[node])
+            .set(runtime.renderer_orphaned);
+        for (outcome, value) in [
+            ("success", runtime.renderer_replacements_succeeded),
+            ("exhausted", runtime.renderer_replacements_exhausted),
+            ("spawn_failed", runtime.renderer_replacements_failed),
+        ] {
+            renderer_replacements
+                .with_label_values(&[node, outcome])
+                .inc_by(value);
+        }
 
         let mut families = self.gather();
         families.extend(registry.gather());
@@ -425,7 +479,7 @@ impl NodeMetrics {
         for outcome in ["hit", "miss"] {
             self.source_cache.with_label_values(&[outcome]).inc_by(0);
         }
-        for outcome in ["hit", "miss", "insert"] {
+        for outcome in ["hit", "miss", "coalesced", "insert"] {
             self.render_output_cache
                 .with_label_values(&[outcome])
                 .inc_by(0);

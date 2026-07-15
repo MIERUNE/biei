@@ -18,17 +18,13 @@ pub(crate) fn parse_tile_path(
     sla_budget: Duration,
     now: Instant,
 ) -> Result<InternalTask, IngressError> {
-    // 受け付ける形式:
-    //   /{style_id}/{z}/{x}/{y}{@scale}.{format}            (4 segments)
-    //   /{user}/{style}/{z}/{x}/{y}{@scale}.{format}        (5 segments)
-    let (style_id, z_str, x_str, yfmt_str) = match parts {
-        [style, z, x, yfmt] => (resolve_style_id(&[*style])?, *z, *x, *yfmt),
-        [user, style, z, x, yfmt] => (resolve_style_id(&[*user, *style])?, *z, *x, *yfmt),
-        _ => {
-            return Err(invalid(
-                "tile path must be /{user}/{style}/{z}/{x}/{y}{@scale}.{format}",
-            ));
-        }
+    let suffix_index = parts
+        .len()
+        .checked_sub(3)
+        .ok_or_else(|| invalid("tile path must be /{style_id}/{z}/{x}/{y}{@scale}.{format}"))?;
+    let style_id = resolve_style_id(&parts[..suffix_index])?;
+    let [z_str, x_str, yfmt_str] = parts[suffix_index..] else {
+        unreachable!("suffix_index leaves exactly three tile segments")
     };
     let style = resolve_style(catalog, style_id)?;
     let z = z_str
@@ -87,6 +83,13 @@ mod tests {
         );
         catalog.upsert_definition(
             StyleId("carto/voyager-gl-style".to_string()),
+            StyleDefinition::new(
+                "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+                1,
+            ),
+        );
+        catalog.upsert_definition(
+            StyleId("carto/gl/voyager-gl-style".to_string()),
             StyleDefinition::new(
                 "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
                 1,
@@ -171,6 +174,15 @@ mod tests {
         assert_eq!(task.style.id.as_str(), "voyager-gl-style");
         assert_eq!(task.output_format, ImageFormat::Webp);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X2);
+        assert!(matches!(task.request, RenderRequest::Tile { z: 2, .. }));
+    }
+
+    #[test]
+    fn parses_tile_with_deeply_namespaced_style_id() {
+        let task = parse_tile("/carto/gl/voyager-gl-style/2/3/1@2x.webp")
+            .expect("deeply namespaced style tile path");
+
+        assert_eq!(task.style.id.as_str(), "carto/gl/voyager-gl-style");
         assert!(matches!(task.request, RenderRequest::Tile { z: 2, .. }));
     }
 }

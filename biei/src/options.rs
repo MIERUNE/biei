@@ -18,6 +18,7 @@ const DEFAULT_SLA: &str = "5s";
 const STANDBY_RATIO_NUMERATOR: usize = 5;
 const STANDBY_RATIO_DENOMINATOR: usize = 4;
 const DEFAULT_RENDER_OUTPUT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MLN_RESOURCE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_TILESET_URL_TEMPLATE: &str =
     "https://tileset-provider.example.test/tilesets/{tileset_id}/tileset.json";
 
@@ -49,20 +50,30 @@ pub struct Options {
     pub node_id: NodeId,
     pub cores: usize,
     pub sla: Duration,
+    /// Used only when Rust FileSources are disabled; the default MLN Database
+    /// FileSource persists its ambient cache at this path.
     pub maplibre_cache_path: PathBuf,
     pub renderer_slots_per_node: usize,
     pub render_permits_per_node: usize,
     pub cpu_render_permits_per_node: usize,
     pub source_cache_capacity: usize,
     pub render_output_cache_capacity_bytes: u64,
+    pub mln_resource_cache_capacity_bytes: u64,
+    /// Hosts that may resolve to private, loopback, or link-local addresses.
+    /// Other resource hosts must resolve to public addresses.
+    pub mln_resource_private_hosts: Vec<String>,
+    /// Expert escape hatch: fall back to MapLibre Native's default Network and
+    /// Database FileSources.
+    pub disable_mln_file_sources: bool,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "biei", about = "Distributed MapLibre renderer")]
+#[command(name = "biei", version, about = "Distributed MapLibre renderer")]
 struct Cli {
     /// Style templates: `;`-separated entries, each either `namespace=<tmpl>`,
     /// the reserved `default=<tmpl>`, or a bare `<tmpl>` (treated as the
-    /// default). Each `<tmpl>` must contain `{style_id}` and be http(s).
+    /// default). Each `<tmpl>` must be http(s) and contain `{style_id}` in its
+    /// URL path.
     /// e.g. `gl=https://basemaps.cartocdn.com/gl/{style_id}/style.json;default=https://styles.example/{style_id}/style.json`
     #[arg(long, env = "BIEI_STYLE_TEMPLATES")]
     style_templates: String,
@@ -92,6 +103,8 @@ struct Cli {
     cores: Option<usize>,
     #[arg(long, env = "BIEI_SLA", default_value = DEFAULT_SLA, value_parser = parse_duration)]
     sla: Duration,
+    /// Fallback MLN ambient-cache path used with
+    /// `--disable-mln-file-sources`.
     #[arg(long, env = "BIEI_MAPLIBRE_CACHE_PATH")]
     maplibre_cache_path: Option<PathBuf>,
     #[arg(long, hide = true)]
@@ -110,13 +123,33 @@ struct Cli {
         default_value_t = DEFAULT_RENDER_OUTPUT_CACHE_BYTES
     )]
     render_output_cache_bytes: u64,
+    /// Process-wide MapLibre tile/glyph/sprite response cache. Set to 0 to
+    /// disable resource caching while keeping the Rust Network FileSource.
+    #[arg(
+        long,
+        env = "BIEI_MLN_RESOURCE_CACHE_BYTES",
+        default_value_t = DEFAULT_MLN_RESOURCE_CACHE_BYTES
+    )]
+    mln_resource_cache_bytes: u64,
+    /// Resource hosts allowed to resolve to non-public addresses. Exact hosts
+    /// and leading-wildcard domains (`*.svc.cluster.local`) are accepted.
+    #[arg(long, env = "BIEI_MLN_RESOURCE_PRIVATE_HOSTS", value_delimiter = ',')]
+    mln_resource_private_hosts: Vec<String>,
+    #[arg(
+        long,
+        hide = true,
+        env = "BIEI_DISABLE_MLN_FILE_SOURCES",
+        default_value_t = false
+    )]
+    disable_mln_file_sources: bool,
 }
 
 impl Options {
     pub fn parse() -> anyhow::Result<Self> {
-        Self::try_parse_from(std::env::args())
+        Self::from_cli(Cli::parse())
     }
 
+    #[cfg(test)]
     pub fn try_parse_from<I, T>(args: I) -> anyhow::Result<Self>
     where
         I: IntoIterator<Item = T>,
@@ -129,6 +162,8 @@ impl Options {
     fn from_cli(cli: Cli) -> anyhow::Result<Self> {
         let style_templates = parse_style_templates(&cli.style_templates)?;
         validate_tileset_url_template(&cli.tileset_url_template)?;
+        let mln_resource_private_hosts =
+            normalize_private_resource_hosts(cli.mln_resource_private_hosts)?;
         let cores = cli.cores.unwrap_or_else(default_cores).max(1);
         let render_permits = cli.debug_render_permits.unwrap_or(cores).max(1);
         let cpu_render_permits = cli
@@ -179,6 +214,9 @@ impl Options {
             cpu_render_permits_per_node: cpu_render_permits.min(renderer_slots),
             source_cache_capacity: cli.source_cache_capacity,
             render_output_cache_capacity_bytes: cli.render_output_cache_bytes,
+            mln_resource_cache_capacity_bytes: cli.mln_resource_cache_bytes,
+            mln_resource_private_hosts,
+            disable_mln_file_sources: cli.disable_mln_file_sources,
         })
     }
 
@@ -267,6 +305,7 @@ fn validate_style_template(template: &str, label: &str) -> anyhow::Result<()> {
     if !template.contains("{style_id}") {
         bail!("style template for {label} must contain {{style_id}}");
     }
+    validate_placeholder_in_url_path(template, "{style_id}", "style template")?;
     let sample_url = template.replace("{style_id}", "sample/style");
     let parsed = url::Url::parse(&sample_url)
         .with_context(|| format!("parse style template for {label}"))?;
@@ -334,12 +373,56 @@ fn validate_tileset_url_template(template: &str) -> anyhow::Result<()> {
     if !template.contains("{tileset_id}") {
         bail!("--tileset-url-template must contain {{tileset_id}}");
     }
+    validate_placeholder_in_url_path(template, "{tileset_id}", "--tileset-url-template")?;
     let sample_url = template.replace("{tileset_id}", "sample/tileset");
     let parsed = url::Url::parse(&sample_url).context("parse --tileset-url-template")?;
     match parsed.scheme() {
         "http" | "https" => Ok(()),
         scheme => bail!("tileset URL scheme {scheme:?} is not supported; expected http or https"),
     }
+}
+
+fn validate_placeholder_in_url_path(
+    template: &str,
+    placeholder: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    const MARKER: &str = "biei-placeholder-marker";
+    let expected = template.matches(placeholder).count();
+    let sample = template.replace(placeholder, MARKER);
+    let parsed = url::Url::parse(&sample)
+        .with_context(|| format!("parse {label} while validating placeholder position"))?;
+    if parsed.path().matches(MARKER).count() != expected {
+        bail!("{label} placeholder must appear only in the URL path");
+    }
+    Ok(())
+}
+
+fn normalize_private_resource_hosts(hosts: Vec<String>) -> anyhow::Result<Vec<String>> {
+    hosts
+        .into_iter()
+        .filter(|host| !host.trim().is_empty())
+        .map(|host| {
+            let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            let wildcard = normalized.starts_with("*.");
+            let candidate = normalized.strip_prefix("*.").unwrap_or(&normalized);
+            let parsed = url::Host::parse(candidate).map_err(|_| {
+                anyhow::anyhow!("invalid --mln-resource-private-hosts entry: {host}")
+            })?;
+            match parsed {
+                url::Host::Domain(domain) if !domain.is_empty() && !domain.contains('*') => {
+                    Ok(if wildcard {
+                        format!("*.{domain}")
+                    } else {
+                        domain
+                    })
+                }
+                url::Host::Ipv4(address) if !wildcard => Ok(address.to_string()),
+                url::Host::Ipv6(address) if !wildcard => Ok(address.to_string()),
+                _ => bail!("invalid --mln-resource-private-hosts entry: {host}"),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -357,6 +440,19 @@ mod tests {
         .expect_err("placeholder is required");
 
         assert!(format!("{err:#}").contains("must contain {style_id}"));
+    }
+
+    #[test]
+    fn rejects_style_placeholder_outside_url_path() {
+        for template in [
+            "https://{style_id}.example.test/style.json",
+            "https://styles.example.test/style.json?id={style_id}",
+            "https://styles.example.test?next=/{style_id}",
+        ] {
+            let err = Options::try_parse_from(["biei", "--style-templates", template])
+                .expect_err("style placeholder outside path is rejected");
+            assert!(format!("{err:#}").contains("only in the URL path"));
+        }
     }
 
     #[test]
@@ -383,6 +479,25 @@ mod tests {
         .expect_err("tileset placeholder is required");
 
         assert!(format!("{err:#}").contains("must contain {tileset_id}"));
+    }
+
+    #[test]
+    fn rejects_tileset_placeholder_outside_url_path() {
+        for template in [
+            "https://{tileset_id}.example.test/tileset.json",
+            "https://tiles.example.test?next=/{tileset_id}",
+        ] {
+            let err = Options::try_parse_from([
+                "biei",
+                "--style-templates",
+                "https://styles.example.test/{style_id}.json",
+                "--tileset-url-template",
+                template,
+            ])
+            .expect_err("tileset placeholder outside path is rejected");
+
+            assert!(format!("{err:#}").contains("only in the URL path"));
+        }
     }
 
     #[test]
@@ -457,10 +572,57 @@ mod tests {
 
         assert_eq!(opts.source_cache_capacity, 4);
         assert_eq!(opts.render_output_cache_capacity_bytes, 1_048_576);
+        assert_eq!(
+            opts.mln_resource_cache_capacity_bytes,
+            DEFAULT_MLN_RESOURCE_CACHE_BYTES
+        );
         assert_eq!(opts.cluster_config().source_cache_capacity, 4);
         assert_eq!(
             opts.cluster_config().render_output_cache_capacity_bytes,
             1_048_576
+        );
+        assert!(!opts.disable_mln_file_sources);
+    }
+
+    #[test]
+    fn parses_file_source_options() {
+        let opts = Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "http://style-api.test/styles/{style_id}/style.json",
+            "--mln-resource-cache-bytes",
+            "1048576",
+            "--mln-resource-private-hosts",
+            "resource-api.default.svc.cluster.local,*.tiles.svc.cluster.local",
+            "--disable-mln-file-sources",
+        ])
+        .expect("options parse");
+
+        assert_eq!(opts.mln_resource_cache_capacity_bytes, 1_048_576);
+        assert_eq!(
+            opts.mln_resource_private_hosts,
+            [
+                "resource-api.default.svc.cluster.local",
+                "*.tiles.svc.cluster.local"
+            ]
+        );
+        assert!(opts.disable_mln_file_sources);
+    }
+
+    #[test]
+    fn rejects_invalid_private_resource_host_pattern() {
+        let err = Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "http://style-api.test/styles/{style_id}/style.json",
+            "--mln-resource-private-hosts",
+            "https://resource-api.test",
+        ])
+        .expect_err("URL syntax is not a host pattern");
+
+        assert!(
+            err.to_string()
+                .contains("invalid --mln-resource-private-hosts")
         );
     }
 

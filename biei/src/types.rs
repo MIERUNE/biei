@@ -666,7 +666,11 @@ pub enum TaskResult {
 
 /// Typed classification of a render failure, so the HTTP layer maps it to a
 /// status code by variant instead of matching on the error message string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Other`: the wire decodes frames from peers that predate this
+/// field via `#[serde(default)]`, and an unclassified failure maps to the
+/// generic 500 path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FailureKind {
     /// The render exceeded its deadline.
     RenderTimeout,
@@ -679,6 +683,7 @@ pub enum FailureKind {
     /// An addlayer/source fetch failed.
     SourceUnavailable,
     /// Any other render failure.
+    #[default]
     Other,
 }
 
@@ -801,6 +806,9 @@ pub enum Decision {
     Local {
         route_tier: RouteTier,
         worker_hint: Option<WorkerId>,
+        /// Remaining HRW candidates to try if local admission races with a
+        /// stale cluster view and the selected worker queue is unavailable.
+        fallback_candidates: Vec<ForwardCandidate>,
     },
     Forward {
         route_tier: RouteTier,

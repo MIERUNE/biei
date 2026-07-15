@@ -1,6 +1,8 @@
 //! `Renderer` trait — profile setup / source / render worker hooks.
 
 pub mod actor;
+pub(crate) mod file_source;
+pub(crate) mod http_fetch;
 pub mod maplibre;
 pub(crate) mod overlay;
 
@@ -53,6 +55,11 @@ pub trait ProfilePreparer: Send + Sync {
     ) -> Result<(), StyleAvailabilityError> {
         Ok(())
     }
+
+    /// Temporarily suppress a revision that fetched successfully but was
+    /// rejected by the renderer's semantic style validation. The default is
+    /// a no-op for preparers without a style cache.
+    fn mark_style_load_failed(&self, _revision: &StyleRevision) {}
 }
 
 #[derive(Default)]
@@ -76,12 +83,12 @@ pub trait Renderer: Send + Sync {
     /// folded into `render`.
     async fn ensure_source(&mut self, hash: SourceHash) -> Result<(), RendererError>;
     async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError>;
-    /// Stop using the current native actor after its in-flight command returns.
+    /// Stop using the current native actor after a caller-side timeout.
     ///
-    /// Implementations should not try to kill an in-flight native render. The
-    /// intended behavior is to mark the actor as retiring, let the blocking
-    /// call return naturally, then drop/recreate the backend before accepting
-    /// more work.
+    /// Implementations must not try to kill an in-flight native render. They
+    /// may detach it under a bounded orphan budget and immediately install a
+    /// replacement so one wedged native call cannot permanently consume the
+    /// renderer slot.
     fn retire_after_current(&mut self) {}
 }
 

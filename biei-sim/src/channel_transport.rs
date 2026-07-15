@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -49,6 +50,10 @@ impl NodeRegistry {
             .and_then(|w| w.upgrade())
             .map(|e| e.node.clone())
     }
+
+    pub fn unregister(&self, id: &NodeId) {
+        self.nodes.write().expect("registry poisoned").remove(id);
+    }
 }
 
 /// In-process transport that simulates per-hop latency by sleeping
@@ -57,6 +62,14 @@ impl NodeRegistry {
 pub struct ChannelTransport {
     hop_latency: Duration,
     registry: Arc<NodeRegistry>,
+    attempts: AtomicU64,
+    successes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransportSnapshot {
+    pub attempts: u64,
+    pub successes: u64,
 }
 
 impl ChannelTransport {
@@ -64,6 +77,15 @@ impl ChannelTransport {
         Self {
             hop_latency,
             registry,
+            attempts: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> TransportSnapshot {
+        TransportSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
         }
     }
 }
@@ -75,6 +97,7 @@ impl Transport for ChannelTransport {
         target: NodeId,
         fwd: ForwardRequest,
     ) -> Result<ForwardResponse, ForwardError> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(fwd.task.remaining_budget_ms as u64);
         tokio::time::sleep(self.hop_latency).await;
@@ -87,6 +110,7 @@ impl Transport for ChannelTransport {
             .get(&target)
             .ok_or_else(|| ForwardError::Retryable(format!("unknown node {target}")))?;
         let outcome = node.handle_forwarded(fwd).await;
+        self.successes.fetch_add(1, Ordering::Relaxed);
         Ok(ForwardResponse::from_task_outcome(outcome, style_id))
     }
 }

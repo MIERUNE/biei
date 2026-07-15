@@ -5,6 +5,7 @@
 //! HTTP response.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -12,20 +13,23 @@ use axum::body::Body;
 use axum::body::to_bytes;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
+use axum::http::{Method, Request, StatusCode, Uri};
 use axum::response::Response;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::gossip::GossipBus;
+#[cfg(test)]
 use crate::http::REQUEST_ID_HEADER;
 use crate::http::ingress::HttpIngress;
+use crate::http::request_id_from_headers;
 use crate::http::response::IngressResponse;
 use crate::metrics::{RuntimeGauges, WorkerGaugeSample};
-use crate::types::RequestId;
 
 const MAX_INTERNAL_FORWARD_BODY_BYTES: usize = 10 * 1024 * 1024;
+const INTERNAL_FORWARD_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(12);
 const MAX_PUBLIC_PATH_BYTES: usize = 8192;
 
 #[derive(Clone)]
@@ -54,6 +58,7 @@ struct HttpServerState {
     membership: Option<crate::membership::Membership>,
     internal_forward: Option<crate::http::internal::InternalForwardEndpoint>,
     metrics: Option<HttpMetrics>,
+    renderer_supervisor: Option<crate::renderer::actor::RendererActorSupervisor>,
 }
 
 #[derive(Clone)]
@@ -61,6 +66,7 @@ pub struct HttpMetrics {
     node: crate::node::Node,
     membership: Option<crate::membership::Membership>,
     drain: Option<crate::drain::DrainController>,
+    renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
 }
 
 impl HttpMetrics {
@@ -68,11 +74,13 @@ impl HttpMetrics {
         node: crate::node::Node,
         membership: Option<crate::membership::Membership>,
         drain: Option<crate::drain::DrainController>,
+        renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
     ) -> Self {
         Self {
             node,
             membership,
             drain,
+            renderer_supervisor,
         }
     }
 
@@ -88,10 +96,6 @@ impl HttpMetrics {
                 let profile = worker.loaded_profile.as_ref();
                 WorkerGaugeSample {
                     worker: worker.id.to_string(),
-                    style_id: profile
-                        .map(|p| p.style.id.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
                     render_mode: profile
                         .map(|p| p.render_mode.as_gossip_value())
                         .unwrap_or("none"),
@@ -105,12 +109,19 @@ impl HttpMetrics {
             Some(membership) => Some(membership.view().await.members.len() as i64),
             None => None,
         };
+        let renderer = self.renderer_supervisor.snapshot();
         let runtime = RuntimeGauges {
             node_id: node_id.as_str().to_string(),
             workers,
             membership_live,
             cpu_permits_inuse: self.node.cpu_permits_inuse() as i64,
             draining: self.drain.as_ref().is_some_and(|drain| drain.is_draining()),
+            renderer_total: renderer.total_slots as i64,
+            renderer_available: renderer.available_slots as i64,
+            renderer_orphaned: renderer.orphaned_threads as i64,
+            renderer_replacements_succeeded: renderer.replacements_succeeded,
+            renderer_replacements_exhausted: renderer.replacements_exhausted,
+            renderer_replacements_failed: renderer.replacements_failed,
         };
         self.node.metrics().render_prometheus_with_runtime(&runtime)
     }
@@ -124,7 +135,13 @@ pub async fn serve_with_shutdown(
     shutdown: Option<ShutdownSignal>,
 ) -> anyhow::Result<()> {
     let drain = ingress.drain_controller();
-    let metrics = Some(HttpMetrics::new(ingress.node(), None, drain.clone()));
+    let renderer_supervisor = ingress.renderer_supervisor();
+    let metrics = Some(HttpMetrics::new(
+        ingress.node(),
+        None,
+        drain.clone(),
+        renderer_supervisor.clone(),
+    ));
     serve_with_state(
         HttpServerState {
             drain,
@@ -132,6 +149,7 @@ pub async fn serve_with_shutdown(
             membership: None,
             internal_forward: None,
             metrics,
+            renderer_supervisor: Some(renderer_supervisor),
         },
         bind,
         None,
@@ -153,10 +171,12 @@ pub async fn serve_with_shutdown_and_membership_and_internal_forward(
     internal_forward: Option<crate::http::internal::InternalForwardEndpoint>,
 ) -> anyhow::Result<()> {
     let drain = ingress.drain_controller();
+    let renderer_supervisor = ingress.renderer_supervisor();
     let metrics = Some(HttpMetrics::new(
         ingress.node(),
         membership.clone(),
         drain.clone(),
+        renderer_supervisor.clone(),
     ));
     serve_with_state(
         HttpServerState {
@@ -165,6 +185,7 @@ pub async fn serve_with_shutdown_and_membership_and_internal_forward(
             membership,
             internal_forward,
             metrics,
+            renderer_supervisor: Some(renderer_supervisor),
         },
         public_bind,
         Some(internal_bind),
@@ -186,10 +207,16 @@ async fn serve_with_state(
             .with_context(|| format!("bind HTTP listener on {public_bind}"))?;
         let server = axum::serve(listener, Router::new().fallback(handle).with_state(state));
         if let Some(signal) = shutdown {
-            server
-                .with_graceful_shutdown(signal.wait())
-                .await
-                .context("serve HTTP listener")?;
+            let force_shutdown = signal.clone();
+            tokio::select! {
+                result = server.with_graceful_shutdown(signal.wait()) => {
+                    result.context("serve HTTP listener")?;
+                }
+                () = shutdown_grace_elapsed(force_shutdown) => tracing::warn!(
+                    grace_ms = HTTP_SHUTDOWN_GRACE.as_millis(),
+                    "HTTP shutdown grace elapsed; dropping active connections"
+                ),
+            }
         } else {
             server.await.context("serve HTTP listener")?;
         }
@@ -214,18 +241,36 @@ async fn serve_with_state(
     if let Some(signal) = shutdown {
         // Fan the single shutdown signal out to both graceful-shutdown futures.
         let internal_signal = signal.clone();
+        let public_force_shutdown = signal.clone();
+        let internal_force_shutdown = signal.clone();
         tokio::try_join!(
             async {
-                public_server
-                    .with_graceful_shutdown(signal.wait())
-                    .await
-                    .context("serve public HTTP listener")
+                tokio::select! {
+                    result = public_server.with_graceful_shutdown(signal.wait()) => {
+                        result.context("serve public HTTP listener")
+                    }
+                    () = shutdown_grace_elapsed(public_force_shutdown) => {
+                        tracing::warn!(
+                            grace_ms = HTTP_SHUTDOWN_GRACE.as_millis(),
+                            "public HTTP shutdown grace elapsed; dropping active connections"
+                        );
+                        Ok(())
+                    }
+                }
             },
             async {
-                internal_server
-                    .with_graceful_shutdown(internal_signal.wait())
-                    .await
-                    .context("serve internal listener")
+                tokio::select! {
+                    result = internal_server.with_graceful_shutdown(internal_signal.wait()) => {
+                        result.context("serve internal listener")
+                    }
+                    () = shutdown_grace_elapsed(internal_force_shutdown) => {
+                        tracing::warn!(
+                            grace_ms = HTTP_SHUTDOWN_GRACE.as_millis(),
+                            "internal HTTP shutdown grace elapsed; dropping active connections"
+                        );
+                        Ok(())
+                    }
+                }
             },
         )?;
     } else {
@@ -237,6 +282,11 @@ async fn serve_with_state(
     Ok(())
 }
 
+async fn shutdown_grace_elapsed(signal: ShutdownSignal) {
+    signal.wait().await;
+    tokio::time::sleep(HTTP_SHUTDOWN_GRACE).await;
+}
+
 /// Combined dispatcher (single-node / tests): serves every endpoint on one port.
 async fn handle(
     State(state): State<HttpServerState>,
@@ -245,7 +295,7 @@ async fn handle(
     request: Request<Body>,
 ) -> Response {
     match uri.path() {
-        "/livez" | "/_internal/healthz" => health_ok(&method),
+        "/livez" | "/_internal/healthz" => healthz(&method, &state),
         "/readyz" | "/_internal/readyz" => readyz(&method, &state).await,
         "/_internal/metrics" => metricsz(&method, &state).await,
         "/_internal/forward" => forwardz(method, &state, request).await,
@@ -263,7 +313,7 @@ async fn handle_public(
     request: Request<Body>,
 ) -> Response {
     match uri.path() {
-        "/livez" => health_ok(&method),
+        "/livez" => healthz(&method, &state),
         "/readyz" => readyz(&method, &state).await,
         path if path == "/metrics" || path.starts_with("/_internal/") => {
             simple_response(StatusCode::NOT_FOUND, "not found")
@@ -283,7 +333,7 @@ async fn handle_internal(
     request: Request<Body>,
 ) -> Response {
     match uri.path() {
-        "/_internal/healthz" => health_ok(&method),
+        "/_internal/healthz" => healthz(&method, &state),
         "/_internal/readyz" => readyz(&method, &state).await,
         "/_internal/metrics" => metricsz(&method, &state).await,
         "/_internal/forward" => forwardz(method, &state, request).await,
@@ -291,11 +341,24 @@ async fn handle_internal(
     }
 }
 
-fn health_ok(method: &Method) -> Response {
+fn healthz(method: &Method, state: &HttpServerState) -> Response {
     if method != Method::GET {
         return simple_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    simple_response(StatusCode::OK, "ok")
+    // Liveness is stricter than readiness: fail only when in-process recovery
+    // is impossible (all slots dead AND the orphan budget exhausted — wedged
+    // Still renders cannot be cancelled), so the orchestrator restarts the
+    // pod per production-spec §8.4. Mere saturation (`!is_ready`) only drops
+    // readiness; restarting a self-healing node would discard warm state.
+    if state
+        .renderer_supervisor
+        .as_ref()
+        .is_none_or(|supervisor| supervisor.is_livable())
+    {
+        simple_response(StatusCode::OK, "ok")
+    } else {
+        simple_response(StatusCode::SERVICE_UNAVAILABLE, "renderer unrecoverable")
+    }
 }
 
 async fn readyz(method: &Method, state: &HttpServerState) -> Response {
@@ -306,6 +369,11 @@ async fn readyz(method: &Method, state: &HttpServerState) -> Response {
         .drain
         .as_ref()
         .is_none_or(|drain| !drain.is_draining());
+    let ready = ready
+        && state
+            .renderer_supervisor
+            .as_ref()
+            .is_none_or(|supervisor| supervisor.is_ready());
     let ready = ready
         && match &state.membership {
             Some(membership) => membership.is_gossip_ready().await,
@@ -344,12 +412,23 @@ async fn forwardz(method: Method, state: &HttpServerState, request: Request<Body
     let Some(internal_forward) = state.internal_forward.as_ref() else {
         return simple_response(StatusCode::NOT_FOUND, "internal forward disabled");
     };
-    let headers = request.headers().clone();
-    let body = match to_bytes(request.into_body(), MAX_INTERNAL_FORWARD_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+    let Some(admission) = internal_forward.try_admit() else {
+        return crate::http::internal::overloaded_response();
     };
-    internal_forward.handle(&headers, body).await
+    let headers = request.headers().clone();
+    let body = match tokio::time::timeout(
+        INTERNAL_FORWARD_BODY_TIMEOUT,
+        to_bytes(request.into_body(), MAX_INTERNAL_FORWARD_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+        Err(_) => return simple_response(StatusCode::REQUEST_TIMEOUT, "request body timed out"),
+    };
+    internal_forward
+        .handle_admitted(&headers, body, admission)
+        .await
 }
 
 async fn public_render(
@@ -361,8 +440,11 @@ async fn public_render(
     if method != Method::GET {
         return simple_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if uri.path().len() > MAX_PUBLIC_PATH_BYTES {
-        return simple_response(StatusCode::URI_TOO_LONG, "path too long");
+    if uri
+        .path_and_query()
+        .is_some_and(|path_and_query| path_and_query.as_str().len() > MAX_PUBLIC_PATH_BYTES)
+    {
+        return simple_response(StatusCode::URI_TOO_LONG, "URI too long");
     }
     let Some(ingress) = state.ingress else {
         return simple_response(StatusCode::NOT_FOUND, "not found");
@@ -378,9 +460,8 @@ async fn public_render(
     )
 }
 
-/// `/{user}/{style}/preview` または `/{style_id}/preview` だけを対象にする。
-/// 一般の tile / static 描画 path とは「最終 segment が literal `preview`」
-/// で衝突しない構造になっているのを利用する。
+/// Matches only `/{user}/{style}/preview` or `/{style_id}/preview`.
+/// Render routes cannot collide because `preview` must be the final segment.
 fn is_preview_path(path: &str) -> bool {
     let segments: Vec<_> = path
         .trim_matches('/')
@@ -388,14 +469,6 @@ fn is_preview_path(path: &str) -> bool {
         .filter(|s| !s.is_empty())
         .collect();
     matches!(segments.len(), 2 | 3) && segments.last().copied() == Some("preview")
-}
-
-fn request_id_from_headers(headers: &HeaderMap) -> Option<RequestId> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(RequestId::from_string)
 }
 
 fn into_axum_response(response: IngressResponse) -> Response {
@@ -463,9 +536,9 @@ mod tests {
         assert!(!is_preview_path("/carto/voyager/0/0/0@2x.png"));
         // preview not last segment
         assert!(!is_preview_path("/foo/preview/bar"));
-        // Too few segments(style id 部分なし)
+        // Too few segments (no style id).
         assert!(!is_preview_path("/preview"));
-        // Too many segments(style id が 2 を超える)
+        // Too many segments (more than two style-id components).
         assert!(!is_preview_path("/foo/bar/baz/preview"));
         // Empty / root
         assert!(!is_preview_path("/"));
@@ -480,6 +553,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
         let request = Request::builder().body(Body::empty()).unwrap();
 
@@ -512,6 +586,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
 
         let request = Request::builder().body(Body::empty()).unwrap();
@@ -538,6 +613,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renderer_health_gates_readiness_before_liveness() {
+        let supervisor = crate::renderer::actor::RendererActorSupervisor::new(1);
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        let state = HttpServerState {
+            ingress: None,
+            drain: None,
+            membership: None,
+            internal_forward: None,
+            metrics: None,
+            renderer_supervisor: Some(supervisor.clone()),
+        };
+
+        // Saturated but recoverable (orphan budget not exhausted): drop out of
+        // the LB via readiness, but do NOT ask the orchestrator to restart —
+        // a completing orphan or replacement can still heal in-process.
+        let ready = handle(
+            State(state.clone()),
+            Method::GET,
+            "/readyz".parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE, "/readyz");
+        let live = handle(
+            State(state.clone()),
+            Method::GET,
+            "/livez".parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(live.status(), StatusCode::OK, "/livez while recoverable");
+
+        // Orphan budget exhausted on top: wedged Still renders cannot be
+        // cancelled and no replacement can spawn — only a process restart
+        // recovers, so liveness must fail too (production-spec §8.4).
+        supervisor.exhaust_orphan_budget_for_test();
+        let live = handle(
+            State(state),
+            Method::GET,
+            "/livez".parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            live.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/livez once unrecoverable"
+        );
+    }
+
+    #[tokio::test]
     async fn single_router_routes_public_and_internal_paths() {
         let options = crate::options::Options::try_parse_from([
             "biei",
@@ -553,6 +680,7 @@ mod tests {
             runtime.node(),
             None,
             ingress.drain_controller(),
+            runtime.renderer_supervisor(),
         ));
         let state = HttpServerState {
             drain: ingress.drain_controller(),
@@ -563,6 +691,7 @@ mod tests {
                 runtime.drain_controller(),
             )),
             metrics,
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
 
         let public = handle(
@@ -605,7 +734,13 @@ mod tests {
             drain: None,
             membership: None,
             internal_forward: None,
-            metrics: Some(HttpMetrics::new(runtime.node(), None, None)),
+            metrics: Some(HttpMetrics::new(
+                runtime.node(),
+                None,
+                None,
+                runtime.renderer_supervisor(),
+            )),
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
 
         let response = handle(
@@ -621,9 +756,13 @@ mod tests {
             .expect("metrics body");
         let body = std::str::from_utf8(&body).expect("utf8 metrics");
         assert!(body.contains("# TYPE biei_queue_depth gauge"));
+        assert!(!body.contains("style_id="));
         assert!(body.contains("biei_worker_loaded"));
         assert!(body.contains("biei_cpu_permits_inuse"));
         assert!(body.contains("biei_drain_state"));
+        assert!(body.contains("biei_renderer_slots"));
+        assert!(body.contains("biei_renderer_orphan_threads"));
+        assert!(body.contains("biei_renderer_replacements_total"));
         assert!(body.contains("# TYPE biei_tasks_completed_total counter"));
         assert!(body.contains(r#"scope="ingress"} 0"#));
     }
@@ -646,6 +785,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
 
         let response = handle(
@@ -674,6 +814,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
         let long_path = format!("/{}", "x".repeat(MAX_PUBLIC_PATH_BYTES + 1));
 
@@ -696,6 +837,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
         let exact_path = format!("/{}", "x".repeat(MAX_PUBLIC_PATH_BYTES - 1));
 
@@ -711,6 +853,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_uri_limit_includes_query_string() {
+        let state = HttpServerState {
+            ingress: None,
+            drain: None,
+            membership: None,
+            internal_forward: None,
+            metrics: None,
+            renderer_supervisor: None,
+        };
+        let uri: Uri = format!("/style/static/none/0,0,1/1x1?addlayer={}", "x".repeat(8192))
+            .parse()
+            .expect("valid oversized URI");
+
+        let response = handle_public(
+            State(state),
+            Method::GET,
+            uri,
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_shutdown_grace_starts_after_the_signal() {
+        let (tx, signal) = shutdown_channel();
+        let task = tokio::spawn(shutdown_grace_elapsed(signal));
+
+        tokio::time::advance(HTTP_SHUTDOWN_GRACE + Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+
+        tx.send(true).expect("send shutdown");
+        tokio::task::yield_now().await;
+        tokio::time::advance(HTTP_SHUTDOWN_GRACE).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+    }
+
+    #[tokio::test]
     async fn public_listener_hides_internal_endpoints() {
         let state = HttpServerState {
             ingress: None,
@@ -718,6 +900,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
 
         for path in [
@@ -754,6 +937,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            renderer_supervisor: None,
         };
 
         let response = handle_internal(

@@ -19,7 +19,7 @@ use crate::http::ingress::HttpIngress;
 use crate::node::{Node, NodeSpawn};
 use crate::options::Options;
 use crate::renderer::BoxRenderer;
-use crate::renderer::actor::RendererActorConfig;
+use crate::renderer::actor::{RendererActorConfig, RendererActorSupervisor};
 use crate::renderer::maplibre::{MapLibreProfilePreparer, MapLibreRenderer};
 use crate::style_catalog::StyleCatalog;
 use crate::tileset_catalog::TilesetCatalog;
@@ -36,7 +36,9 @@ pub struct Runtime {
     tileset_catalog: Arc<TilesetCatalog>,
     drain: DrainController,
     ingress_concurrency_limit: usize,
+    internal_forward_concurrency_limit: usize,
     membership: Option<crate::membership::Membership>,
+    renderer_supervisor: RendererActorSupervisor,
 }
 
 impl Runtime {
@@ -72,6 +74,7 @@ impl Runtime {
             sla_budget,
             self.drain.clone(),
             self.ingress_concurrency_limit,
+            self.renderer_supervisor.clone(),
         )
     }
 
@@ -79,8 +82,17 @@ impl Runtime {
         self.drain.clone()
     }
 
+    pub(crate) fn internal_forward_concurrency_limit(&self) -> usize {
+        self.internal_forward_concurrency_limit
+    }
+
     pub fn membership(&self) -> Option<crate::membership::Membership> {
         self.membership.clone()
+    }
+
+    #[cfg(test)]
+    pub fn renderer_supervisor(&self) -> RendererActorSupervisor {
+        self.renderer_supervisor.clone()
     }
 
     pub async fn begin_draining(&self) {
@@ -165,15 +177,21 @@ fn spawn_node_with_backends(
     let queue_limits = cluster.resolved_queue_limits(&costs);
     let renderer_slots = cluster.renderer_slots_per_node;
     let ingress_concurrency_limit = ingress_concurrency_limit(renderer_slots, queue_limits.hard);
+    let internal_forward_concurrency_limit =
+        internal_forward_concurrency_limit(renderer_slots, queue_limits.hard);
     let render_permits = cluster.resolved_render_permits_per_node();
     let cpu_render_permits = cluster.resolved_cpu_render_permits_per_node();
+    let renderer_supervisor = RendererActorSupervisor::new(renderer_slots);
 
     let renderers: Vec<BoxRenderer> = (0..renderer_slots)
         .map(|worker_id| {
-            let renderer = MapLibreRenderer::spawn(RendererActorConfig {
-                worker_id: worker_id as u32,
-                ambient_cache_path: Some(options.maplibre_cache_path.clone()),
-            })?;
+            let renderer = MapLibreRenderer::spawn_supervised(
+                RendererActorConfig {
+                    worker_id: worker_id as u32,
+                    ambient_cache_path: Some(options.maplibre_cache_path.clone()),
+                },
+                renderer_supervisor.clone(),
+            )?;
             Ok(Box::new(renderer) as BoxRenderer)
         })
         .collect::<Result<_, crate::types::RendererError>>()?;
@@ -216,7 +234,9 @@ fn spawn_node_with_backends(
         tileset_catalog,
         drain: DrainController::new(),
         ingress_concurrency_limit,
+        internal_forward_concurrency_limit,
         membership,
+        renderer_supervisor,
     })
 }
 
@@ -226,6 +246,10 @@ fn ingress_concurrency_limit(renderer_slots: usize, hard_queue_limit: usize) -> 
         .saturating_mul(3)
         .div_ceil(2)
         .max(1)
+}
+
+fn internal_forward_concurrency_limit(renderer_slots: usize, hard_queue_limit: usize) -> usize {
+    renderer_slots.saturating_mul(hard_queue_limit).max(1)
 }
 
 fn default_production_costs(sla: Duration) -> CostConfig {
@@ -261,6 +285,15 @@ impl GossipBus for LocalGossipBus {
             .entry(node_id)
             .or_default()
             .insert(key, value);
+    }
+
+    async fn set_many(&self, node_id: NodeId, kvs: NodeKvs) {
+        self.kvs
+            .lock()
+            .expect("local gossip mutex poisoned")
+            .entry(node_id)
+            .or_default()
+            .extend(kvs);
     }
 
     async fn view(&self) -> ClusterView {
@@ -322,31 +355,14 @@ mod tests {
         let node_id = NodeId::from("node-7");
         let gossip = LocalGossipBus::new(vec![node_id.clone()]);
         gossip
-            .set(
+            .set_many(
                 node_id.clone(),
-                "worker.0.style".to_string(),
-                "carto/voyager@1".to_string(),
-            )
-            .await;
-        gossip
-            .set(
-                node_id.clone(),
-                "worker.0.mode".to_string(),
-                "static".to_string(),
-            )
-            .await;
-        gossip
-            .set(
-                node_id.clone(),
-                "worker.0.scale".to_string(),
-                "2x".to_string(),
-            )
-            .await;
-        gossip
-            .set(
-                node_id.clone(),
-                "worker.0.queue".to_string(),
-                "0".to_string(),
+                NodeKvs::from([
+                    ("worker.0.style".to_string(), "carto/voyager@1".to_string()),
+                    ("worker.0.mode".to_string(), "static".to_string()),
+                    ("worker.0.scale".to_string(), "2x".to_string()),
+                    ("worker.0.queue".to_string(), "0".to_string()),
+                ]),
             )
             .await;
 
@@ -409,6 +425,16 @@ mod tests {
         assert_eq!(ingress_concurrency_limit(20, 28), 840);
         assert_eq!(ingress_concurrency_limit(1, 1), 2);
         assert_eq!(ingress_concurrency_limit(0, 0), 1);
+    }
+
+    #[test]
+    fn internal_forward_limit_is_independent_from_public_ingress() {
+        assert_eq!(internal_forward_concurrency_limit(20, 28), 560);
+        assert_eq!(internal_forward_concurrency_limit(0, 0), 1);
+        assert_ne!(
+            internal_forward_concurrency_limit(20, 28),
+            ingress_concurrency_limit(20, 28)
+        );
     }
 
     #[tokio::test]

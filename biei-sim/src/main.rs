@@ -1,17 +1,131 @@
-//! Demo runner — executes every scenario in sequence and prints the resulting
-//! metrics tables. CSV outputs land alongside the binary.
+//! Simulator CLI. The legacy no-subcommand mode still runs the existing
+//! scenario suite; `run` produces a reproducible JSON report.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Result;
 use biei::types::RouteTier;
 use biei_sim::{
-    Simulation,
+    Simulation, SimulationOptions,
+    churn::ChurnPlan,
     config::{SimConfig, StyleDist},
-    scenarios,
+    scenarios, visualization,
 };
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "biei-sim", about = "Biei cluster simulator")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run one simulation and write a reproducible JSON report.
+    Run {
+        #[arg(long, default_value = "biei-sim-report.json")]
+        report: PathBuf,
+        #[arg(long)]
+        churn_plan: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_000)]
+        sample_every_requests: u64,
+        #[arg(long)]
+        nodes: Option<usize>,
+        #[arg(long)]
+        rate: Option<f64>,
+        #[arg(long)]
+        styles: Option<usize>,
+        #[arg(long)]
+        new_style_rate: Option<f64>,
+        #[arg(long)]
+        duration_seconds: Option<u64>,
+        #[arg(long)]
+        warmup_seconds: Option<u64>,
+        /// Also write a self-contained HTML report.
+        #[arg(long)]
+        html: Option<PathBuf>,
+    },
+    /// Convert a JSON report into a self-contained HTML file.
+    Visualize {
+        input: PathBuf,
+        #[arg(short, long, default_value = "biei-sim-report.html")]
+        output: PathBuf,
+    },
+}
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> Result<()> {
+    match Cli::parse().command {
+        Some(Command::Visualize { input, output }) => {
+            visualization::write_visualization(input, &output)?;
+            println!("written: {}", output.display());
+        }
+        Some(Command::Run {
+            report,
+            churn_plan,
+            sample_every_requests,
+            nodes,
+            rate,
+            styles,
+            new_style_rate,
+            duration_seconds,
+            warmup_seconds,
+            html,
+        }) => {
+            tokio::time::pause();
+            let mut config = SimConfig::default();
+            if let Some(nodes) = nodes {
+                config.node_count = nodes;
+            }
+            if let Some(rate) = rate {
+                config.workload.total_rate = rate;
+            }
+            if let Some(styles) = styles {
+                config.workload.style_count = styles;
+                config.workload.tile_style_count = config.workload.tile_style_count.min(styles);
+            }
+            if let Some(rate) = new_style_rate {
+                config.workload.new_style_rate = rate;
+            }
+            if let Some(seconds) = duration_seconds {
+                config.workload.duration = Duration::from_secs(seconds);
+            }
+            if let Some(seconds) = warmup_seconds {
+                config.workload.warmup = Duration::from_secs(seconds);
+            }
+            let churn_plan = Some(
+                churn_plan
+                    .map(ChurnPlan::from_path)
+                    .transpose()?
+                    .unwrap_or(ChurnPlan { events: Vec::new() }),
+            );
+            let run_report = Simulation::new(config)
+                .run_report(SimulationOptions {
+                    churn_plan,
+                    sample_every_requests,
+                })
+                .await?;
+            println!(
+                "completed={} rejected={} p99={:.1}ms",
+                run_report.result.completed,
+                run_report.result.rejected,
+                run_report.result.latency_p99_ms,
+            );
+            run_report.write_json(&report)?;
+            println!("written: {}", report.display());
+            if let Some(html) = html {
+                visualization::write_visualization(&report, &html)?;
+                println!("written: {}", html.display());
+            }
+        }
+        None => run_legacy().await,
+    }
+    Ok(())
+}
+
+async fn run_legacy() {
     tokio::time::pause();
 
     if std::env::var_os("RUN_LARGE_SCALE_ONLY").is_some() {

@@ -1,6 +1,7 @@
 //! `Renderer` implementation backed by the production MapLibre actor.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -8,7 +9,12 @@ use moka::sync::Cache;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
 
-use crate::renderer::actor::{RenderTaskView, RendererActor, RendererActorConfig, ResolvedStyle};
+use crate::renderer::actor::{
+    RenderTaskView, RendererActor, RendererActorConfig, RendererActorSupervisor, ResolvedStyle,
+};
+use crate::renderer::http_fetch::{
+    BodyReadError, read_bounded_body, redacted_url, redacted_url_str, reqwest_error_label,
+};
 use crate::renderer::{PreparedProfile, ProfilePreparer, Renderer, StyleAvailabilityError};
 use crate::style_catalog::StyleCatalog;
 use crate::types::{
@@ -19,7 +25,9 @@ use crate::types::{
 pub struct MapLibreRenderer {
     actor: RendererActor,
     config: RendererActorConfig,
+    supervisor: RendererActorSupervisor,
     retiring: bool,
+    slot_available: bool,
 }
 
 pub struct MapLibreProfilePreparer {
@@ -29,37 +37,39 @@ pub struct MapLibreProfilePreparer {
     style_json_cache: Cache<StyleRevision, Arc<str>>,
     style_error_cache: Cache<StyleRevision, RendererError>,
     tileset_json_cache: Cache<String, Arc<str>>,
-    inflight_style_loads: Mutex<HashMap<StyleRevision, watch::Sender<StyleLoadSignal>>>,
+    tileset_error_cache: Cache<String, RendererError>,
+    inflight_style_loads: Mutex<HashMap<StyleRevision, watch::Sender<JsonLoadSignal>>>,
+    inflight_tileset_loads: Mutex<HashMap<String, watch::Sender<JsonLoadSignal>>>,
 }
 
 #[derive(Clone)]
-enum StyleLoadSignal {
+enum JsonLoadSignal {
     Pending,
     Ready(Arc<str>),
-    Failed(StyleFetchError),
+    Failed(ProfileFetchError),
     Aborted,
 }
 
 enum CacheLookup {
-    Load(watch::Sender<StyleLoadSignal>),
-    Wait(watch::Receiver<StyleLoadSignal>),
+    Load(watch::Sender<JsonLoadSignal>),
+    Wait(watch::Receiver<JsonLoadSignal>),
     Negative(RendererError),
 }
 
-struct InFlightStyleLoad<'a> {
-    key: StyleRevision,
-    inflight: &'a Mutex<HashMap<StyleRevision, watch::Sender<StyleLoadSignal>>>,
-    tx: watch::Sender<StyleLoadSignal>,
+struct InFlightJsonLoad<'a, K: Eq + Hash> {
+    key: K,
+    inflight: &'a Mutex<HashMap<K, watch::Sender<JsonLoadSignal>>>,
+    tx: watch::Sender<JsonLoadSignal>,
     completed: bool,
 }
 
-impl Drop for InFlightStyleLoad<'_> {
+impl<K: Eq + Hash> Drop for InFlightJsonLoad<'_, K> {
     fn drop(&mut self) {
         if self.completed {
             return;
         }
         lock_unpoisoned(self.inflight).remove(&self.key);
-        self.tx.send_replace(StyleLoadSignal::Aborted);
+        self.tx.send_replace(JsonLoadSignal::Aborted);
     }
 }
 
@@ -73,50 +83,121 @@ const STYLE_JSON_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const STYLE_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 const TILESET_JSON_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const TILESET_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
-const STYLE_JSON_NEGATIVE_CACHE_MAX_ENTRIES: u64 = 4096;
+const JSON_NEGATIVE_CACHE_MAX_ENTRIES: u64 = 4096;
 // Short on purpose: the negative cache only needs to absorb repeated requests
-// for the same definitively-bad style within a burst (§7.5.1 spray defense).
-// A longer TTL would delay a freshly-registered/fixed style from becoming
-// servable. Transient failures (5xx, connection/read errors, timeouts) are not
-// cached here at all — see `StyleFetchError`.
-const STYLE_JSON_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+// for the same definitively-bad style or TileJSON within a burst (§7.5.1 spray
+// defense). A longer TTL would delay a freshly-registered/fixed resource from
+// becoming servable. Transient failures (5xx, connection/read errors,
+// timeouts) are not cached here at all — see `ProfileFetchError`.
+const JSON_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+fn is_permanent_profile_http_status(status: reqwest::StatusCode) -> bool {
+    status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
 
 impl MapLibreRenderer {
     pub fn spawn(config: RendererActorConfig) -> Result<Self, RendererError> {
+        Self::spawn_supervised(config, RendererActorSupervisor::new(1))
+    }
+
+    pub(crate) fn spawn_supervised(
+        config: RendererActorConfig,
+        supervisor: RendererActorSupervisor,
+    ) -> Result<Self, RendererError> {
         Ok(Self {
-            actor: RendererActor::spawn(config.clone())?,
+            actor: RendererActor::spawn_supervised(config.clone(), supervisor.clone())?,
             config,
+            supervisor,
             retiring: false,
+            slot_available: true,
         })
     }
 
     #[cfg(test)]
     fn from_actor(actor: RendererActor) -> Self {
+        let supervisor = RendererActorSupervisor::new(1);
         Self {
             actor,
             config: RendererActorConfig {
                 worker_id: 0,
                 ambient_cache_path: None,
             },
+            supervisor,
             retiring: false,
+            slot_available: true,
         }
     }
 
     pub fn is_alive(&self) -> bool {
-        self.actor.is_alive()
+        !self.retiring && self.actor.is_alive()
     }
 
     fn actor(&mut self) -> Result<&RendererActor, RendererError> {
         if self.retiring {
-            if self.actor.is_alive() {
-                return Err(RendererError::ActorDead);
-            }
-            self.actor = RendererActor::spawn(self.config.clone())?;
-            self.retiring = false;
+            self.replace_retiring_actor()?;
         } else if !self.actor.is_alive() {
-            self.actor = RendererActor::spawn(self.config.clone())?;
+            self.replace_finished_actor()?;
         }
         Ok(&self.actor)
+    }
+
+    fn replace_retiring_actor(&mut self) -> Result<(), RendererError> {
+        if !self.actor.try_abandon() {
+            self.supervisor.record_replacement_exhausted();
+            self.supervisor
+                .set_slot_available(&mut self.slot_available, false);
+            tracing::error!(
+                worker_id = self.config.worker_id,
+                orphaned_threads = self.supervisor.snapshot().orphaned_threads,
+                "renderer actor replacement budget exhausted"
+            );
+            return Err(RendererError::ActorDead);
+        }
+
+        // Reserve bounded orphan capacity before creating another native
+        // renderer thread. Otherwise an exhausted slot briefly creates and
+        // immediately tears down a replacement on every retry.
+        let replacement =
+            match RendererActor::spawn_supervised(self.config.clone(), self.supervisor.clone()) {
+                Ok(actor) => actor,
+                Err(err) => {
+                    self.supervisor.record_replacement_failed();
+                    self.supervisor
+                        .set_slot_available(&mut self.slot_available, false);
+                    return Err(err);
+                }
+            };
+
+        self.actor = replacement;
+        self.retiring = false;
+        self.supervisor
+            .set_slot_available(&mut self.slot_available, true);
+        self.supervisor.record_replacement_succeeded();
+        tracing::warn!(
+            worker_id = self.config.worker_id,
+            "abandoned timed-out renderer actor and spawned replacement"
+        );
+        Ok(())
+    }
+
+    fn replace_finished_actor(&mut self) -> Result<(), RendererError> {
+        match RendererActor::spawn_supervised(self.config.clone(), self.supervisor.clone()) {
+            Ok(actor) => {
+                self.actor = actor;
+                self.supervisor
+                    .set_slot_available(&mut self.slot_available, true);
+                self.supervisor.record_replacement_succeeded();
+                Ok(())
+            }
+            Err(err) => {
+                self.supervisor.record_replacement_failed();
+                self.supervisor
+                    .set_slot_available(&mut self.slot_available, false);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -127,9 +208,11 @@ impl MapLibreProfilePreparer {
             http_client: reqwest::Client::new(),
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches.max(1))),
             style_json_cache: style_json_cache(),
-            style_error_cache: style_error_cache(),
+            style_error_cache: error_cache(),
             tileset_json_cache: tileset_json_cache(),
+            tileset_error_cache: error_cache(),
             inflight_style_loads: Mutex::new(HashMap::new()),
+            inflight_tileset_loads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -147,9 +230,9 @@ impl MapLibreProfilePreparer {
         &self,
         style: &StyleRevision,
         deadline: Instant,
-    ) -> Result<PreparedProfile, StyleFetchError> {
+    ) -> Result<PreparedProfile, ProfileFetchError> {
         loop {
-            match self.lookup_cache(style) {
+            match self.lookup_style_cache(style) {
                 Ok(style_json) => {
                     return Ok(PreparedProfile {
                         revision: style.clone(),
@@ -158,9 +241,9 @@ impl MapLibreProfilePreparer {
                     });
                 }
                 Err(CacheLookup::Wait(mut rx)) => {
-                    match tokio::time::timeout_at(deadline, wait_for_style_load(&mut rx))
+                    match tokio::time::timeout_at(deadline, wait_for_json_load(&mut rx))
                         .await
-                        .map_err(|_| StyleFetchError::transient(RendererError::Timeout))??
+                        .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))??
                     {
                         Some(style_json) => {
                             return Ok(PreparedProfile {
@@ -172,16 +255,23 @@ impl MapLibreProfilePreparer {
                         None => continue,
                     }
                 }
-                Err(CacheLookup::Negative(err)) => return Err(StyleFetchError::permanent(err)),
+                Err(CacheLookup::Negative(err)) => return Err(ProfileFetchError::permanent(err)),
                 Err(CacheLookup::Load(tx)) => {
-                    let mut guard = InFlightStyleLoad {
+                    let mut guard = InFlightJsonLoad {
                         key: style.clone(),
                         inflight: &self.inflight_style_loads,
                         tx: tx.clone(),
                         completed: false,
                     };
                     let result = self.fetch_uncached_style(style, deadline).await;
-                    self.store_fetch_result(style.clone(), tx, &result);
+                    store_json_fetch_result(
+                        &self.style_json_cache,
+                        &self.style_error_cache,
+                        &self.inflight_style_loads,
+                        style.clone(),
+                        tx,
+                        &result,
+                    );
                     guard.completed = true;
                     return result.map(|style_json| PreparedProfile {
                         revision: style.clone(),
@@ -216,37 +306,88 @@ impl MapLibreProfilePreparer {
         deadline: Instant,
     ) -> Result<String, RendererError> {
         let tileset_url = source_url_from_addlayer_source(style_id, source)?;
-        let tilejson = match self.tileset_json_cache.get(&tileset_url) {
-            Some(tilejson) => tilejson,
-            None => {
-                let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
-                    .await
-                    .map_err(|_| RendererError::Timeout)?
-                    .map_err(|_| RendererError::ActorDead)?;
-                let fetched = Arc::<str>::from(
-                    fetch_tileset_json(&self.http_client, style_id, &tileset_url, deadline).await?,
-                );
-                self.tileset_json_cache
-                    .insert(tileset_url.clone(), fetched.clone());
-                fetched
-            }
-        };
+        let tilejson = self
+            .resolve_tileset_json(style_id, &tileset_url, deadline)
+            .await?;
         rewrite_tileset_source_json(style_id, source, &tileset_url, &tilejson)
     }
 
-    fn lookup_cache(&self, revision: &StyleRevision) -> Result<Arc<str>, CacheLookup> {
-        if let Some(style_json) = self.style_json_cache.get(revision) {
-            return Ok(style_json);
+    async fn resolve_tileset_json(
+        &self,
+        style_id: &StyleId,
+        tileset_url: &str,
+        deadline: Instant,
+    ) -> Result<Arc<str>, RendererError> {
+        loop {
+            match self.lookup_tileset_cache(tileset_url) {
+                Ok(tilejson) => return Ok(tilejson),
+                Err(CacheLookup::Wait(mut rx)) => {
+                    match tokio::time::timeout_at(deadline, wait_for_json_load(&mut rx))
+                        .await
+                        .map_err(|_| RendererError::Timeout)?
+                        .map_err(|failure| failure.error)?
+                    {
+                        Some(tilejson) => return Ok(tilejson),
+                        None => continue,
+                    }
+                }
+                Err(CacheLookup::Negative(error)) => return Err(error),
+                Err(CacheLookup::Load(tx)) => {
+                    let mut guard = InFlightJsonLoad {
+                        key: tileset_url.to_string(),
+                        inflight: &self.inflight_tileset_loads,
+                        tx: tx.clone(),
+                        completed: false,
+                    };
+                    let result = self
+                        .fetch_uncached_tileset(style_id, tileset_url, deadline)
+                        .await;
+                    store_json_fetch_result(
+                        &self.tileset_json_cache,
+                        &self.tileset_error_cache,
+                        &self.inflight_tileset_loads,
+                        tileset_url.to_string(),
+                        tx,
+                        &result,
+                    );
+                    guard.completed = true;
+                    return result.map_err(|failure| failure.error);
+                }
+            }
         }
+    }
+
+    fn lookup_style_cache(&self, revision: &StyleRevision) -> Result<Arc<str>, CacheLookup> {
         if let Some(err) = self.style_error_cache.get(revision) {
             return Err(CacheLookup::Negative(err));
+        }
+        if let Some(style_json) = self.style_json_cache.get(revision) {
+            return Ok(style_json);
         }
         let mut inflight = lock_unpoisoned(&self.inflight_style_loads);
         match inflight.get(revision) {
             Some(tx) => Err(CacheLookup::Wait(tx.subscribe())),
             None => {
-                let (tx, _rx) = watch::channel(StyleLoadSignal::Pending);
+                let (tx, _rx) = watch::channel(JsonLoadSignal::Pending);
                 inflight.insert(revision.clone(), tx.clone());
+                Err(CacheLookup::Load(tx))
+            }
+        }
+    }
+
+    fn lookup_tileset_cache(&self, tileset_url: &str) -> Result<Arc<str>, CacheLookup> {
+        if let Some(tilejson) = self.tileset_json_cache.get(tileset_url) {
+            return Ok(tilejson);
+        }
+        if let Some(error) = self.tileset_error_cache.get(tileset_url) {
+            return Err(CacheLookup::Negative(error));
+        }
+        let mut inflight = lock_unpoisoned(&self.inflight_tileset_loads);
+        match inflight.get(tileset_url) {
+            Some(tx) => Err(CacheLookup::Wait(tx.subscribe())),
+            None => {
+                let (tx, _rx) = watch::channel(JsonLoadSignal::Pending);
+                inflight.insert(tileset_url.to_string(), tx.clone());
                 Err(CacheLookup::Load(tx))
             }
         }
@@ -256,16 +397,16 @@ impl MapLibreProfilePreparer {
         &self,
         style: &StyleRevision,
         deadline: Instant,
-    ) -> Result<Arc<str>, StyleFetchError> {
+    ) -> Result<Arc<str>, ProfileFetchError> {
         let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
             .await
-            .map_err(|_| StyleFetchError::transient(RendererError::Timeout))?
-            .map_err(|_| StyleFetchError::transient(RendererError::ActorDead))?;
+            .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
+            .map_err(|_| ProfileFetchError::transient(RendererError::ActorDead))?;
         let definition = self
             .style_catalog
             .definition_for_revision(style)
             .ok_or_else(|| {
-                StyleFetchError::permanent(RendererError::StyleLoadFailed {
+                ProfileFetchError::permanent(RendererError::StyleLoadFailed {
                     style_id: style.id.clone(),
                     source: format!(
                         "style definition for version {} is not registered",
@@ -284,31 +425,47 @@ impl MapLibreProfilePreparer {
         ))
     }
 
-    fn store_fetch_result(
+    async fn fetch_uncached_tileset(
         &self,
-        revision: StyleRevision,
-        tx: watch::Sender<StyleLoadSignal>,
-        result: &Result<Arc<str>, StyleFetchError>,
-    ) {
-        match result {
-            Ok(style_json) => {
-                self.style_json_cache
-                    .insert(revision.clone(), style_json.clone());
-                lock_unpoisoned(&self.inflight_style_loads).remove(&revision);
-                tx.send_replace(StyleLoadSignal::Ready(style_json.clone()));
+        style_id: &StyleId,
+        tileset_url: &str,
+        deadline: Instant,
+    ) -> Result<Arc<str>, ProfileFetchError> {
+        let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
+            .await
+            .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
+            .map_err(|_| ProfileFetchError::transient(RendererError::ActorDead))?;
+        Ok(Arc::from(
+            fetch_tileset_json(&self.http_client, style_id, tileset_url, deadline).await?,
+        ))
+    }
+}
+
+fn store_json_fetch_result<K>(
+    cache: &Cache<K, Arc<str>>,
+    error_cache: &Cache<K, RendererError>,
+    inflight: &Mutex<HashMap<K, watch::Sender<JsonLoadSignal>>>,
+    key: K,
+    tx: watch::Sender<JsonLoadSignal>,
+    result: &Result<Arc<str>, ProfileFetchError>,
+) where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+{
+    match result {
+        Ok(json) => {
+            cache.insert(key.clone(), json.clone());
+            tx.send_replace(JsonLoadSignal::Ready(json.clone()));
+        }
+        Err(failure) => {
+            // Only definitive failures are negative-cached; transient ones
+            // (5xx, connection/read errors, timeouts) must be retried.
+            if failure.negative_cacheable {
+                error_cache.insert(key.clone(), failure.error.clone());
             }
-            Err(failure) => {
-                // Only definitive failures are negative-cached; transient ones
-                // (5xx, connection/read errors, timeouts) must be retried.
-                if failure.negative_cacheable {
-                    self.style_error_cache
-                        .insert(revision.clone(), failure.error.clone());
-                }
-                lock_unpoisoned(&self.inflight_style_loads).remove(&revision);
-                tx.send_replace(StyleLoadSignal::Failed(failure.clone()));
-            }
+            tx.send_replace(JsonLoadSignal::Failed(failure.clone()));
         }
     }
+    lock_unpoisoned(inflight).remove(&key);
 }
 
 fn style_json_cache() -> Cache<StyleRevision, Arc<str>> {
@@ -331,44 +488,47 @@ fn tileset_json_cache() -> Cache<String, Arc<str>> {
         .build()
 }
 
-fn style_error_cache() -> Cache<StyleRevision, RendererError> {
+fn error_cache<K>() -> Cache<K, RendererError>
+where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+{
     Cache::builder()
-        .max_capacity(STYLE_JSON_NEGATIVE_CACHE_MAX_ENTRIES)
-        .time_to_live(STYLE_JSON_NEGATIVE_CACHE_TTL)
+        .max_capacity(JSON_NEGATIVE_CACHE_MAX_ENTRIES)
+        .time_to_live(JSON_NEGATIVE_CACHE_TTL)
         .build()
 }
 
-async fn wait_for_style_load(
-    rx: &mut watch::Receiver<StyleLoadSignal>,
-) -> Result<Option<Arc<str>>, StyleFetchError> {
+async fn wait_for_json_load(
+    rx: &mut watch::Receiver<JsonLoadSignal>,
+) -> Result<Option<Arc<str>>, ProfileFetchError> {
     loop {
         match rx.borrow_and_update().clone() {
-            StyleLoadSignal::Pending => {}
-            StyleLoadSignal::Ready(style_json) => return Ok(Some(style_json)),
-            StyleLoadSignal::Failed(err) => return Err(err),
-            StyleLoadSignal::Aborted => return Ok(None),
+            JsonLoadSignal::Pending => {}
+            JsonLoadSignal::Ready(style_json) => return Ok(Some(style_json)),
+            JsonLoadSignal::Failed(err) => return Err(err),
+            JsonLoadSignal::Aborted => return Ok(None),
         }
         rx.changed()
             .await
-            .map_err(|_| StyleFetchError::transient(RendererError::ActorDead))?;
+            .map_err(|_| ProfileFetchError::transient(RendererError::ActorDead))?;
     }
 }
 
-/// A failed style fetch plus whether it is safe to negative-cache.
+/// A failed style or TileJSON fetch plus whether it is safe to negative-cache.
 ///
 /// Permanent/content failures (4xx, parse, oversize, bad encoding, unknown
-/// style) reproduce on an immediate retry, so caching them briefly is the
+/// resource) reproduce on an immediate retry, so caching them briefly is the
 /// §7.5.1 spray defense. Transient failures (5xx, connection/read errors,
 /// timeouts) may recover at once, so they are never cached — otherwise a
-/// one-second upstream blip becomes `STYLE_JSON_NEGATIVE_CACHE_TTL` of forced
+/// one-second upstream blip becomes `JSON_NEGATIVE_CACHE_TTL` of forced
 /// failures for every request hitting that style.
 #[derive(Clone)]
-struct StyleFetchError {
+struct ProfileFetchError {
     error: RendererError,
     negative_cacheable: bool,
 }
 
-impl StyleFetchError {
+impl ProfileFetchError {
     fn permanent(error: RendererError) -> Self {
         Self {
             error,
@@ -413,7 +573,21 @@ impl ProfilePreparer for MapLibreProfilePreparer {
         self.resolve_style_fetch(revision, deadline)
             .await
             .map(|_| ())
-            .map_err(StyleFetchError::into_availability_error)
+            .map_err(ProfileFetchError::into_availability_error)
+    }
+
+    fn mark_style_load_failed(&self, revision: &StyleRevision) {
+        // A provider may repair invalid style JSON without changing the lazy
+        // template revision. Do not keep feeding MLN the rejected positive
+        // cache entry after the short negative-cache window expires.
+        self.style_json_cache.invalidate(revision);
+        self.style_error_cache.insert(
+            revision.clone(),
+            RendererError::StyleLoadFailed {
+                style_id: revision.id.clone(),
+                source: "MapLibre rejected the prepared style".to_string(),
+            },
+        );
     }
 }
 
@@ -425,9 +599,11 @@ impl MapLibreProfilePreparer {
             http_client: reqwest::Client::new(),
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(16)),
             style_json_cache: style_json_cache(),
-            style_error_cache: style_error_cache(),
+            style_error_cache: error_cache(),
             tileset_json_cache: tileset_json_cache(),
+            tileset_error_cache: error_cache(),
             inflight_style_loads: Mutex::new(HashMap::new()),
+            inflight_tileset_loads: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -457,7 +633,8 @@ impl Renderer for MapLibreRenderer {
     }
 
     async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
-        // Production v0 relies on maplibre-native's default resource loader.
+        // MapLibre resolves source resources through the process-wide Rust
+        // FileSource chain installed by the renderer actor.
         Ok(())
     }
 
@@ -468,6 +645,10 @@ impl Renderer for MapLibreRenderer {
     fn retire_after_current(&mut self) {
         self.retiring = true;
         self.actor.retire_after_current();
+        // Native renders cannot be preempted safely. Replace the actor now and
+        // let the bounded orphan tracker account for the old thread until its
+        // native call returns.
+        let _ = self.replace_retiring_actor();
     }
 }
 
@@ -509,57 +690,111 @@ async fn fetch_tileset_json(
     style_id: &StyleId,
     tileset_url: &str,
     deadline: Instant,
-) -> Result<String, RendererError> {
-    let url = url::Url::parse(tileset_url).map_err(|err| RendererError::StyleLoadFailed {
-        style_id: style_id.clone(),
-        source: format!("tileset URL parse failed for {tileset_url}: {err}"),
+) -> Result<String, ProfileFetchError> {
+    let safe_input = redacted_url_str(tileset_url);
+    let url = url::Url::parse(tileset_url).map_err(|err| {
+        ProfileFetchError::permanent(RendererError::StyleLoadFailed {
+            style_id: style_id.clone(),
+            source: format!("tileset URL parse failed for {safe_input}: {err}"),
+        })
     })?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("unsupported tileset URL scheme: {}", url.scheme()),
-        });
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("unsupported tileset URL scheme: {}", url.scheme()),
+            },
+        ));
     }
+    let safe_url = redacted_url(&url);
     let response = tokio::time::timeout_at(deadline, client.get(url.clone()).send())
         .await
-        .map_err(|_| RendererError::Timeout)?
-        .map_err(|err| RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("tileset GET failed for {url}: {err}"),
+        .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
+        .map_err(|err| {
+            let error_kind = reqwest_error_label(&err);
+            tracing::debug!(
+                style_id = style_id.as_str(),
+                resource_url = safe_url,
+                error_kind,
+                "TileJSON request failed"
+            );
+            ProfileFetchError::transient(RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("tileset GET failed for {safe_url} ({error_kind})"),
+            })
         })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(RendererError::StyleLoadFailed {
+        tracing::debug!(
+            style_id = style_id.as_str(),
+            resource_url = safe_url,
+            %status,
+            "TileJSON provider returned a non-success status"
+        );
+        let error = RendererError::StyleLoadFailed {
             style_id: style_id.clone(),
-            source: format!("tileset GET failed for {url}: HTTP status code {status}"),
+            source: format!("tileset GET failed for {safe_url}: HTTP status code {status}"),
+        };
+        return Err(if is_permanent_profile_http_status(status) {
+            ProfileFetchError::permanent(error)
+        } else {
+            ProfileFetchError::transient(error)
         });
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_TILESET_JSON_BYTES as u64)
-    {
-        return Err(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("tileset JSON exceeds {MAX_TILESET_JSON_BYTES} bytes"),
-        });
-    }
-    let bytes = tokio::time::timeout_at(deadline, response.bytes())
+    let bytes = read_bounded_body(response, MAX_TILESET_JSON_BYTES, deadline)
         .await
-        .map_err(|_| RendererError::Timeout)?
-        .map_err(|err| RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("tileset body read failed for {url}: {err}"),
+        .map_err(|err| match err {
+            BodyReadError::Timeout => ProfileFetchError::transient(RendererError::Timeout),
+            BodyReadError::Transport(_) => {
+                ProfileFetchError::transient(RendererError::StyleLoadFailed {
+                    style_id: style_id.clone(),
+                    source: format!("tileset body read failed for {safe_url}: {err}"),
+                })
+            }
+            BodyReadError::TooLarge { .. } => {
+                ProfileFetchError::permanent(RendererError::StyleLoadFailed {
+                    style_id: style_id.clone(),
+                    source: err.to_string(),
+                })
+            }
         })?;
-    if bytes.len() > MAX_TILESET_JSON_BYTES {
-        return Err(RendererError::StyleLoadFailed {
+    let json = String::from_utf8(bytes).map_err(|err| {
+        ProfileFetchError::permanent(RendererError::StyleLoadFailed {
             style_id: style_id.clone(),
-            source: format!("tileset JSON exceeds {MAX_TILESET_JSON_BYTES} bytes"),
-        });
+            source: format!("tileset JSON is not UTF-8: {err}"),
+        })
+    })?;
+    validate_tileset_json(style_id, &json)?;
+    Ok(json)
+}
+
+fn validate_tileset_json(style_id: &StyleId, json: &str) -> Result<(), ProfileFetchError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|err| {
+        ProfileFetchError::permanent(RendererError::StyleLoadFailed {
+            style_id: style_id.clone(),
+            source: format!("tileset JSON parse failed: {err}"),
+        })
+    })?;
+    let tiles = value
+        .as_object()
+        .and_then(|object| object.get("tiles"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|tiles| !tiles.is_empty())
+        .ok_or_else(|| {
+            ProfileFetchError::permanent(RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: "tileset JSON must contain a non-empty `tiles` array".to_string(),
+            })
+        })?;
+    if tiles.iter().any(|tile| !tile.is_string()) {
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: "tileset JSON contains a non-string tile URL".to_string(),
+            },
+        ));
     }
-    String::from_utf8(bytes.to_vec()).map_err(|err| RendererError::StyleLoadFailed {
-        style_id: style_id.clone(),
-        source: format!("tileset JSON is not UTF-8: {err}"),
-    })
+    Ok(())
 }
 
 fn rewrite_tileset_source_json(
@@ -593,7 +828,10 @@ fn rewrite_tileset_source_json(
             })?;
     let base = url::Url::parse(tileset_url).map_err(|err| RendererError::StyleLoadFailed {
         style_id: style_id.clone(),
-        source: format!("tileset URL parse failed for {tileset_url}: {err}"),
+        source: format!(
+            "tileset URL parse failed for {}: {err}",
+            redacted_url_str(tileset_url)
+        ),
     })?;
     let tile_urls = tilejson_obj
         .get("tiles")
@@ -656,7 +894,7 @@ fn resolve_tile_url(
             .join(&protected_tile)
             .map_err(|err| RendererError::StyleLoadFailed {
                 style_id: style_id.clone(),
-                source: format!("relative tile URL resolve failed for `{tile}`: {err}"),
+                source: format!("relative tile URL resolve failed: {err}"),
             })?,
     };
     if url.scheme() != "http" && url.scheme() != "https" {
@@ -689,14 +927,14 @@ async fn fetch_style_json(
     style_id: &StyleId,
     style_url: &str,
     deadline: Instant,
-) -> Result<String, StyleFetchError> {
+) -> Result<String, ProfileFetchError> {
     let json = match url::Url::parse(style_url) {
         Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
             fetch_http_style_json(client, style_id, url, deadline).await?
         }
         Ok(url) if url.scheme() == "file" => {
             let path = url.to_file_path().map_err(|_| {
-                StyleFetchError::permanent(RendererError::StyleLoadFailed {
+                ProfileFetchError::permanent(RendererError::StyleLoadFailed {
                     style_id: style_id.clone(),
                     source: format!("style file URL is not a local path: {style_url}"),
                 })
@@ -704,10 +942,12 @@ async fn fetch_style_json(
             read_style_json_file(style_id, &path, deadline).await?
         }
         Ok(url) => {
-            return Err(StyleFetchError::permanent(RendererError::StyleLoadFailed {
-                style_id: style_id.clone(),
-                source: format!("unsupported style URL scheme: {}", url.scheme()),
-            }));
+            return Err(ProfileFetchError::permanent(
+                RendererError::StyleLoadFailed {
+                    style_id: style_id.clone(),
+                    source: format!("unsupported style URL scheme: {}", url.scheme()),
+                },
+            ));
         }
         Err(_) => read_style_json_file(style_id, std::path::Path::new(style_url), deadline).await?,
     };
@@ -716,7 +956,7 @@ async fn fetch_style_json(
     // Native parses the same JSON again in load_style_from_json. Revisit if
     // cold profile setup cost becomes visible in production profiles.
     serde_json::from_str::<serde_json::Value>(&json).map_err(|err| {
-        StyleFetchError::permanent(RendererError::StyleLoadFailed {
+        ProfileFetchError::permanent(RendererError::StyleLoadFailed {
             style_id: style_id.clone(),
             source: format!("style JSON parse failed: {err}"),
         })
@@ -729,61 +969,67 @@ async fn fetch_http_style_json(
     style_id: &crate::types::StyleId,
     style_url: url::Url,
     deadline: Instant,
-) -> Result<String, StyleFetchError> {
+) -> Result<String, ProfileFetchError> {
+    let safe_url = redacted_url(&style_url);
     let response = tokio::time::timeout_at(deadline, client.get(style_url.clone()).send())
         .await
-        .map_err(|_| StyleFetchError::transient(RendererError::Timeout))?
+        .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
         .map_err(|err| {
             // Connection/DNS/send failure: the upstream may come back at once.
-            StyleFetchError::transient(RendererError::StyleLoadFailed {
+            let error_kind = reqwest_error_label(&err);
+            tracing::debug!(
+                style_id = style_id.as_str(),
+                resource_url = safe_url,
+                error_kind,
+                "style request failed"
+            );
+            ProfileFetchError::transient(RendererError::StyleLoadFailed {
                 style_id: style_id.clone(),
-                source: format!("style GET failed for {style_url}: {err}"),
+                source: format!("style GET failed for {safe_url} ({error_kind})"),
             })
         })?;
 
     let status = response.status();
     if !status.is_success() {
+        tracing::debug!(
+            style_id = style_id.as_str(),
+            resource_url = safe_url,
+            %status,
+            "style provider returned a non-success status"
+        );
         let err = RendererError::StyleLoadFailed {
             style_id: style_id.clone(),
-            source: format!("style GET failed for {style_url}: HTTP status code {status}"),
+            source: format!("style GET failed for {safe_url}: HTTP status code {status}"),
         };
-        // 4xx means the style is definitively unservable (404/410/...); 5xx and
-        // anything else non-success is treated as a transient upstream problem.
-        return Err(if status.is_client_error() {
-            StyleFetchError::permanent(err)
+        // Most 4xx responses are deterministic for this URL and may absorb a
+        // short burst. 408 and 429 explicitly describe transient conditions
+        // and must not poison the profile negative cache.
+        return Err(if is_permanent_profile_http_status(status) {
+            ProfileFetchError::permanent(err)
         } else {
-            StyleFetchError::transient(err)
+            ProfileFetchError::transient(err)
         });
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_STYLE_JSON_BYTES as u64)
-    {
-        return Err(StyleFetchError::permanent(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("style JSON exceeds {MAX_STYLE_JSON_BYTES} bytes"),
-        }));
-    }
-
-    let bytes = tokio::time::timeout_at(deadline, response.bytes())
+    let bytes = read_bounded_body(response, MAX_STYLE_JSON_BYTES, deadline)
         .await
-        .map_err(|_| StyleFetchError::transient(RendererError::Timeout))?
-        .map_err(|err| {
-            StyleFetchError::transient(RendererError::StyleLoadFailed {
-                style_id: style_id.clone(),
-                source: format!("style body read failed for {style_url}: {err}"),
-            })
+        .map_err(|err| match err {
+            BodyReadError::Timeout => ProfileFetchError::transient(RendererError::Timeout),
+            BodyReadError::Transport(_) => {
+                ProfileFetchError::transient(RendererError::StyleLoadFailed {
+                    style_id: style_id.clone(),
+                    source: format!("style body read failed for {safe_url}: {err}"),
+                })
+            }
+            BodyReadError::TooLarge { .. } => {
+                ProfileFetchError::permanent(RendererError::StyleLoadFailed {
+                    style_id: style_id.clone(),
+                    source: err.to_string(),
+                })
+            }
         })?;
 
-    if bytes.len() > MAX_STYLE_JSON_BYTES {
-        return Err(StyleFetchError::permanent(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("style JSON exceeds {MAX_STYLE_JSON_BYTES} bytes"),
-        }));
-    }
-
-    String::from_utf8(bytes.to_vec()).map_err(|err| {
-        StyleFetchError::permanent(RendererError::StyleLoadFailed {
+    String::from_utf8(bytes).map_err(|err| {
+        ProfileFetchError::permanent(RendererError::StyleLoadFailed {
             style_id: style_id.clone(),
             source: format!("style JSON is not UTF-8: {err}"),
         })
@@ -794,34 +1040,38 @@ async fn read_style_json_file(
     style_id: &crate::types::StyleId,
     path: &std::path::Path,
     deadline: Instant,
-) -> Result<String, StyleFetchError> {
+) -> Result<String, ProfileFetchError> {
     let metadata = tokio::time::timeout_at(deadline, tokio::fs::metadata(path))
         .await
-        .map_err(|_| StyleFetchError::transient(RendererError::Timeout))?
+        .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
         .map_err(|err| {
-            StyleFetchError::transient(RendererError::StyleLoadFailed {
+            ProfileFetchError::transient(RendererError::StyleLoadFailed {
                 style_id: style_id.clone(),
                 source: format!("style file metadata failed for {}: {err}", path.display()),
             })
         })?;
     if !metadata.is_file() {
-        return Err(StyleFetchError::permanent(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("style path is not a file: {}", path.display()),
-        }));
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("style path is not a file: {}", path.display()),
+            },
+        ));
     }
     if metadata.len() > MAX_STYLE_JSON_BYTES as u64 {
-        return Err(StyleFetchError::permanent(RendererError::StyleLoadFailed {
-            style_id: style_id.clone(),
-            source: format!("style JSON exceeds {MAX_STYLE_JSON_BYTES} bytes"),
-        }));
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("style JSON exceeds {MAX_STYLE_JSON_BYTES} bytes"),
+            },
+        ));
     }
 
     tokio::time::timeout_at(deadline, tokio::fs::read_to_string(path))
         .await
-        .map_err(|_| StyleFetchError::transient(RendererError::Timeout))?
+        .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
         .map_err(|err| {
-            StyleFetchError::transient(RendererError::StyleLoadFailed {
+            ProfileFetchError::transient(RendererError::StyleLoadFailed {
                 style_id: style_id.clone(),
                 source: format!("style file read failed for {}: {err}", path.display()),
             })
@@ -870,6 +1120,23 @@ mod tests {
             id: StyleId("carto/voyager".to_string()),
             version: 1,
         }
+    }
+
+    #[test]
+    fn profile_http_status_only_negative_caches_deterministic_client_errors() {
+        assert!(is_permanent_profile_http_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(is_permanent_profile_http_status(reqwest::StatusCode::GONE));
+        assert!(!is_permanent_profile_http_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(!is_permanent_profile_http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!is_permanent_profile_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
     }
 
     fn internal_task(style: StyleRevision) -> InternalTask {
@@ -1061,6 +1328,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_style_rejection_temporarily_suppresses_cached_json() {
+        let (style_url, request_count, server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let task = internal_task(rev.clone());
+
+        assert!(
+            preparer
+                .prepare_profile(&task)
+                .await
+                .expect("style fetch succeeds")
+                .is_some()
+        );
+        preparer.mark_style_load_failed(&rev);
+        assert!(
+            preparer.style_json_cache.get(&rev).is_none(),
+            "MLN rejection invalidates the positive JSON cache"
+        );
+        let error = preparer
+            .prepare_profile(&task)
+            .await
+            .expect_err("native rejection is temporarily suppressed");
+
+        server.abort();
+        assert!(matches!(error, RendererError::StyleLoadFailed { .. }));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn profile_preparer_resolves_addlayer_tileset_before_worker() {
         let (style_url, _style_request_count, style_server) = spawn_counting_style_server(
             axum::http::StatusCode::OK,
@@ -1128,6 +1431,123 @@ mod tests {
             "tile URL template placeholders must remain unescaped: {tile}"
         );
         assert_eq!(second.addlayer_source, Some(source));
+    }
+
+    #[tokio::test]
+    async fn profile_preparer_coalesces_concurrent_tileset_fetches() {
+        let (style_url, _style_request_count, style_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (tileset_url, tileset_request_count, tileset_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"tiles":["tiles/{z}/{x}/{y}.pbf"]}"#,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let mut task = internal_task(rev);
+        attach_addlayer_source(&mut task, tileset_url);
+
+        let (first, second) = tokio::join!(
+            preparer.prepare_profile(&task),
+            preparer.prepare_profile(&task)
+        );
+
+        style_server.abort();
+        tileset_server.abort();
+        assert!(first.expect("first profile prepares").is_some());
+        assert!(second.expect("second profile prepares").is_some());
+        assert_eq!(tileset_request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_preparer_negative_caches_tileset_404() {
+        let (style_url, _style_request_count, style_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (tileset_url, tileset_request_count, tileset_server) = spawn_counting_style_server(
+            axum::http::StatusCode::NOT_FOUND,
+            "missing tileset",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let mut task = internal_task(rev);
+        attach_addlayer_source(&mut task, tileset_url);
+
+        let first = preparer.prepare_profile(&task).await;
+        let second = preparer.prepare_profile(&task).await;
+
+        style_server.abort();
+        tileset_server.abort();
+        assert!(matches!(first, Err(RendererError::StyleLoadFailed { .. })));
+        assert!(matches!(second, Err(RendererError::StyleLoadFailed { .. })));
+        assert_eq!(tileset_request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_preparer_does_not_cache_transient_tileset_5xx() {
+        let (style_url, _style_request_count, style_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (tileset_url, tileset_request_count, tileset_server) = spawn_counting_style_server(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "upstream down",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let mut task = internal_task(rev);
+        attach_addlayer_source(&mut task, tileset_url);
+
+        let first = preparer.prepare_profile(&task).await;
+        let second = preparer.prepare_profile(&task).await;
+
+        style_server.abort();
+        tileset_server.abort();
+        assert!(matches!(first, Err(RendererError::StyleLoadFailed { .. })));
+        assert!(matches!(second, Err(RendererError::StyleLoadFailed { .. })));
+        assert_eq!(tileset_request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn tileset_fetch_error_redacts_query_credentials() {
+        let (tileset_url, _request_count, server) = spawn_counting_style_server(
+            axum::http::StatusCode::NOT_FOUND,
+            "missing tileset",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let secret = "do-not-log-this-token";
+        let error = fetch_tileset_json(
+            &reqwest::Client::new(),
+            &revision().id,
+            &format!("{tileset_url}?access_token={secret}"),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("404 returns a classified fetch failure");
+
+        server.abort();
+        assert!(!error.error.to_string().contains(secret));
     }
 
     #[tokio::test]

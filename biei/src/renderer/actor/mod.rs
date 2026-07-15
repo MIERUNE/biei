@@ -6,6 +6,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 
@@ -28,7 +29,141 @@ use crate::types::{
     StyleRevision, TaskId, WorkerId,
 };
 
-const ACTOR_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(10);
+// Native renderer destruction flushes backend state and may take a few tens of
+// milliseconds even when no render is in flight. Keep shutdown bounded, but
+// avoid treating normal destruction as a stuck actor.
+const ACTOR_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+const THREAD_RUNNING: u8 = 0;
+const THREAD_ORPHANED: u8 = 1;
+const THREAD_FINISHED: u8 = 2;
+
+#[derive(Clone, Debug)]
+pub struct RendererActorSupervisor {
+    inner: Arc<RendererActorSupervisorInner>,
+}
+
+#[derive(Debug)]
+struct RendererActorSupervisorInner {
+    total_slots: usize,
+    available_slots: AtomicUsize,
+    max_orphaned_threads: usize,
+    orphaned_threads: AtomicUsize,
+    replacements_succeeded: AtomicU64,
+    replacements_exhausted: AtomicU64,
+    replacements_failed: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererActorHealthSnapshot {
+    pub total_slots: usize,
+    pub available_slots: usize,
+    pub orphaned_threads: usize,
+    pub replacements_succeeded: u64,
+    pub replacements_exhausted: u64,
+    pub replacements_failed: u64,
+}
+
+impl RendererActorSupervisor {
+    pub fn new(total_slots: usize) -> Self {
+        let total_slots = total_slots.max(1);
+        Self {
+            inner: Arc::new(RendererActorSupervisorInner {
+                total_slots,
+                available_slots: AtomicUsize::new(total_slots),
+                // One abandoned native render per configured slot is enough
+                // to recover a complete first-wave wedge without allowing an
+                // attacker to leak threads indefinitely.
+                max_orphaned_threads: total_slots,
+                orphaned_threads: AtomicUsize::new(0),
+                replacements_succeeded: AtomicU64::new(0),
+                replacements_exhausted: AtomicU64::new(0),
+                replacements_failed: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.inner.available_slots.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether in-process recovery is still possible. False once every slot is
+    /// unavailable AND the orphan budget is exhausted: renders cannot be
+    /// cancelled (engine constraint), a wedged Still render may never finish,
+    /// and no replacement can be spawned — the only full recovery is a process
+    /// restart (production-spec §8.4). Liveness should fail in that state so
+    /// the orchestrator restarts the pod.
+    pub fn is_livable(&self) -> bool {
+        self.inner.available_slots.load(Ordering::Acquire) > 0
+            || self.inner.orphaned_threads.load(Ordering::Acquire) < self.inner.max_orphaned_threads
+    }
+
+    /// Test hook: consume the entire orphan budget to simulate the
+    /// unrecoverable state (`is_livable() == false` once no slot is available).
+    #[cfg(test)]
+    pub(crate) fn exhaust_orphan_budget_for_test(&self) {
+        self.inner
+            .orphaned_threads
+            .store(self.inner.max_orphaned_threads, Ordering::Release);
+    }
+
+    pub fn snapshot(&self) -> RendererActorHealthSnapshot {
+        RendererActorHealthSnapshot {
+            total_slots: self.inner.total_slots,
+            available_slots: self.inner.available_slots.load(Ordering::Acquire),
+            orphaned_threads: self.inner.orphaned_threads.load(Ordering::Acquire),
+            replacements_succeeded: self.inner.replacements_succeeded.load(Ordering::Relaxed),
+            replacements_exhausted: self.inner.replacements_exhausted.load(Ordering::Relaxed),
+            replacements_failed: self.inner.replacements_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn try_reserve_orphan(&self) -> bool {
+        self.inner
+            .orphaned_threads
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.inner.max_orphaned_threads).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn reserve_orphan_unchecked(&self) {
+        self.inner.orphaned_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn release_orphan(&self) {
+        self.inner.orphaned_threads.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn record_replacement_succeeded(&self) {
+        self.inner
+            .replacements_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replacement_exhausted(&self) {
+        self.inner
+            .replacements_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replacement_failed(&self) {
+        self.inner
+            .replacements_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_slot_available(&self, available: &mut bool, next: bool) {
+        if *available == next {
+            return;
+        }
+        if next {
+            self.inner.available_slots.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.inner.available_slots.fetch_sub(1, Ordering::AcqRel);
+        }
+        *available = next;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RendererActorConfig {
@@ -87,6 +222,8 @@ pub trait BlockingRenderBackend: 'static {
 pub struct RendererActor {
     tx: mpsc::Sender<RenderCmd>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
+    thread_status: Arc<AtomicU8>,
+    supervisor: RendererActorSupervisor,
 }
 
 enum RenderCmd {
@@ -105,8 +242,15 @@ enum RenderCmd {
 
 impl RendererActor {
     pub fn spawn(config: RendererActorConfig) -> Result<Self, RendererError> {
+        Self::spawn_supervised(config, RendererActorSupervisor::new(1))
+    }
+
+    pub fn spawn_supervised(
+        config: RendererActorConfig,
+        supervisor: RendererActorSupervisor,
+    ) -> Result<Self, RendererError> {
         let ambient_cache_path = config.ambient_cache_path.clone();
-        Self::spawn_with_backend_factory(config, move || {
+        Self::spawn_with_backend_factory(config, supervisor, move || {
             MapLibreNativeBackend::new(ambient_cache_path)
         })
     }
@@ -118,11 +262,23 @@ impl RendererActor {
     where
         B: BlockingRenderBackend + Send,
     {
-        Self::spawn_with_backend_factory(config, || backend)
+        Self::spawn_with_backend_supervised(config, RendererActorSupervisor::new(1), backend)
+    }
+
+    fn spawn_with_backend_supervised<B>(
+        config: RendererActorConfig,
+        supervisor: RendererActorSupervisor,
+        backend: B,
+    ) -> Result<Self, RendererError>
+    where
+        B: BlockingRenderBackend + Send,
+    {
+        Self::spawn_with_backend_factory(config, supervisor, || backend)
     }
 
     fn spawn_with_backend_factory<F, B>(
         config: RendererActorConfig,
+        supervisor: RendererActorSupervisor,
         backend_factory: F,
     ) -> Result<Self, RendererError>
     where
@@ -130,9 +286,18 @@ impl RendererActor {
         B: BlockingRenderBackend,
     {
         let (tx, rx) = mpsc::channel();
+        let thread_status = Arc::new(AtomicU8::new(THREAD_RUNNING));
+        let exit_status = Arc::clone(&thread_status);
+        let exit_supervisor = supervisor.clone();
         let thread = thread::Builder::new()
             .name(format!("biei-renderer-{}", config.worker_id))
-            .spawn(move || run_actor(rx, backend_factory()))
+            .spawn(move || {
+                let _exit = ActorThreadExit {
+                    status: exit_status,
+                    supervisor: exit_supervisor,
+                };
+                run_actor(rx, backend_factory());
+            })
             .map_err(|err| {
                 RendererError::RenderFailed(format!("failed to spawn renderer actor: {err}"))
             })?;
@@ -140,6 +305,8 @@ impl RendererActor {
         Ok(Self {
             tx,
             thread: Mutex::new(Some(thread)),
+            thread_status,
+            supervisor,
         })
     }
 
@@ -175,6 +342,48 @@ impl RendererActor {
     pub fn retire_after_current(&self) {
         let _ = self.tx.send(RenderCmd::Retire);
     }
+
+    /// Detach a wedged actor thread after reserving bounded orphan capacity.
+    /// The thread decrements the orphan count itself if the native call ever
+    /// returns. A detached actor has no join handle and can be dropped cheaply.
+    pub(crate) fn try_abandon(&self) -> bool {
+        let mut thread = lock_unpoisoned(&self.thread);
+        let Some(handle) = thread.as_ref() else {
+            return true;
+        };
+        if handle.is_finished() {
+            let handle = thread.take().expect("renderer thread exists");
+            drop(thread);
+            let _ = handle.join();
+            return true;
+        }
+        if !self.supervisor.try_reserve_orphan() {
+            return false;
+        }
+        match self.thread_status.compare_exchange(
+            THREAD_RUNNING,
+            THREAD_ORPHANED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Dropping a JoinHandle detaches the still-running thread.
+                thread.take();
+                true
+            }
+            Err(THREAD_FINISHED) => {
+                self.supervisor.release_orphan();
+                let handle = thread.take().expect("renderer thread exists");
+                drop(thread);
+                let _ = handle.join();
+                true
+            }
+            Err(_) => {
+                self.supervisor.release_orphan();
+                false
+            }
+        }
+    }
 }
 
 impl Drop for RendererActor {
@@ -191,12 +400,43 @@ impl Drop for RendererActor {
             if thread.is_finished() {
                 let _ = thread.join();
             } else {
+                if self
+                    .thread_status
+                    .compare_exchange(
+                        THREAD_RUNNING,
+                        THREAD_ORPHANED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.supervisor.reserve_orphan_unchecked();
+                }
                 tracing::warn!(
                     "renderer actor thread did not stop promptly; detaching to avoid blocking shutdown"
                 );
             }
         }
     }
+}
+
+struct ActorThreadExit {
+    status: Arc<AtomicU8>,
+    supervisor: RendererActorSupervisor,
+}
+
+impl Drop for ActorThreadExit {
+    fn drop(&mut self) {
+        if self.status.swap(THREAD_FINISHED, Ordering::AcqRel) == THREAD_ORPHANED {
+            self.supervisor.release_orphan();
+        }
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 async fn await_actor_reply<T>(
@@ -846,6 +1086,35 @@ mod tests {
         }
     }
 
+    struct SlowDropBackend {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl BlockingRenderBackend for SlowDropBackend {
+        fn load_profile(
+            &mut self,
+            _style: &ResolvedStyle,
+            _task: &RenderTaskView,
+        ) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+            Ok(RenderOutput {
+                bytes: vec![task.id as u8].into(),
+                format: task.output_format,
+            })
+        }
+    }
+
+    impl Drop for SlowDropBackend {
+        fn drop(&mut self) {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     struct ResetCountingBackend {
         resets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1151,6 +1420,28 @@ mod tests {
         assert!(actor.is_alive());
     }
 
+    #[test]
+    fn actor_drop_waits_for_normal_backend_destruction() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let actor = RendererActor::spawn_with_backend(
+            RendererActorConfig {
+                worker_id: 16,
+                ambient_cache_path: None,
+            },
+            SlowDropBackend {
+                dropped: Arc::clone(&dropped),
+            },
+        )
+        .expect("actor spawns");
+
+        drop(actor);
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "actor shutdown joins a backend with a normal slow destructor"
+        );
+    }
+
     #[tokio::test]
     async fn actor_rejects_render_before_matching_style_is_loaded() {
         let actor = RendererActor::spawn_with_backend(
@@ -1195,6 +1486,55 @@ mod tests {
             .expect_err("actor reply wait times out at task deadline");
 
         assert!(matches!(err, RendererError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn abandoned_actor_threads_are_bounded_and_released_on_exit() {
+        let supervisor = RendererActorSupervisor::new(1);
+        let actor = RendererActor::spawn_with_backend_supervised(
+            RendererActorConfig {
+                worker_id: 17,
+                ambient_cache_path: None,
+            },
+            supervisor.clone(),
+            SlowBackend,
+        )
+        .expect("actor spawns");
+        let style = resolved_style();
+        let mut task = task_view(style.revision.clone());
+        actor
+            .load_profile(style, task.clone())
+            .await
+            .expect("profile loads");
+        task.deadline = Instant::now() + std::time::Duration::from_millis(5);
+        assert!(matches!(
+            actor.render(task).await,
+            Err(RendererError::Timeout)
+        ));
+        actor.retire_after_current();
+        assert!(actor.try_abandon());
+        assert_eq!(supervisor.snapshot().orphaned_threads, 1);
+
+        let second = RendererActor::spawn_with_backend_supervised(
+            RendererActorConfig {
+                worker_id: 18,
+                ambient_cache_path: None,
+            },
+            supervisor.clone(),
+            FakeBackend,
+        )
+        .expect("second actor spawns");
+        assert!(
+            !second.try_abandon(),
+            "orphan budget must prevent unbounded detached threads"
+        );
+        drop(second);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while supervisor.snapshot().orphaned_threads != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(supervisor.snapshot().orphaned_threads, 0);
     }
 
     #[tokio::test]

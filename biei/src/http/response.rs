@@ -89,8 +89,13 @@ pub fn response_from_outcome(outcome: TaskOutcome) -> IngressResponse {
         TaskResult::Rejected { reason } => {
             response_from_rejection(reason).with_request_id(&request_id)
         }
-        TaskResult::Failed { error, kind } => {
-            response_from_failure(kind, &error).with_request_id(&request_id)
+        TaskResult::Failed { kind, .. } => {
+            tracing::warn!(
+                request_id = request_id.as_str(),
+                failure_kind = ?kind,
+                "render request failed"
+            );
+            response_from_failure(kind).with_request_id(&request_id)
         }
     }
 }
@@ -117,18 +122,18 @@ pub(crate) fn response_from_rejection(reason: RejectionReason) -> IngressRespons
     }
 }
 
-fn response_from_failure(kind: FailureKind, error: &str) -> IngressResponse {
+fn response_from_failure(kind: FailureKind) -> IngressResponse {
     match kind {
         FailureKind::RenderTimeout => {
-            IngressResponse::json(504, "render_timeout", error).with_retry_after("1")
+            IngressResponse::json(504, "render_timeout", "").with_retry_after("1")
         }
         FailureKind::RendererDead => {
-            IngressResponse::json(500, "renderer_dead", error).with_retry_after("1")
+            IngressResponse::json(500, "renderer_dead", "").with_retry_after("1")
         }
-        FailureKind::StyleUnavailable => IngressResponse::json(502, "style_unavailable", error),
-        FailureKind::StyleNotReady => IngressResponse::json(500, "style_not_ready", error),
-        FailureKind::SourceUnavailable => IngressResponse::json(502, "source_unavailable", error),
-        FailureKind::Other => IngressResponse::json(500, "render_failed", error),
+        FailureKind::StyleUnavailable => IngressResponse::json(502, "style_unavailable", ""),
+        FailureKind::StyleNotReady => IngressResponse::json(500, "style_not_ready", ""),
+        FailureKind::SourceUnavailable => IngressResponse::json(502, "source_unavailable", ""),
+        FailureKind::Other => IngressResponse::json(500, "render_failed", ""),
     }
 }
 
@@ -220,7 +225,7 @@ mod tests {
             had_source: false,
             deadline_stage: None,
             result: TaskResult::Failed {
-                error: "render timeout".to_string(),
+                error: "fetch failed for https://provider.test/style?token=secret".to_string(),
                 kind: FailureKind::RenderTimeout,
             },
         });
@@ -233,10 +238,9 @@ mod tests {
                 (REQUEST_ID_HEADER, "rid".to_string())
             ]
         );
-        assert!(
-            std::str::from_utf8(&response.body)
-                .expect("json body")
-                .contains("render_timeout")
-        );
+        let body = std::str::from_utf8(&response.body).expect("json body");
+        assert!(body.contains("render_timeout"));
+        assert!(!body.contains("provider.test"));
+        assert!(!body.contains("secret"));
     }
 }

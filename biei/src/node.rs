@@ -1,10 +1,10 @@
 //! `Node` — request/response entry point composing dispatcher + worker pool +
 //! gossip publisher.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -14,20 +14,22 @@ use crate::config::{CostConfig, GossipConfig, RoutingConfig};
 use crate::dispatcher::{Dispatcher, DispatcherSpawn};
 use crate::gossip::GossipBus;
 use crate::metrics::NodeMetrics;
-use crate::render_cache::{RenderOutputCache, cache_hit_outcome};
+use crate::render_cache::{
+    RenderCacheLookup, RenderFlightLeader, RenderOutputCache, cache_hit_outcome,
+};
 use crate::renderer::{BoxRenderer, PreparedProfile, ProfilePreparer};
 use crate::style_catalog::StyleCatalog;
 use crate::transport::{ForwardError, Transport};
 use crate::types::{
     ClusterView, Decision, InternalTask, NodeId, ProcessError, RejectionReason, RequestId,
-    RouteTier, TaskOutcome, TaskResult, WorkerView,
+    RouteTier, TaskOutcome, TaskResult, WorkerId, WorkerView,
 };
 use crate::wire::ForwardRequest;
 use crate::worker_pool::{PoolSnapshotter, WorkerPool, WorkerPoolSpawn};
 
 const MIN_FORWARD_BUDGET_MS: u64 = 200;
 const MAX_FORWARDING_HOPS: u8 = 1;
-const MAX_CLUSTER_VIEW_CACHE_TTL: Duration = Duration::from_millis(10);
+const MAX_CLUSTER_VIEW_CACHE_TTL: Duration = Duration::from_millis(100);
 const MIN_CLUSTER_VIEW_CACHE_TTL: Duration = Duration::from_millis(1);
 
 /// Cheap-to-clone handle for a node. Internals hidden behind `Arc<NodeInner>`
@@ -55,47 +57,114 @@ struct NodeInner {
 
 struct ClusterViewCache {
     ttl: Duration,
-    cached: Mutex<Option<CachedClusterView>>,
+    state: Mutex<ClusterViewCacheState>,
+    changed: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct ClusterViewCacheState {
+    cached: Option<CachedClusterView>,
+    loading: bool,
 }
 
 struct CachedClusterView {
     expires_at: Instant,
-    view: ClusterView,
+    view: Arc<ClusterView>,
 }
 
 impl ClusterViewCache {
     fn new(ttl: Duration) -> Self {
+        let (changed, _) = watch::channel(0);
         Self {
             ttl,
-            cached: Mutex::new(None),
+            state: Mutex::new(ClusterViewCacheState::default()),
+            changed,
         }
     }
 
-    async fn get_or_load(&self, gossip: &dyn GossipBus) -> ClusterView {
-        let now = Instant::now();
-        {
-            let cached = self.cached.lock().await;
-            if let Some(cached_view) = cached.as_ref().filter(|cached| cached.expires_at > now) {
-                // TODO: if this clone shows up in profiles, store Arc<ClusterView>
-                // and pass a borrow/Arc through the dispatcher boundary.
-                return cached_view.view.clone();
+    async fn get_or_load(&self, gossip: &dyn GossipBus) -> Arc<ClusterView> {
+        loop {
+            let mut changed = self.changed.subscribe();
+            let should_load = {
+                let mut state = lock_unpoisoned(&self.state);
+                if let Some(cached) = state
+                    .cached
+                    .as_ref()
+                    .filter(|cached| cached.expires_at > Instant::now())
+                {
+                    return Arc::clone(&cached.view);
+                }
+                if state.loading {
+                    if let Some(cached) = &state.cached {
+                        // A bounded stale snapshot is preferable to making a
+                        // request wait behind a gossip refresh.
+                        return Arc::clone(&cached.view);
+                    }
+                    false
+                } else {
+                    state.loading = true;
+                    true
+                }
+            };
+
+            if should_load {
+                let load = ClusterViewLoad::new(self);
+                let view = Arc::new(gossip.view().await);
+                load.complete(Arc::clone(&view));
+                return view;
             }
-        }
 
-        let view = gossip.view().await;
-        let mut cached = self.cached.lock().await;
-        if let Some(cached_view) = cached
-            .as_ref()
-            .filter(|cached| cached.expires_at > Instant::now())
-        {
-            return cached_view.view.clone();
+            // `watch` remembers changes that happen after subscribe but
+            // before this await, avoiding a lost wakeup on the initial load.
+            let _ = changed.changed().await;
         }
-        *cached = Some(CachedClusterView {
-            expires_at: Instant::now() + self.ttl,
-            view: view.clone(),
-        });
-        view
     }
+}
+
+struct ClusterViewLoad<'a> {
+    cache: &'a ClusterViewCache,
+    complete: bool,
+}
+
+impl<'a> ClusterViewLoad<'a> {
+    fn new(cache: &'a ClusterViewCache) -> Self {
+        Self {
+            cache,
+            complete: false,
+        }
+    }
+
+    fn complete(mut self, view: Arc<ClusterView>) {
+        let mut state = lock_unpoisoned(&self.cache.state);
+        state.cached = Some(CachedClusterView {
+            expires_at: Instant::now() + self.cache.ttl,
+            view,
+        });
+        state.loading = false;
+        self.complete = true;
+        drop(state);
+        self.cache.changed.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
+}
+
+impl Drop for ClusterViewLoad<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        lock_unpoisoned(&self.cache.state).loading = false;
+        self.cache.changed.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn cluster_view_cache_ttl(publish_interval: Duration) -> Duration {
@@ -185,12 +254,13 @@ impl Node {
                 let mut last_sent = crate::types::NodeKvs::new();
                 loop {
                     let kvs = snap.snapshot_kvs();
-                    for (k, v) in kvs.iter() {
-                        if last_sent.get(k) != Some(v) {
-                            gossip
-                                .set(publisher_node_id.clone(), k.clone(), v.clone())
-                                .await;
-                        }
+                    let changed: crate::types::NodeKvs = kvs
+                        .iter()
+                        .filter(|(key, value)| last_sent.get(*key) != Some(*value))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    if !changed.is_empty() {
+                        gossip.set_many(publisher_node_id.clone(), changed).await;
                     }
                     last_sent = kvs;
                     tokio::time::sleep(interval).await;
@@ -269,35 +339,27 @@ impl Node {
             ));
         }
 
-        if let Some(outcome) = self.cached_task_outcome(&task) {
-            tracing::debug!(
-                task_id,
-                style_id = %task.style.id.as_str(),
-                "serving incoming task from render output cache"
-            );
-            self.inner.metrics.record_render_output_cache_hit();
-            return self.record_ingress_outcome(outcome);
-        }
-        if self.inner.render_output_cache.is_enabled_for(&task) {
-            self.inner.metrics.record_render_output_cache_miss();
-        }
-
-        let cache_task = task.clone();
+        let cache_flight = match self.acquire_render_output_cache(&task).await {
+            Ok(flight) => flight,
+            Err(outcome) => return self.record_ingress_outcome(outcome),
+        };
         let view = self
             .inner
             .view_cache
             .get_or_load(self.inner.gossip.as_ref())
             .await;
-        let outcome = match self.inner.dispatcher.decide(&task, view) {
+        let outcome = match self.inner.dispatcher.decide(&task, &view) {
             Decision::Local {
                 route_tier,
                 worker_hint,
+                fallback_candidates,
             } => {
                 tracing::debug!(
                     task_id,
                     style_id = %task.style.id.as_str(),
                     ?route_tier,
                     ?worker_hint,
+                    fallback_candidates = fallback_candidates.len(),
                     "routing task locally"
                 );
                 let prepared_profile = match self.prepare_local_profile(&task).await {
@@ -313,13 +375,25 @@ impl Node {
                         ));
                     }
                 };
+                let fallback_task = (!fallback_candidates.is_empty()).then(|| task.clone());
                 match self
-                    .inner
-                    .pool
-                    .process(task, prepared_profile, route_tier, worker_hint)
+                    .process_local_task(task, prepared_profile, route_tier, worker_hint)
                     .await
                 {
                     Ok(o) => o,
+                    Err(err) if fallback_task.is_some() => {
+                        tracing::debug!(
+                            task_id,
+                            error = ?err,
+                            "local admission failed; trying remaining HRW candidates"
+                        );
+                        self.forward_with_failover(
+                            fallback_task.expect("checked above"),
+                            route_tier,
+                            fallback_candidates,
+                        )
+                        .await
+                    }
                     Err(err) => {
                         outcome_from_process_error(task_id, request_id, arrived_at, had_source, err)
                     }
@@ -349,7 +423,7 @@ impl Node {
                 reject(task_id, request_id, arrived_at, had_source, reason)
             }
         };
-        self.maybe_insert_render_output_cache(&cache_task, &outcome);
+        self.maybe_insert_render_output_cache(cache_flight.as_ref(), &outcome);
         self.record_ingress_outcome(outcome)
     }
 
@@ -406,19 +480,10 @@ impl Node {
                 RejectionReason::DeadlineExceeded,
             ));
         }
-        if let Some(outcome) = self.cached_task_outcome(&task) {
-            tracing::debug!(
-                task_id,
-                style_id = %task.style.id.as_str(),
-                "serving forwarded task from render output cache"
-            );
-            self.inner.metrics.record_render_output_cache_hit();
-            return self.record_forwarded_outcome(outcome);
-        }
-        if self.inner.render_output_cache.is_enabled_for(&task) {
-            self.inner.metrics.record_render_output_cache_miss();
-        }
-        let cache_task = task.clone();
+        let cache_flight = match self.acquire_render_output_cache(&task).await {
+            Ok(flight) => flight,
+            Err(outcome) => return self.record_forwarded_outcome(outcome),
+        };
         let prepared_profile = match self.prepare_local_profile(&task).await {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -433,9 +498,7 @@ impl Node {
             }
         };
         let outcome = match self
-            .inner
-            .pool
-            .process(task, prepared_profile, route_tier, drain_worker)
+            .process_local_task(task, prepared_profile, route_tier, drain_worker)
             .await
         {
             Ok(o) => o,
@@ -443,15 +506,55 @@ impl Node {
                 outcome_from_process_error(task_id, request_id, arrived_at, had_source, err)
             }
         };
-        self.maybe_insert_render_output_cache(&cache_task, &outcome);
+        self.maybe_insert_render_output_cache(cache_flight.as_ref(), &outcome);
         self.record_forwarded_outcome(outcome)
     }
 
-    fn cached_task_outcome(&self, task: &InternalTask) -> Option<TaskOutcome> {
-        self.inner
-            .render_output_cache
-            .get(task)
-            .map(|output| cache_hit_outcome(self.inner.id.clone(), task, output))
+    async fn acquire_render_output_cache(
+        &self,
+        task: &InternalTask,
+    ) -> Result<Option<RenderFlightLeader>, TaskOutcome> {
+        let mut joined_existing_render = false;
+        loop {
+            match self.inner.render_output_cache.lookup_or_join(task) {
+                RenderCacheLookup::Disabled => return Ok(None),
+                RenderCacheLookup::Hit(output) => {
+                    tracing::debug!(
+                        task_id = task.id,
+                        style_id = %task.style.id.as_str(),
+                        "serving task from render output cache"
+                    );
+                    self.inner.metrics.record_render_output_cache_hit();
+                    return Err(cache_hit_outcome(self.inner.id.clone(), task, output));
+                }
+                RenderCacheLookup::Leader(leader) => {
+                    self.inner.metrics.record_render_output_cache_miss();
+                    return Ok(Some(leader));
+                }
+                RenderCacheLookup::Wait(mut changed) => {
+                    if !joined_existing_render {
+                        self.inner.metrics.record_render_output_cache_coalesced();
+                        joined_existing_render = true;
+                    }
+                    tokio::select! {
+                        result = changed.changed() => {
+                            // A leader may complete without a cacheable result.
+                            // Re-check both the cache and flight election state.
+                            let _ = result;
+                        }
+                        _ = tokio::time::sleep_until(task.deadline) => {
+                            return Err(reject(
+                                task.id,
+                                task.request_id.clone(),
+                                task.arrived_at,
+                                task.source.is_some(),
+                                RejectionReason::DeadlineExceeded,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn prepare_local_profile(
@@ -459,6 +562,33 @@ impl Node {
         task: &InternalTask,
     ) -> Result<Option<PreparedProfile>, crate::types::RendererError> {
         self.inner.profile_preparer.prepare_profile(task).await
+    }
+
+    async fn process_local_task(
+        &self,
+        task: InternalTask,
+        prepared_profile: Option<PreparedProfile>,
+        route_tier: RouteTier,
+        worker_hint: Option<WorkerId>,
+    ) -> Result<TaskOutcome, ProcessError> {
+        let revision = task.style.clone();
+        let outcome = self
+            .inner
+            .pool
+            .process(task, prepared_profile, route_tier, worker_hint)
+            .await?;
+        if matches!(
+            &outcome.result,
+            TaskResult::Failed {
+                kind: crate::types::FailureKind::StyleUnavailable,
+                ..
+            }
+        ) {
+            self.inner
+                .profile_preparer
+                .mark_style_load_failed(&revision);
+        }
+        Ok(outcome)
     }
 
     /// Confirm a style is actually fetchable at its provider, reusing the
@@ -476,12 +606,12 @@ impl Node {
             .await
     }
 
-    fn maybe_insert_render_output_cache(&self, task: &InternalTask, outcome: &TaskOutcome) {
-        if self
-            .inner
-            .render_output_cache
-            .insert_from_outcome(task, outcome)
-        {
+    fn maybe_insert_render_output_cache(
+        &self,
+        cache_flight: Option<&RenderFlightLeader>,
+        outcome: &TaskOutcome,
+    ) {
+        if cache_flight.is_some_and(|flight| flight.insert_from_outcome(outcome)) {
             self.inner.metrics.record_render_output_cache_insert();
         }
     }
@@ -546,7 +676,6 @@ impl Node {
             let drain_worker = candidate.drain_worker;
             let fwd = ForwardRequest {
                 task: forwarded_task
-                    .clone()
                     .to_wire_with_hop_latency(tokio::time::Instant::now(), self.inner.hop_latency),
                 route_tier,
                 drain_worker,
@@ -622,9 +751,7 @@ impl Node {
                 }
             };
             return match self
-                .inner
-                .pool
-                .process(
+                .process_local_task(
                     fallback_task,
                     prepared_profile,
                     RouteTier::Tier4Overflow,
@@ -798,6 +925,7 @@ mod tests {
     struct CountingViewGossip {
         calls: Arc<AtomicUsize>,
         view: ClusterView,
+        delay: Duration,
     }
 
     #[async_trait]
@@ -806,6 +934,7 @@ mod tests {
 
         async fn view(&self) -> ClusterView {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             self.view.clone()
         }
     }
@@ -833,6 +962,7 @@ mod tests {
                 states: HashMap::new(),
                 generated_at: Instant::now(),
             },
+            delay: Duration::ZERO,
         };
         let cache = ClusterViewCache::new(Duration::from_secs(1));
 
@@ -840,7 +970,44 @@ mod tests {
         let second = cache.get_or_load(&gossip).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.generated_at, second.generated_at);
+    }
+
+    #[tokio::test]
+    async fn cluster_view_cache_coalesces_concurrent_initial_loads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gossip = CountingViewGossip {
+            calls: Arc::clone(&calls),
+            view: ClusterView {
+                members: vec![NodeId::from_index(1)],
+                states: HashMap::new(),
+                generated_at: Instant::now(),
+            },
+            delay: Duration::from_millis(10),
+        };
+        let cache = ClusterViewCache::new(Duration::from_secs(1));
+
+        let (first, second) = tokio::join!(cache.get_or_load(&gossip), cache.get_or_load(&gossip));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn cluster_view_cache_ttl_tracks_publish_cadence_with_bounds() {
+        assert_eq!(
+            cluster_view_cache_ttl(Duration::from_millis(50)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            cluster_view_cache_ttl(Duration::from_secs(1)),
+            MAX_CLUSTER_VIEW_CACHE_TTL
+        );
+        assert_eq!(
+            cluster_view_cache_ttl(Duration::ZERO),
+            MIN_CLUSTER_VIEW_CACHE_TTL
+        );
     }
 
     struct StaticGossip {
@@ -874,6 +1041,12 @@ mod tests {
         renders: Arc<AtomicUsize>,
     }
 
+    struct StyleRejectingRenderer;
+
+    struct FailureRecordingPreparer {
+        failures: Arc<AtomicUsize>,
+    }
+
     struct BlockingRenderer {
         render_started: Option<Arc<Notify>>,
         render_continue: Option<Arc<Notify>>,
@@ -905,6 +1078,35 @@ mod tests {
                 bytes: vec![task.request_id.as_str().len() as u8].into(),
                 format: task.output_format,
             })
+        }
+    }
+
+    #[async_trait]
+    impl Renderer for StyleRejectingRenderer {
+        async fn setup_profile(
+            &mut self,
+            task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            Err(RendererError::StyleLoadFailed {
+                style_id: task.style.id.clone(),
+                source: "semantic style validation failed".to_string(),
+            })
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, _task: &InternalTask) -> Result<RenderOutput, RendererError> {
+            panic!("render must not run after style setup fails")
+        }
+    }
+
+    #[async_trait]
+    impl ProfilePreparer for FailureRecordingPreparer {
+        fn mark_style_load_failed(&self, _revision: &StyleRevision) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -961,10 +1163,26 @@ mod tests {
         gossip: Arc<dyn GossipBus>,
         render_output_cache_capacity_bytes: u64,
     ) -> Node {
+        node_with_catalog_cache_and_preparer(
+            style_catalog,
+            renderers,
+            gossip,
+            render_output_cache_capacity_bytes,
+            Arc::new(NoopProfilePreparer),
+        )
+    }
+
+    fn node_with_catalog_cache_and_preparer(
+        style_catalog: Arc<StyleCatalog>,
+        renderers: Vec<BoxRenderer>,
+        gossip: Arc<dyn GossipBus>,
+        render_output_cache_capacity_bytes: u64,
+        profile_preparer: Arc<dyn ProfilePreparer>,
+    ) -> Node {
         Node::spawn(NodeSpawn {
             id: NodeId::from_index(1),
             renderers,
-            profile_preparer: Arc::new(NoopProfilePreparer),
+            profile_preparer,
             gossip,
             transport: Arc::new(NoopTransport),
             style_catalog,
@@ -1177,6 +1395,90 @@ mod tests {
         assert_eq!(info.route_tier, RouteTier::RenderCacheHit);
         assert_eq!(output.bytes.as_ref(), &[5]);
         assert_eq!(renders.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingress_and_forwarded_requests_share_one_render() {
+        let render_started = Arc::new(Notify::new());
+        let render_continue = Arc::new(Notify::new());
+        let node = node_with_catalog_and_cache(
+            registered_catalog(),
+            vec![Box::new(BlockingRenderer {
+                render_started: Some(render_started.clone()),
+                render_continue: Some(render_continue.clone()),
+            })],
+            Arc::new(StaticGossip {
+                node_id: NodeId::from_index(1),
+            }),
+            1024 * 1024,
+        );
+
+        let ingress = tokio::spawn({
+            let node = node.clone();
+            async move { node.handle_incoming(internal_task(1, "ingress")).await }
+        });
+        render_started.notified().await;
+
+        let forwarded = tokio::spawn({
+            let node = node.clone();
+            async move {
+                node.handle_forwarded(forwarded_task(2, "forwarded", 0))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !forwarded.is_finished(),
+            "forwarded duplicate should wait for the active render"
+        );
+
+        render_continue.notify_waiters();
+        let ingress = tokio::time::timeout(Duration::from_secs(1), ingress)
+            .await
+            .expect("ingress render should complete")
+            .expect("ingress task should join");
+        let forwarded = tokio::time::timeout(Duration::from_secs(1), forwarded)
+            .await
+            .expect("forwarded follower should complete")
+            .expect("forwarded task should join");
+
+        assert!(matches!(ingress.result, TaskResult::Completed { .. }));
+        let TaskResult::Completed { info, output } = forwarded.result else {
+            panic!("forwarded duplicate should complete from cache");
+        };
+        assert_eq!(info.route_tier, RouteTier::RenderCacheHit);
+        assert_eq!(output.bytes.as_ref(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn local_style_load_failure_is_reported_to_profile_preparer() {
+        let failures = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_cache_and_preparer(
+            registered_catalog(),
+            vec![Box::new(StyleRejectingRenderer)],
+            Arc::new(NoopGossip),
+            0,
+            Arc::new(FailureRecordingPreparer {
+                failures: failures.clone(),
+            }),
+        );
+
+        let outcome = node
+            .handle_forwarded(ForwardRequest {
+                task: internal_task(1, "style-rejected").to_wire(Instant::now()),
+                route_tier: RouteTier::Tier2HrwBl,
+                drain_worker: Some(0),
+            })
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            TaskResult::Failed {
+                kind: crate::types::FailureKind::StyleUnavailable,
+                ..
+            }
+        ));
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

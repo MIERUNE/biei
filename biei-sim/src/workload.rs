@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_distr::{Exp, Poisson, Zipf};
@@ -11,24 +12,26 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
+use crate::churn::ChurnTracker;
 use crate::config::{
     BurstPattern, SourcePattern, SourceProvider, StyleDist, StyleShift, WorkloadConfig,
 };
+use crate::harness::WorkloadCluster;
 use crate::metrics::MetricsCollector;
 use biei::activity::ProfileActivityTracker;
-use biei::node::Node;
 use biei::types::{
     CachePolicy, ImageFormat, InternalTask, PixelRatio, Positioning, RenderRequest, Scale,
     SourceHash, SourceRef, StyleId, StyleRevision,
 };
 
-pub async fn run_workload(
+pub(crate) async fn run_workload(
     config: WorkloadConfig,
-    nodes: Vec<Node>,
+    cluster: &mut WorkloadCluster,
     metrics: Arc<MetricsCollector>,
     activity: Arc<ProfileActivityTracker>,
     seed: u64,
-) {
+    mut churn: Option<&mut ChurnTracker>,
+) -> Result<u64> {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let start = Instant::now();
     let deadline = start + config.duration;
@@ -95,6 +98,9 @@ pub async fn run_workload(
         }
 
         for _ in 0..n_tasks {
+            if let Some(tracker) = churn.as_deref_mut() {
+                tracker.before_request(cluster, &metrics, next_id).await?;
+            }
             let style = sample_style(
                 now,
                 start,
@@ -137,12 +143,13 @@ pub async fn run_workload(
             activity.record(task.worker_profile(), now);
             next_id += 1;
 
-            let node_idx = rng.random_range(0..nodes.len());
-            let node = nodes[node_idx].clone();
+            let (node, counters) = cluster.select(&mut rng);
+            counters.submit();
             let m = metrics.clone();
             let task_arrived_at = task.arrived_at;
             inflight.spawn(async move {
                 let outcome = node.handle_incoming(task).await;
+                counters.record(&outcome);
                 if task_arrived_at >= record_after {
                     m.record(outcome);
                 }
@@ -151,6 +158,10 @@ pub async fn run_workload(
     }
 
     while inflight.join_next().await.is_some() {}
+    if let Some(tracker) = churn {
+        tracker.before_request(cluster, &metrics, next_id).await?;
+    }
+    Ok(next_id)
 }
 
 fn render_request_for_style(style: u32, tile_style_count: usize) -> RenderRequest {

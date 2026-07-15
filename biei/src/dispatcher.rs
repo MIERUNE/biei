@@ -89,7 +89,7 @@ impl Dispatcher {
         queue_wait.saturating_add(own)
     }
 
-    pub fn decide(&self, task: &InternalTask, view: ClusterView) -> Decision {
+    pub fn decide(&self, task: &InternalTask, view: &ClusterView) -> Decision {
         let profile = task.worker_profile();
 
         // ---- Tier 1: warm tracking (over propagated states only) ----
@@ -103,12 +103,18 @@ impl Dispatcher {
             let target_id = match self.config.tier1_strategy {
                 Tier1Strategy::WeightedRandom => {
                     let weights: Vec<u32> = warm.iter().map(|n| n.warm_count).collect();
-                    let mut rng = self.rng.lock().expect("dispatcher rng poisoned");
+                    let mut rng = self
+                        .rng
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
                     warm[dist.sample(&mut *rng)].node.id.clone()
                 }
                 Tier1Strategy::PowerOfTwo => {
-                    let mut rng = self.rng.lock().expect("dispatcher rng poisoned");
+                    let mut rng = self
+                        .rng
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if warm.len() == 1 {
                         warm[0].node.id.clone()
                     } else {
@@ -135,29 +141,20 @@ impl Dispatcher {
         // HRW input is stable style id + render mode + scale (not the style
         // revision version) so version bumps do not reshuffle routing. Tier 4
         // reuses the same ordering.
-        let mut hrw_nodes = view.members.clone();
-        hrw_nodes.sort_by_key(|id| std::cmp::Reverse(hrw_weight(&profile, id)));
-        let tier2_candidates: Vec<_> = hrw_nodes
-            .iter()
-            .filter(|id| {
+        let tier2_candidates =
+            top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
                 view.states
                     .get(id)
                     .map(|n| n.has_capacity(self.bl_capacity))
                     .unwrap_or(true)
-            })
-            .take(DEFAULT_FORWARD_CANDIDATES)
-            .map(|id| ForwardCandidate {
-                node_id: id.clone(),
-                drain_worker: None,
-            })
-            .collect();
+            });
         if !tier2_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier2HrwBl, tier2_candidates);
         }
 
         // ---- Tier 3: drain-and-swap ----
         if self.config.tier3_enabled {
-            let tier3_candidates = self.tier3_candidates(&view, task, DEFAULT_FORWARD_CANDIDATES);
+            let tier3_candidates = self.tier3_candidates(view, task, DEFAULT_FORWARD_CANDIDATES);
             if !tier3_candidates.is_empty() {
                 return self.materialize_candidates(
                     task,
@@ -168,20 +165,13 @@ impl Dispatcher {
         }
 
         // ---- Tier 4: overflow queue admission ----
-        let tier4_candidates: Vec<_> = hrw_nodes
-            .iter()
-            .filter(|id| {
+        let tier4_candidates =
+            top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
                 view.states
                     .get(id)
                     .map(|n| n.has_admission_capacity(self.queue_capacity))
                     .unwrap_or(true)
-            })
-            .take(DEFAULT_FORWARD_CANDIDATES)
-            .map(|id| ForwardCandidate {
-                node_id: id.clone(),
-                drain_worker: None,
-            })
-            .collect();
+            });
         if !tier4_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier4Overflow, tier4_candidates);
         }
@@ -299,11 +289,23 @@ impl Dispatcher {
                 reason: RejectionReason::NoCapacity,
             };
         };
+        let first_node_id = first.node_id.clone();
+        let first_worker = first.drain_worker;
 
-        if first.node_id == self.node_id {
+        if first_node_id == self.node_id {
+            let fallback_candidates = if task.forwarding_hops >= 1 {
+                Vec::new()
+            } else {
+                candidates
+                    .into_iter()
+                    .skip(1)
+                    .filter(|candidate| candidate.node_id != self.node_id)
+                    .collect()
+            };
             Decision::Local {
                 route_tier: tier,
-                worker_hint: first.drain_worker,
+                worker_hint: first_worker,
+                fallback_candidates,
             }
         } else if task.forwarding_hops >= 1 {
             // Chained forwarding banned — process locally; cannot honor the
@@ -311,6 +313,7 @@ impl Dispatcher {
             Decision::Local {
                 route_tier: tier,
                 worker_hint: None,
+                fallback_candidates: Vec::new(),
             }
         } else {
             let candidates = candidates
@@ -332,23 +335,57 @@ fn warm_candidate<'a>(
 ) -> Option<WarmCandidate<'a>> {
     let mut warm_count = 0;
     let mut style_spare_bl = 0;
-    let mut has_soft_capacity = false;
+    let mut has_usable_capacity = false;
 
     for worker in &node.workers {
-        if worker.queue_depth < bl {
-            has_soft_capacity = true;
-        }
         if worker.loaded_profile.as_ref() == Some(profile) {
             warm_count += 1;
             style_spare_bl += bl.saturating_sub(worker.queue_depth);
+            has_usable_capacity |= worker.queue_depth < bl;
+        } else if worker.loaded_profile.is_none() {
+            // A fresh worker can expand an already-warm profile without
+            // evicting unrelated renderer state.
+            has_usable_capacity = true;
         }
     }
 
-    (warm_count > 0 && has_soft_capacity).then_some(WarmCandidate {
+    (warm_count > 0 && has_usable_capacity).then_some(WarmCandidate {
         node,
         warm_count,
         style_spare_bl,
     })
+}
+
+fn top_hrw_candidates<F>(
+    members: &[NodeId],
+    profile: &WorkerProfile,
+    limit: usize,
+    mut eligible: F,
+) -> Vec<ForwardCandidate>
+where
+    F: FnMut(&NodeId) -> bool,
+{
+    let mut top: Vec<(u64, &NodeId)> = Vec::with_capacity(limit);
+
+    for node_id in members.iter().filter(|node_id| eligible(node_id)) {
+        let weight = hrw_weight(profile, node_id);
+        // Equal weights retain member order, matching stable `sort_by_key`.
+        let insert_at = top
+            .iter()
+            .position(|(existing, _)| weight > *existing)
+            .unwrap_or(top.len());
+        if insert_at < limit {
+            top.insert(insert_at, (weight, node_id));
+            top.truncate(limit);
+        }
+    }
+
+    top.into_iter()
+        .map(|(_, node_id)| ForwardCandidate {
+            node_id: node_id.clone(),
+            drain_worker: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -482,6 +519,71 @@ mod tests {
             deadline: now + Duration::from_secs(10),
             forwarding_hops: 0,
         }
+    }
+
+    #[test]
+    fn tier1_ignores_capacity_owned_by_an_unrelated_loaded_profile() {
+        let target = profile(9);
+        let node = NodeStateView {
+            id: NodeId::from_index(0),
+            workers: vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(target.clone()),
+                    queue_depth: 2,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(profile(1)),
+                    queue_depth: 0,
+                },
+            ],
+        };
+
+        assert!(warm_candidate(&node, &target, 2).is_none());
+    }
+
+    #[test]
+    fn tier1_can_expand_a_warm_profile_into_a_fresh_worker() {
+        let target = profile(9);
+        let node = NodeStateView {
+            id: NodeId::from_index(0),
+            workers: vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(target.clone()),
+                    queue_depth: 2,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: None,
+                    queue_depth: 0,
+                },
+            ],
+        };
+
+        let candidate = warm_candidate(&node, &target, 2).expect("fresh capacity is usable");
+        assert_eq!(candidate.warm_count, 1);
+        assert_eq!(candidate.style_spare_bl, 0);
+    }
+
+    #[test]
+    fn top_hrw_candidates_matches_stable_full_sort() {
+        let target = profile(9);
+        let members: Vec<_> = (0..8).map(NodeId::from_index).collect();
+        let eligible = |node_id: &NodeId| node_id != &NodeId::from_index(3);
+        let actual = top_hrw_candidates(&members, &target, 2, eligible);
+
+        let mut expected: Vec<_> = members.iter().filter(|node_id| eligible(node_id)).collect();
+        expected.sort_by_key(|node_id| Reverse(hrw_weight(&target, node_id)));
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|candidate| &candidate.node_id)
+                .collect::<Vec<_>>(),
+            expected.into_iter().take(2).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -680,7 +782,7 @@ mod tests {
 
         let decision = d.decide(
             &task,
-            view(vec![WorkerView {
+            &view(vec![WorkerView {
                 id: 0,
                 loaded_profile: Some(profile(9)),
                 queue_depth: 1,
@@ -692,7 +794,9 @@ mod tests {
             Decision::Local {
                 route_tier: RouteTier::Tier4Overflow,
                 worker_hint: None,
+                fallback_candidates,
             }
+            if fallback_candidates.is_empty()
         ));
     }
 
@@ -748,7 +852,7 @@ mod tests {
             generated_at: now,
         };
 
-        let decision = d.decide(&task, view);
+        let decision = d.decide(&task, &view);
         let Decision::Forward {
             route_tier,
             candidates,
@@ -759,5 +863,37 @@ mod tests {
         assert_eq!(route_tier, RouteTier::Tier2HrwBl);
         assert_eq!(candidates.len(), DEFAULT_FORWARD_CANDIDATES);
         assert!(candidates.iter().all(|c| c.drain_worker.is_none()));
+    }
+
+    #[test]
+    fn local_decision_retains_remaining_remote_candidates() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let dispatcher = dispatcher(activity);
+        let task = make_task(9, Instant::now());
+        let remote = ForwardCandidate {
+            node_id: NodeId::from_index(1),
+            drain_worker: Some(2),
+        };
+
+        let decision = dispatcher.materialize_candidates(
+            &task,
+            RouteTier::Tier2HrwBl,
+            vec![
+                ForwardCandidate {
+                    node_id: NodeId::from_index(0),
+                    drain_worker: Some(0),
+                },
+                remote.clone(),
+            ],
+        );
+
+        let Decision::Local {
+            fallback_candidates,
+            ..
+        } = decision
+        else {
+            panic!("expected local decision");
+        };
+        assert_eq!(fallback_candidates, vec![remote]);
     }
 }

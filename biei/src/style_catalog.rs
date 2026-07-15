@@ -6,9 +6,18 @@
 //! grow the catalog indefinitely.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::types::{StyleId, StyleRevision};
+
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyleDefinition {
@@ -83,7 +92,7 @@ impl StyleCatalog {
     /// Add or update the renderable style definition. Returns the registered
     /// version.
     pub fn upsert_definition(&self, style_id: StyleId, definition: StyleDefinition) -> u64 {
-        let mut inner = self.inner.write().expect("style catalog poisoned");
+        let mut inner = write_unpoisoned(&self.inner);
         let version = definition.version;
         inner.by_id.insert(style_id, definition);
         version
@@ -94,7 +103,7 @@ impl StyleCatalog {
     /// `{style_id}` (with the whole id) in this template. Explicit
     /// `upsert_definition` entries still take precedence.
     pub fn set_url_template(&self, template: impl Into<String>) {
-        let mut inner = self.inner.write().expect("style catalog poisoned");
+        let mut inner = write_unpoisoned(&self.inner);
         inner.default_template = Some(StyleUrlTemplate {
             template: template.into(),
         });
@@ -108,7 +117,7 @@ impl StyleCatalog {
         namespace: impl Into<String>,
         template: impl Into<String>,
     ) {
-        let mut inner = self.inner.write().expect("style catalog poisoned");
+        let mut inner = write_unpoisoned(&self.inner);
         inner.namespace_templates.insert(
             namespace.into(),
             StyleUrlTemplate {
@@ -118,7 +127,7 @@ impl StyleCatalog {
     }
 
     pub fn resolve_latest(&self, style_id: &StyleId) -> Option<u64> {
-        let inner = self.inner.read().expect("style catalog poisoned");
+        let inner = read_unpoisoned(&self.inner);
         inner
             .by_id
             .get(style_id)
@@ -132,7 +141,7 @@ impl StyleCatalog {
     }
 
     pub fn definition_for_revision(&self, revision: &StyleRevision) -> Option<StyleDefinition> {
-        let inner = self.inner.read().expect("style catalog poisoned");
+        let inner = read_unpoisoned(&self.inner);
         if let Some(definition) = inner
             .by_id
             .get(&revision.id)
@@ -151,11 +160,7 @@ impl StyleCatalog {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .read()
-            .expect("style catalog poisoned")
-            .by_id
-            .len()
+        read_unpoisoned(&self.inner).by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {

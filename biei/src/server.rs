@@ -16,6 +16,17 @@ pub async fn run() -> anyhow::Result<()> {
         node_id = %options.node_id,
         "starting biei"
     );
+    // Must precede Runtime::spawn_*: the registration is process-global and
+    // does not update MapLibre Native file sources that renderers have already
+    // cached.
+    if options.disable_mln_file_sources {
+        tracing::warn!("Rust FileSources disabled; using MapLibre Native default resource loader");
+    } else {
+        crate::renderer::file_source::register_file_sources(
+            options.mln_resource_cache_capacity_bytes,
+            options.mln_resource_private_hosts.clone(),
+        )?;
+    }
     let runtime = if options.cluster {
         tracing::info!(
             internal_advertise_addr = %options.internal_advertise_addr,
@@ -32,9 +43,10 @@ pub async fn run() -> anyhow::Result<()> {
     let ingress = runtime.http_ingress(options.sla);
     let shutdown = install_shutdown_handler(runtime.clone());
     if options.cluster {
-        let internal_forward = crate::http::internal::InternalForwardEndpoint::with_drain(
+        let internal_forward = crate::http::internal::InternalForwardEndpoint::with_drain_and_limit(
             runtime.node(),
             runtime.drain_controller(),
+            runtime.internal_forward_concurrency_limit(),
         );
         crate::http::adapter::serve_with_shutdown_and_membership_and_internal_forward(
             ingress,

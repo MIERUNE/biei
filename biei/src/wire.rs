@@ -156,6 +156,9 @@ pub enum OutcomeResult {
     },
     Failed {
         error: String,
+        /// `#[serde(default)]` so frames from peers that predate this field
+        /// still decode during a rolling deploy (missing kind → `Other`).
+        #[serde(default)]
         kind: FailureKind,
     },
 }
@@ -194,6 +197,18 @@ pub fn encode_response_body(
     Ok(out)
 }
 
+/// Encode only the length-prefixed metadata portion of a forward response.
+/// The HTTP adapter can chain this with an existing image `Bytes` value
+/// without copying the image into a second contiguous allocation.
+pub fn encode_response_header(header: &OutcomeHeader) -> Result<bytes::Bytes, WireError> {
+    let json = serde_json::to_vec(header).map_err(WireError::Encode)?;
+    let json_len: u32 = json.len().try_into().map_err(|_| WireError::TooLarge)?;
+    let mut out = Vec::with_capacity(4 + json.len());
+    out.extend_from_slice(&json_len.to_be_bytes());
+    out.extend_from_slice(&json);
+    Ok(out.into())
+}
+
 pub fn decode_response_body(body: &[u8]) -> Result<(OutcomeHeader, &[u8]), WireError> {
     if body.len() < 4 {
         return Err(WireError::Truncated);
@@ -209,6 +224,22 @@ pub fn decode_response_body(body: &[u8]) -> Result<(OutcomeHeader, &[u8]), WireE
     let header =
         serde_json::from_slice(&body[payload_start..payload_end]).map_err(WireError::Decode)?;
     Ok((header, &body[payload_end..]))
+}
+
+/// Decode an owned HTTP body while retaining the image as a zero-copy slice.
+pub fn decode_response_bytes(
+    body: bytes::Bytes,
+) -> Result<(OutcomeHeader, bytes::Bytes), WireError> {
+    if body.len() < 4 {
+        return Err(WireError::Truncated);
+    }
+    let json_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let payload_end = 4usize.checked_add(json_len).ok_or(WireError::Truncated)?;
+    if body.len() < payload_end {
+        return Err(WireError::Truncated);
+    }
+    let header = serde_json::from_slice(&body[4..payload_end]).map_err(WireError::Decode)?;
+    Ok((header, body.slice(payload_end..)))
 }
 
 impl ForwardResponse {
@@ -642,6 +673,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_without_kind_decodes_as_other_for_rolling_deploy() {
+        // A peer that predates `FailureKind` sends `failed` without `kind`;
+        // the frame must still decode (kind defaults to `Other`).
+        let json = r#"{
+            "task_id": 1,
+            "style_id": "style-1",
+            "had_source": false,
+            "image_format": null,
+            "failed": {
+                "error": "renderer failed"
+            }
+        }"#;
+
+        let decoded: OutcomeHeader = serde_json::from_str(json).expect("pre-kind frame decodes");
+        assert!(matches!(
+            decoded.result,
+            OutcomeResult::Failed {
+                kind: FailureKind::Other,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn response_body_frame_roundtrips_metadata_and_image_bytes() {
         let header = OutcomeHeader {
             task_id: 1,
@@ -670,6 +725,28 @@ mod tests {
 
         assert_eq!(decoded, header);
         assert_eq!(decoded_image, image);
+    }
+
+    #[test]
+    fn owned_response_body_keeps_image_as_a_bytes_slice() {
+        let header = OutcomeHeader {
+            task_id: 1,
+            request_id: RequestId::from_string("owned-frame-test"),
+            style_id: style().id,
+            had_source: false,
+            image_format: None,
+            result: OutcomeResult::Rejected {
+                reason: RejectionReason::QueueFull,
+                deadline_stage: None,
+            },
+        };
+        let body: bytes::Bytes = encode_response_body(&header, b"image")
+            .expect("encode body")
+            .into();
+        let (decoded, image) = decode_response_bytes(body).expect("decode owned body");
+
+        assert_eq!(decoded, header);
+        assert_eq!(image.as_ref(), b"image");
     }
 
     #[test]

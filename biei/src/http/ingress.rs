@@ -38,6 +38,7 @@ pub struct HttpIngress {
     next_task_id: Arc<AtomicU64>,
     drain: Option<DrainController>,
     concurrency: Option<Arc<Semaphore>>,
+    renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
 }
 
 impl HttpIngress {
@@ -48,6 +49,7 @@ impl HttpIngress {
         sla_budget: Duration,
         drain: DrainController,
         concurrency_limit: usize,
+        renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
     ) -> Self {
         Self {
             node,
@@ -57,6 +59,7 @@ impl HttpIngress {
             next_task_id: Arc::new(AtomicU64::new(1)),
             drain: Some(drain),
             concurrency: Some(Arc::new(Semaphore::new(concurrency_limit.max(1)))),
+            renderer_supervisor,
         }
     }
 
@@ -66,6 +69,10 @@ impl HttpIngress {
 
     pub fn node(&self) -> Node {
         self.node.clone()
+    }
+
+    pub fn renderer_supervisor(&self) -> crate::renderer::actor::RendererActorSupervisor {
+        self.renderer_supervisor.clone()
     }
 
     #[cfg(test)]
@@ -211,14 +218,19 @@ fn parse_path_with_request_id(
 }
 
 fn is_static_path(parts: &[&str]) -> bool {
-    match parts {
-        [_, "static", _, _] => true,
-        [_, "static", z, x, yfmt] if looks_like_user_static_tile_path(z, x, yfmt) => false,
-        [_, "static", _, _, _] => true,
-        [_, _, "static", _, _] => true,
-        [_, _, "static", _, _, _] => true,
-        _ => false,
+    // Static requests have either two suffix segments (position, size) or
+    // three (overlay, position, size). Style ids may contain any number of
+    // namespace segments, so classify from the suffix rather than fixed
+    // indices. The three-segment form is ambiguous with a tile request whose
+    // style id ends in `static`; a valid z/x/y suffix remains a tile.
+    let len = parts.len();
+    if len >= 4 && parts[len - 3] == "static" {
+        return true;
     }
+    if len >= 5 && parts[len - 4] == "static" {
+        return !looks_like_user_static_tile_path(parts[len - 3], parts[len - 2], parts[len - 1]);
+    }
+    false
 }
 
 fn looks_like_user_static_tile_path(z: &str, x: &str, yfmt: &str) -> bool {
@@ -285,6 +297,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn deeply_namespaced_style_can_render_static_images() {
+        let catalog = StyleCatalog::new();
+        catalog.upsert_definition(
+            StyleId("carto/gl/voyager-gl-style".to_string()),
+            StyleDefinition::new("https://styles.test/voyager/style.json", 1),
+        );
+
+        let task = parse_path_with_request_id(
+            "/carto/gl/voyager-gl-style/static/none/139.767,35.681,11,0,0/320x240.png",
+            None,
+            &catalog,
+            43,
+            RequestId::from_string("req-nested-static-style"),
+            Duration::from_secs(30),
+            Instant::now(),
+        )
+        .expect("static path with a deeply namespaced style parses");
+
+        assert_eq!(task.style.id.as_str(), "carto/gl/voyager-gl-style");
+        assert!(matches!(task.request, RenderRequest::StaticImage { .. }));
     }
 
     #[test]

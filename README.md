@@ -13,6 +13,37 @@ Biei is designed to work both as a simple single-node server and as a scalable M
 
 LICENSE: MIT OR Apache-2.0
 
+## Simulator
+
+Run one deterministic simulation and write both machine-readable and
+self-contained visual reports:
+
+```sh
+cargo run -p biei-sim -- run \
+  --report biei-sim-report.json \
+  --html biei-sim-report.html
+```
+
+Membership churn is replayed from an ordered JSON plan and sampled before and
+after every event:
+
+```json
+{"events":[
+  {"at_request":500,"action":"add"},
+  {"at_request":1500,"action":"remove","node_id":"node-0"}
+]}
+```
+
+```sh
+cargo run -p biei-sim -- run \
+  --churn-plan biei-sim/examples/churn-plan.json \
+  --report churn-report.json
+cargo run -p biei-sim -- visualize churn-report.json --output churn-report.html
+```
+
+Running `cargo run -p biei-sim` without a subcommand retains the legacy sweep
+suite.
+
 
 ## Demo
 
@@ -68,9 +99,9 @@ bash scripts/dev-cluster.sh
 Single-node mode is the default. Cluster mode is explicit and serves two HTTP
 listeners: a public port (`--http-bind`, default `:8080`) for render ingress plus
 top-level `/livez` `/readyz`, and a separate cluster-internal port
-(`--internal-http-port`, default `9090`) for `/_internal/*`, `/metrics` and
+(`--internal-port`, default `9090`) for `/_internal/*` (including metrics) and
 peer-to-peer forwarding. The internal port is never exposed publicly; peers
-forward to the advertised internal address, so `--internal-http-advertise-addr` points at the
+forward to the advertised internal address, so `--internal-advertise-addr` points at the
 internal port:
 
 ```sh
@@ -78,9 +109,10 @@ cargo run -p biei -- \
   --cluster \
   --style-templates 'http://style-provider.svc.cluster.local:8080/styles/{style_id}/style.json' \
   --tileset-url-template 'http://style-provider.svc.cluster.local:8080/tilesets/{tileset_id}/tileset.json' \
-  --maplibre-cache-path /var/cache/biei/maplibre-ambient-cache.sqlite \
-  --internal-http-port 9090 \
-  --internal-http-advertise-addr "$HOSTNAME.biei.default.svc.cluster.local:9090" \
+  --mln-resource-private-hosts style-provider.svc.cluster.local \
+  --mln-resource-cache-bytes 268435456 \
+  --internal-port 9090 \
+  --internal-advertise-addr "$HOSTNAME.biei.default.svc.cluster.local:9090" \
   --gossip-seeds biei-0.biei:7946
 ```
 
@@ -88,7 +120,8 @@ cargo run -p biei -- \
 
 `--style-templates` (env `BIEI_STYLE_TEMPLATES`) maps a request's style id to a
 `style.json` URL. It is a `;`-separated list of entries; each `<template>` must
-contain `{style_id}` and be an http(s) URL.
+be an http(s) URL with `{style_id}` in its path. Placeholders in the authority,
+query, or fragment are rejected.
 
 **Single bare template** — every style id is substituted whole:
 
@@ -119,3 +152,17 @@ which keeps the catalog scoped to providers you list.
 `BIEI_SOURCE_CACHE_CAPACITY` controls the per-renderer warm source cache
 capacity (default `1`). `BIEI_RENDER_OUTPUT_CACHE_BYTES` controls the node-local
 rendered image cache size (default `268435456`, set `0` to disable).
+Rendered entries expire after five minutes even when the style revision is
+unchanged, because referenced resources may change at stable URLs.
+`BIEI_MLN_RESOURCE_CACHE_BYTES` controls the process-wide in-memory cache for
+tiles, glyphs, sprites, and other MapLibre resources (default `268435456`, set
+`0` to disable). The resource cache is shared by every renderer slot in the
+process and does not persist across restarts.
+
+Map resources are allowed to resolve to public IP addresses by default. Set
+`BIEI_MLN_RESOURCE_PRIVATE_HOSTS` to a comma-separated list of exact hosts or
+leading-wildcard domains when an operator-managed style intentionally loads
+resources from a private network, for example
+`resource-api.default.svc.cluster.local,*.tiles.svc.cluster.local`. Loopback,
+link-local, and private addresses reached through any other hostname or redirect
+are rejected.
