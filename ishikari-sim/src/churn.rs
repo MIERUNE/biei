@@ -102,9 +102,11 @@ pub struct ChurnReport {
 pub struct AppliedChurnEvent {
     pub requested_at_request: u64,
     pub applied_at_request: u64,
+    pub virtual_elapsed_ms: Option<u64>,
     pub action: &'static str,
     pub node_id: String,
     pub active_nodes: usize,
+    pub membership_stale_nodes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +126,7 @@ pub async fn run_churn_trace(
 ) -> Result<ChurnReport> {
     config.validate()?;
     plan.validate_trace_length(entries.len())?;
-    let mut state = ChurnState::new(config, cluster.observation());
+    let mut state = ChurnState::new(config, cluster.observation().await);
     apply_real_events(cluster, plan, &mut state, 0).await?;
 
     if viewport_batches {
@@ -132,20 +134,24 @@ pub async fn run_churn_trace(
             let slice = &entries[range];
             let assignments = assign_entries(slice, cluster.node_count(), config);
             cluster.serve_viewport_on(slice, &assignments).await?;
-            state.after_batch(cluster.observation());
-            let processed = state.processed;
+            let processed = cluster.request_count();
+            if state.update_processed(processed) {
+                state.record_periodic(cluster.observation().await);
+            }
             apply_real_events(cluster, plan, &mut state, processed).await?;
         }
     } else {
         for entry in entries {
             let entry_node = assign_entry(entry, cluster.node_count(), config);
             cluster.serve_on(entry, entry_node).await?;
-            state.after_batch(cluster.observation());
-            let processed = state.processed;
+            let processed = cluster.request_count();
+            if state.update_processed(processed) {
+                state.record_periodic(cluster.observation().await);
+            }
             apply_real_events(cluster, plan, &mut state, processed).await?;
         }
     }
-    state.finish(cluster.observation());
+    state.finish(cluster.observation().await);
     Ok(state.report())
 }
 
@@ -166,16 +172,20 @@ pub fn run_modeled_churn_trace(
             let slice = &entries[range];
             let assignments = assign_entries(slice, cluster.node_count(), config);
             cluster.serve_viewport_on(slice, &assignments)?;
-            state.after_batch(cluster.observation());
-            let processed = state.processed;
+            let processed = cluster.request_count();
+            if state.update_processed(processed) {
+                state.record_periodic(cluster.observation());
+            }
             apply_modeled_events(cluster, plan, &mut state, processed)?;
         }
     } else {
         for entry in entries {
             let entry_node = assign_entry(entry, cluster.node_count(), config);
             cluster.serve_on(entry, entry_node)?;
-            state.after_batch(cluster.observation());
-            let processed = state.processed;
+            let processed = cluster.request_count();
+            if state.update_processed(processed) {
+                state.record_periodic(cluster.observation());
+            }
             apply_modeled_events(cluster, plan, &mut state, processed)?;
         }
     }
@@ -208,17 +218,20 @@ impl ChurnState {
         }
     }
 
-    fn after_batch(&mut self, observation: ClusterObservation) {
-        self.processed = observation.requests;
-        if self.processed >= self.next_sample {
-            self.samples.push(ChurnSample {
-                at_request: self.processed,
-                reason: "periodic",
-                observation,
-            });
-            while self.next_sample <= self.processed {
-                self.next_sample += self.config.sample_every_requests;
-            }
+    fn update_processed(&mut self, processed: u64) -> bool {
+        self.processed = processed;
+        self.processed >= self.next_sample
+    }
+
+    fn record_periodic(&mut self, observation: ClusterObservation) {
+        debug_assert_eq!(observation.requests, self.processed);
+        self.samples.push(ChurnSample {
+            at_request: self.processed,
+            reason: "periodic",
+            observation,
+        });
+        while self.next_sample <= self.processed {
+            self.next_sample += self.config.sample_every_requests;
         }
     }
 
@@ -232,9 +245,11 @@ impl ChurnState {
         self.events.push(AppliedChurnEvent {
             requested_at_request: event.at_request(),
             applied_at_request: self.processed,
+            virtual_elapsed_ms: observation.virtual_elapsed_ms,
             action,
             node_id,
             active_nodes: observation.active_nodes,
+            membership_stale_nodes: observation.membership_stale_nodes,
         });
         self.samples.push(ChurnSample {
             at_request: self.processed,
@@ -279,16 +294,18 @@ async fn apply_real_events(
         state.samples.push(ChurnSample {
             at_request: state.processed,
             reason: "pre_event",
-            observation: cluster.observation(),
+            observation: cluster.observation().await,
         });
         match event {
             ChurnEvent::Add { .. } => {
                 let id = cluster.add_node().await?;
-                state.record_event(event, "add", id, cluster.observation());
+                let observation = cluster.observation().await;
+                state.record_event(event, "add", id, observation);
             }
             ChurnEvent::Remove { node_id, .. } => {
                 cluster.remove_node(node_id).await?;
-                state.record_event(event, "remove", node_id.clone(), cluster.observation());
+                let observation = cluster.observation().await;
+                state.record_event(event, "remove", node_id.clone(), observation);
             }
         }
     }

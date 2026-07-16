@@ -16,8 +16,11 @@ use ishikari_sim::{
 };
 use serde::Serialize;
 
+const REPORT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct RunReport {
+    schema_version: u32,
     execution_mode: &'static str,
     cache_mode: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +146,9 @@ struct SimulationArgs {
     chunk_size_bytes: u64,
     #[arg(long, default_value_t = 4)]
     max_fetch_chunks: u64,
+    /// Process-wide object-storage range-fetch limit per simulated node.
+    #[arg(long, default_value_t = 32)]
+    backend_fetch_concurrency: usize,
     /// Fixed range-fetch delay, or the median when sigma is non-zero.
     #[arg(long, default_value_t = 0)]
     artificial_backend_delay_ms: u64,
@@ -229,6 +235,7 @@ impl SimulationArgs {
             tile_group_size: self.tile_group_size,
             chunk_size_bytes: self.chunk_size_bytes,
             max_fetch_chunks: self.max_fetch_chunks,
+            backend_fetch_concurrency: self.backend_fetch_concurrency,
             backend_latency,
             peer_latency_ms: self.peer_latency_ms,
             gossip_interval_ms: self.gossip_interval_ms,
@@ -391,6 +398,7 @@ async fn main() -> Result<()> {
     let result = modeled_result.or_else(|| cluster.map(SimCluster::report));
     if let Some(result) = result {
         let report = RunReport {
+            schema_version: REPORT_SCHEMA_VERSION,
             execution_mode: args.execution_mode(),
             cache_mode: args.cache_mode.label(),
             catalog_tiles,

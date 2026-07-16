@@ -203,8 +203,23 @@ impl Membership {
         if let Some(peers) = self.cached_peers() {
             return peers;
         }
-        let peers: Arc<[Peer]> = self
-            .handle
+        let peers = self.read_live_peers().await;
+        *self.lock_peers_cache() = Some((Instant::now(), peers.clone()));
+        peers
+    }
+
+    /// Observes the peer list without populating the routing cache.
+    #[cfg(feature = "simulator-support")]
+    #[doc(hidden)]
+    pub async fn peers_for_simulator_observation(&self) -> Arc<[Peer]> {
+        if let Some(peers) = self.cached_peers() {
+            return peers;
+        }
+        self.read_live_peers().await
+    }
+
+    async fn read_live_peers(&self) -> Arc<[Peer]> {
+        self.handle
             .with_chitchat(|chitchat| {
                 let live_nodes = chitchat
                     .live_nodes()
@@ -218,9 +233,7 @@ impl Membership {
                 collect_live_peers_from_nodes(&live_nodes)
             })
             .await
-            .into();
-        *self.lock_peers_cache() = Some((Instant::now(), peers.clone()));
-        peers
+            .into()
     }
 
     /// Returns the cached peer list if it is still within the TTL.

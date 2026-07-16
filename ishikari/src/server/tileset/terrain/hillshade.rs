@@ -7,7 +7,7 @@
 //! projected onto a single signed tone value per cell — the luminance shift it
 //! would cause over a reference background using the reference palette — so
 //! one polygon partition carries everything: `class` is the sign (`shadow` /
-//! `highlight`), `level` the linearly quantized magnitude, and a style
+//! `highlight`), `level` the perceptually quantized magnitude, and a style
 //! reproduces the raster look with two fill layers and midpoint opacity ramps
 //! (shadow at the reference dark color, highlight white).
 
@@ -30,9 +30,8 @@ const GRID_BUFFER: i32 = 1;
 /// shorter highlight range of spatial resolution; square-root weighting keeps
 /// more levels on the larger shadow range without reducing highlights to a few
 /// broad, over-bright bands.
-/// 24 total (roughly 16 shadow + 8 highlight): 18 proved too few once the
-/// first band is pinned near the JND — the exponential growth left the deep
-/// bands 7-10 L* wide and visibly flattened steep terrain.
+/// 32 total: smaller budgets proved too sparse once the first band was pinned
+/// near the JND, leaving deep bands visibly wide and flattening steep terrain.
 const TOTAL_TONE_LEVELS: u8 = 32;
 /// Keep the first shadow band close to the just-noticeable contrast around the
 /// reference background, then let later bands grow progressively wider.

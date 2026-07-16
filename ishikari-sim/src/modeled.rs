@@ -670,6 +670,10 @@ impl ModeledCluster {
         }
     }
 
+    pub fn request_count(&self) -> u64 {
+        self.report.requests
+    }
+
     pub fn observation(&self) -> ClusterObservation {
         let mut metrics = NodeMetricsSnapshot::default();
         for node in &self.retired_nodes {
@@ -681,6 +685,15 @@ impl ModeledCluster {
         ClusterObservation {
             requests: self.report.requests,
             active_nodes: self.nodes.len(),
+            virtual_elapsed_ms: None,
+            gossip_messages: 0,
+            gossip_bytes: 0,
+            membership_converged_nodes: self.nodes.len(),
+            membership_stale_nodes: 0,
+            membership_missing_peer_refs: 0,
+            membership_extra_peer_refs: 0,
+            membership_min_peer_count: self.nodes.len(),
+            membership_max_peer_count: self.nodes.len(),
             cache_hits: self.report.l1_cache_hits,
             by_source: self.report.by_source.clone(),
             node_requests: self
@@ -689,6 +702,9 @@ impl ModeledCluster {
                 .map(|node| (node.id.clone(), node.requests))
                 .collect(),
             peer_requests: self.report.peer_requests,
+            peer_unavailable_requests: 0,
+            peer_retryable_failures: metrics.peer_forward_retryable,
+            peer_backoff_skips: metrics.peer_forward_backoff_skips,
             backend_fetches: metrics.backend_fetches,
             backend_bytes: self
                 .retired_nodes
@@ -978,5 +994,27 @@ mod tests {
                 .iter()
                 .any(|node| node.id == "node-1" && !node.active)
         );
+    }
+
+    #[test]
+    fn modeled_membership_is_reported_as_instantly_converged() {
+        let cluster = ModeledCluster::new(
+            ClusterConfig {
+                node_count: 3,
+                ..ClusterConfig::default()
+            },
+            TileCatalog {
+                entries: HashMap::new(),
+            },
+        )
+        .expect("modeled cluster");
+
+        let observation = cluster.observation();
+        assert_eq!(observation.membership_converged_nodes, 3);
+        assert_eq!(observation.membership_stale_nodes, 0);
+        assert_eq!(observation.membership_min_peer_count, 3);
+        assert_eq!(observation.membership_max_peer_count, 3);
+        assert_eq!(observation.virtual_elapsed_ms, None);
+        assert_eq!(observation.gossip_messages, 0);
     }
 }

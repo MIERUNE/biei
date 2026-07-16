@@ -12,6 +12,9 @@ pub struct SimReport {
     pub by_source: BTreeMap<String, u64>,
     pub peer_requests: u64,
     pub peer_bytes: u64,
+    pub peer_unavailable_requests: u64,
+    pub gossip_messages: u64,
+    pub gossip_bytes: u64,
     pub backend_bytes: u64,
     pub tile_cache_bytes: u64,
     pub chunk_cache_bytes: u64,
@@ -118,6 +121,7 @@ pub struct NodeReport {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SchedulerReport {
     pub backend_fetch_duration_ms: DistributionSummary,
+    pub backend_fetch_queue_duration_ms: DistributionSummary,
     pub backend_fetch_size_bytes: DistributionSummary,
     pub backend_fetch_chunks: DistributionSummary,
     pub queue_delay_immediate_ms: DistributionSummary,
@@ -132,6 +136,10 @@ impl SchedulerReport {
         Self {
             backend_fetch_duration_ms: DistributionSummary::from_continuous_histogram(
                 &histograms.backend_fetch_duration_seconds,
+                1_000.0,
+            ),
+            backend_fetch_queue_duration_ms: DistributionSummary::from_continuous_histogram(
+                &histograms.backend_fetch_queue_duration_seconds,
                 1_000.0,
             ),
             backend_fetch_size_bytes: DistributionSummary::from_continuous_histogram(
@@ -233,10 +241,22 @@ fn histogram_quantile(histogram: &HistogramSnapshot, quantile: f64, interpolate:
 pub struct ClusterObservation {
     pub requests: u64,
     pub active_nodes: usize,
+    pub virtual_elapsed_ms: Option<u64>,
+    pub gossip_messages: u64,
+    pub gossip_bytes: u64,
+    pub membership_converged_nodes: usize,
+    pub membership_stale_nodes: usize,
+    pub membership_missing_peer_refs: usize,
+    pub membership_extra_peer_refs: usize,
+    pub membership_min_peer_count: usize,
+    pub membership_max_peer_count: usize,
     pub cache_hits: u64,
     pub by_source: BTreeMap<String, u64>,
     pub node_requests: BTreeMap<String, u64>,
     pub peer_requests: u64,
+    pub peer_unavailable_requests: u64,
+    pub peer_retryable_failures: u64,
+    pub peer_backoff_skips: u64,
     pub backend_fetches: u64,
     pub backend_bytes: u64,
     pub served_bytes: u64,
@@ -245,6 +265,23 @@ pub struct ClusterObservation {
 }
 
 pub(crate) fn add_metrics(total: &mut NodeMetricsSnapshot, node: NodeMetricsSnapshot) {
+    total.peer_forward_successes += node.peer_forward_successes;
+    total.peer_forward_not_found += node.peer_forward_not_found;
+    total.peer_forward_retryable += node.peer_forward_retryable;
+    total.peer_forward_fatal += node.peer_forward_fatal;
+    total.peer_forward_backoff_skips += node.peer_forward_backoff_skips;
+    total.peer_tile_fetches += node.peer_tile_fetches;
+    total.peer_bootstrap_fetches += node.peer_bootstrap_fetches;
+    total.peer_leaf_fetches += node.peer_leaf_fetches;
+    total.peer_provider_fetches += node.peer_provider_fetches;
+    total.peer_tile_duplicate_inflight += node.peer_tile_duplicate_inflight;
+    total.peer_bootstrap_duplicate_inflight += node.peer_bootstrap_duplicate_inflight;
+    total.peer_leaf_duplicate_inflight += node.peer_leaf_duplicate_inflight;
+    total.peer_provider_duplicate_inflight += node.peer_provider_duplicate_inflight;
+    total.internal_tile_requests += node.internal_tile_requests;
+    total.internal_bootstrap_requests += node.internal_bootstrap_requests;
+    total.internal_leaf_requests += node.internal_leaf_requests;
+    total.internal_provider_requests += node.internal_provider_requests;
     total.backend_fetches += node.backend_fetches;
     total.backend_fetch_successes += node.backend_fetch_successes;
     total.backend_fetch_not_found += node.backend_fetch_not_found;
@@ -269,9 +306,37 @@ pub(crate) fn add_histograms(total: &mut NodeHistogramSnapshot, node: &NodeHisto
 
 #[cfg(test)]
 mod tests {
-    use ishikari::metrics::{HistogramBucketSnapshot, HistogramSnapshot};
+    use ishikari::metrics::{HistogramBucketSnapshot, HistogramSnapshot, NodeMetricsSnapshot};
 
-    use super::{DistributionSummary, NodeReport, SimReport};
+    use super::{DistributionSummary, NodeReport, SimReport, add_metrics};
+
+    #[test]
+    fn aggregates_peer_forward_metrics() {
+        let mut total = NodeMetricsSnapshot::default();
+        add_metrics(
+            &mut total,
+            NodeMetricsSnapshot {
+                peer_forward_successes: 7,
+                peer_forward_retryable: 2,
+                peer_forward_backoff_skips: 11,
+                peer_bootstrap_fetches: 3,
+                peer_leaf_fetches: 5,
+                peer_tile_duplicate_inflight: 2,
+                internal_bootstrap_requests: 13,
+                internal_leaf_requests: 17,
+                ..NodeMetricsSnapshot::default()
+            },
+        );
+
+        assert_eq!(total.peer_forward_successes, 7);
+        assert_eq!(total.peer_forward_retryable, 2);
+        assert_eq!(total.peer_forward_backoff_skips, 11);
+        assert_eq!(total.peer_bootstrap_fetches, 3);
+        assert_eq!(total.peer_leaf_fetches, 5);
+        assert_eq!(total.peer_tile_duplicate_inflight, 2);
+        assert_eq!(total.internal_bootstrap_requests, 13);
+        assert_eq!(total.internal_leaf_requests, 17);
+    }
 
     #[test]
     fn derives_rates_from_common_report_counters() {

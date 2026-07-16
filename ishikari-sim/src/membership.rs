@@ -23,6 +23,11 @@ impl SimGossipTransport {
             hop_latency,
         }
     }
+
+    pub(crate) fn statistics(&self) -> (u64, u64) {
+        let statistics = self.inner.statistics();
+        (statistics.num_messages_total, statistics.num_bytes_total)
+    }
 }
 
 #[async_trait]

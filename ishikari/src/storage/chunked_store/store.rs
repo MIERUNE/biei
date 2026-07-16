@@ -22,6 +22,15 @@ pub struct ChunkedStore {
     coordinator: ChunkFetchCoordinator,
 }
 
+pub(crate) struct ChunkedStoreConfig {
+    pub tileset_sources: String,
+    pub chunk_size: u64,
+    pub max_fetch_chunks: u64,
+    pub backend_fetch_concurrency: usize,
+    pub backend_latency: BackendLatencyModel,
+    pub chunk_cache_max_bytes: u64,
+}
+
 /// Whether a range read was satisfied immediately or waited for backend work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChunkReadSource {
@@ -37,25 +46,22 @@ pub(crate) struct ChunkRead {
 
 impl ChunkedStore {
     /// Creates a chunked object-store reader over the configured tileset sources.
-    pub fn new(
-        tileset_sources: String,
-        chunk_size: u64,
-        max_fetch_chunks: u64,
-        backend_latency: BackendLatencyModel,
-        chunk_cache_max_bytes: u64,
+    pub(crate) fn new(
+        config: ChunkedStoreConfig,
         registry: &ObjectStoreRegistry,
         metrics: NodeMetrics,
     ) -> Result<Self> {
         let fetcher = ChunkFetcher::new(
-            tileset_sources,
-            chunk_size,
-            backend_latency,
+            config.tileset_sources,
+            config.chunk_size,
+            config.backend_fetch_concurrency,
+            config.backend_latency,
             registry,
             metrics.clone(),
         )?;
         Ok(Self {
-            cache: ChunkCache::new(chunk_cache_max_bytes),
-            coordinator: ChunkFetchCoordinator::new(fetcher, max_fetch_chunks, metrics),
+            cache: ChunkCache::new(config.chunk_cache_max_bytes),
+            coordinator: ChunkFetchCoordinator::new(fetcher, config.max_fetch_chunks, metrics),
         })
     }
 

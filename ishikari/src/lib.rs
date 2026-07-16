@@ -7,4 +7,5 @@ pub mod metrics;
 pub mod pmtiles;
 pub mod request_id;
 pub mod server;
+mod singleflight;
 pub mod storage;

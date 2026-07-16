@@ -16,8 +16,8 @@ behind it. The Rust implementation remains the source of truth:
 - `terrain/topology.rs`: shared boundaries and polygon assembly
 - `server/tileset/preview.rs`: reference preview styles
 
-Open optimization work is tracked in `ishikari-todo-spec.md`; it is not repeated
-as an implementation plan here.
+Open optimization work is tracked in `../issues/ishikari-todo.md`; it is
+not repeated as an implementation plan here.
 
 ## Products and Public Contract
 
@@ -64,8 +64,9 @@ request
   -> ResourceResolver / HRW routing
   -> tile and chunk caches / backend range batching
   -> Terrarium decode cache
+  -> derived-output tile-group HRW owner
   -> derived-product generation
-  -> generated-output cache
+  -> owner-local generated-output cache
 ```
 
 Generation obtains the center DEM and eight neighbors concurrently. The center
@@ -81,7 +82,8 @@ elevations.
 
 The current resource controls are:
 
-- generated outputs are single-flighted and byte-weighted in a pod-local cache;
+- generated outputs are assigned to a tile-group HRW owner, then single-flighted
+  and byte-weighted in that owner's local cache;
 - decoded source DEMs are single-flighted and byte-weighted;
 - authoritative center absence is negative-cached for the tile-negative TTL and
   returned as a cacheable `404`;
@@ -90,8 +92,12 @@ The current resource controls are:
 - WebP decode, contour/hillshade generation, and MLT transcode use
   `spawn_blocking` behind the shared `ISKR_CPU_WORK_CONCURRENCY` limit.
 
-Generated outputs are not currently assigned to a cluster-wide HRW owner. Two
-replicas can generate the same cold derived tile independently.
+The product and tileset form a synthetic routing id, while the PMTiles tile id
+selects the normal Hilbert group. MVT and MLT representations of one product
+therefore share an owner, and MLT transcoding also happens there. If the owner
+is unreachable, or an older rolling-upgrade peer does not expose the typed
+internal endpoint, the entry node generates locally rather than failing the
+public request.
 
 ## Contours
 
@@ -302,10 +308,11 @@ The implementation and tests should preserve these invariants:
   negative result;
 - CPU-heavy work remains bounded independently of request fan-out.
 
-## Remaining Evaluation
+## Evaluation Criteria
 
-The unresolved question is the Pareto frontier, not whether vectorization is
-technically possible. Representative fixtures and zooms should compare:
+The unresolved design question is the Pareto frontier, not whether
+vectorization is technically possible. The benchmark tracked in the TODO uses
+representative fixtures and zooms to compare:
 
 - vector MVT and MLT;
 - quantized lossless WebP;

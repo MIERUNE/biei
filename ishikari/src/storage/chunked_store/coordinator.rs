@@ -10,7 +10,7 @@ use std::{
 use anyhow::anyhow;
 use bytes::Bytes;
 use tokio::{
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot},
     time::{self, Instant},
 };
 use tracing::debug;
@@ -52,6 +52,8 @@ struct TilesetFetchState {
     scheduler_running: bool,
     /// Number of backend fetches currently inflight for this tileset.
     inflight_fetch_count: usize,
+    /// Wakes the scheduler when an inflight fetch releases a per-tileset slot.
+    capacity_available: Arc<Notify>,
     archive_len: u64,
 }
 
@@ -86,7 +88,7 @@ enum DispatchDecision {
     /// Nothing pending; the scheduler stops (state set non-running).
     Idle,
     /// Pending work exists but the concurrency cap leaves no slot this pass.
-    Throttled,
+    Throttled(Arc<Notify>),
     /// Dispatch these contiguous chunk ranges; carries dispatch metric inputs.
     Dispatch {
         groups: Vec<Range<u64>>,
@@ -153,7 +155,7 @@ impl TilesetFetchState {
             return DispatchDecision::Idle;
         }
         if self.inflight_fetch_count >= MAX_CONCURRENT_FETCHES_PER_TILESET {
-            return DispatchDecision::Throttled;
+            return DispatchDecision::Throttled(Arc::clone(&self.capacity_available));
         }
         let available_slots = MAX_CONCURRENT_FETCHES_PER_TILESET - self.inflight_fetch_count;
         let groups: Vec<Range<u64>> =
@@ -162,7 +164,7 @@ impl TilesetFetchState {
                 .take(available_slots)
                 .collect();
         if groups.is_empty() {
-            return DispatchDecision::Throttled;
+            return DispatchDecision::Throttled(Arc::clone(&self.capacity_available));
         }
         // Snapshot metric inputs before the chunks leave the pending set.
         let pending_at_dispatch = self.pending_chunks.len();
@@ -197,7 +199,13 @@ impl TilesetFetchState {
         chunk_range: Range<u64>,
         result: &Result<HashMap<u64, Bytes>, ChunkFetchError>,
     ) -> usize {
+        let scheduler_needs_capacity = self.inflight_fetch_count
+            >= MAX_CONCURRENT_FETCHES_PER_TILESET
+            && !self.pending_chunks.is_empty();
         self.inflight_fetch_count = self.inflight_fetch_count.saturating_sub(1);
+        if scheduler_needs_capacity {
+            self.capacity_available.notify_one();
+        }
         let mut released_waiters = 0;
         for chunk_index in chunk_range.start..chunk_range.end {
             self.inflight_chunks.remove(&chunk_index);
@@ -308,7 +316,7 @@ impl ChunkFetchCoordinator {
                 time::sleep(FETCH_MERGE_WINDOW).await;
             }
 
-            let dispatch = {
+            let (dispatch, capacity_available) = {
                 let mut tileset_states = self.tileset_states.lock().await;
                 let Some(state) = tileset_states.get_mut(&tileset_id) else {
                     return;
@@ -321,7 +329,9 @@ impl ChunkFetchCoordinator {
                         }
                         return;
                     }
-                    DispatchDecision::Throttled => None,
+                    DispatchDecision::Throttled(capacity_available) => {
+                        (None, Some(capacity_available))
+                    }
                     DispatchDecision::Dispatch {
                         groups,
                         archive_len,
@@ -338,10 +348,16 @@ impl ChunkFetchCoordinator {
                             queue_delay,
                             pending_at_dispatch,
                         );
-                        Some((groups, archive_len))
+                        (Some((groups, archive_len)), None)
                     }
                 }
             };
+
+            if let Some(capacity_available) = capacity_available {
+                capacity_available.notified().await;
+                flush_immediately = true;
+                continue;
+            }
 
             let Some((groups, archive_len)) = dispatch else {
                 continue;
@@ -544,6 +560,28 @@ mod tests {
             "chunk two"
         );
         assert!(state.is_drainable());
+    }
+
+    #[tokio::test]
+    async fn completing_fetch_wakes_capacity_waiter() {
+        let mut state = TilesetFetchState {
+            scheduler_running: true,
+            inflight_fetch_count: MAX_CONCURRENT_FETCHES_PER_TILESET,
+            ..Default::default()
+        };
+        state.inflight_chunks.insert(1);
+        state.enqueue_chunks(&[2], Instant::now());
+
+        let DispatchDecision::Throttled(capacity_available) = state.select_dispatch_groups(4)
+        else {
+            panic!("expected capacity throttling");
+        };
+        let notified = capacity_available.notified();
+
+        state.complete_group(1..2, &Ok(HashMap::from([(1, Bytes::new())])));
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("fetch completion must wake the scheduler");
     }
 
     #[test]

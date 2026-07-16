@@ -1,6 +1,7 @@
 # Ishikari Simulator Spec
 
-A plan for a deterministic, trace-driven simulator that answers quantitative
+A specification and current-status record for a deterministic, trace-driven
+simulator that answers quantitative
 questions about Ishikari's distributed cache behavior — hit rates, backend
 egress, node-churn recovery, chunk batching efficiency, and load skew — under a
 realistic workload derived from Japan's population distribution.
@@ -18,11 +19,13 @@ for every important resource and decision with the cheapest faithful model:
 - use real-cluster tests only to fit and validate the model, not as the normal
   way to answer capacity questions.
 
-This follows the biei-sim design principle: **production logic (HRW routing,
-cache decisions, PMTiles resolution, chunk batching) lives in the main crate
-and the simulator consumes it through narrow seams. The simulator never
-reimplements policy.** Conversely, it must not consume production-scale
-resources merely to look realistic. Any behavior that is neither executed from
+This follows the biei-sim design principle: production policy should stay in
+the main crate and be consumed through narrow seams. Real-cache mode executes
+the production resolver directly. Modeled-cache mode instead implements a
+metadata-only request flow while reusing production HRW routing, PMTiles access
+planning, chunk-range planning, Moka eviction policies, and byte weights. That
+approximation is calibrated against real-cache runs; it must not be described
+as identical production execution. Any behavior that is neither executed from
 production code nor represented by a measured model is an explicit limitation,
 not an implicit zero-cost operation.
 
@@ -49,10 +52,13 @@ cluster ("one config per load-test run").
 - **Q4 — Chunk batching × Hilbert locality.** How far do
   `chunk_size_bytes` / `max_fetch_chunks` (with `MAX_CHUNK_GAP = 1` gap
   prefetch) cut backend GET count under a viewport workload, and where does
-  read amplification (bytes fetched / bytes used) start to hurt?
+  read amplification (bytes fetched / bytes used) start to hurt? Under Phase 2,
+  also sweep `backend_fetch_concurrency` and inspect backend admission queue
+  p95 rather than assuming every planned range starts immediately.
 - **Q5 — Derived-tile generation queueing** (Phase 2 only). How does
   contour/hillshade generation (~100–500 ms/tile) behave under the
-  `terrain_generation_concurrency` semaphore with viewport request patterns?
+  shared `ISKR_CPU_WORK_CONCURRENCY` and `ISKR_CPU_WORK_MAX_INFLIGHT` admission
+  limits with viewport request patterns? This is not modeled yet.
 
 ## 2. Approach — two phases
 
@@ -73,32 +79,35 @@ All newly visible tiles from one viewport step are polled together, preserving
 their deterministic `(dy, dx)` order. `tokio::time` starts paused so the real
 10 ms fetch merge window advances without wall-clock delay after every ready
 request has had a chance to enqueue its missing chunks. This exercises the
-production single-flight, gap merge, and `max_fetch_chunks` behavior without
-introducing a latency distribution.
+production single-flight, gap merge, and `max_fetch_chunks` behavior in
+real-cache mode without introducing a latency distribution. Modeled-cache mode
+uses its metadata-only range planner instead.
 
 **Phase 2: Tokio paused-time simulation** (biei-sim style) for questions where
 latency and queueing matter. VUs run concurrently as closed users: one viewport
 batch completes, then the VU sleeps for `1.2 +/- 0.5 s`. The runner uses the
 real resolver, caches, peer transport, single-flight, merge window, and backend
 fetch concurrency limit. Fixed backend and peer delays are controlled sweep
-inputs; fitted latency distributions and terrain generation remain future work.
+inputs; fitted lognormal backend profiles are implemented. Terrain generation
+and shared CPU-admission queueing remain future work.
 
 ## 3. Workload model — population-driven viewport walk
 
-Port of the `tile_server_loadtest.js` (k6) user model to Rust, so the same
-workload drives both the simulator and real-cluster validation runs.
+The population-driven viewport model is implemented in Rust so one
+deterministic trace can drive both simulator sweeps and real-cluster validation
+runs.
 
 ### 3.1 Data
 
 `ishikari-sim/data/census_2020_1km_population.geojson` (~18.5 MB): 2020
 national census, 1 km (1/80°) mesh centroids with a `population` property.
 Loaded at startup into a cumulative-weight array
-(`Vec<(lng, lat, cum_weight)>`), same as the k6 `SharedArray` CDF.
+(`Vec<(lng, lat, cum_weight)>`).
 Zero/negative-population meshes are dropped.
 
 ### 3.2 Session state machine (per simulated user)
 
-Mirrors the k6 script exactly; parameter names and defaults carried over:
+The workload contract uses these parameters and defaults:
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -122,11 +131,10 @@ Per step:
    **deduplicated against the previous step's viewport set** — only newly
    visible tiles become requests, exactly like a map client.
 
-Zoom-out/zoom-in is represented the same way the k6 model represents it:
-session resets re-roll zoom. An explicit within-session zoom ladder
-(z → z±1 keeping the center, which produces parent/child tile requests) is a
-planned workload knob (`zoom_walk_probability`, default 0 = k6-compatible);
-it matters for Q4 because parent/child tiles are far apart in tile-id space.
+Zoom-out/zoom-in is represented by session resets that re-roll zoom. An
+explicit within-session zoom ladder (z → z±1 keeping the center, which produces
+parent/child tile requests) is not implemented yet; it is tracked in the TODO
+because parent/child tiles are far apart in tile-id space and matter for Q4.
 
 ### 3.3 Interleaving and traces
 
@@ -139,7 +147,7 @@ it matters for Q4 because parent/child tiles are far apart in tile-id space.
   - the exact same trace can be replayed across config sweeps
     (variance-free A/B), and
   - the trace can be exported for replay against a **real** cluster
-    (a thin k6/vegeta replay script) for cross-validation (§8).
+    (a thin HTTP JSONL replay tool) for cross-validation (§8).
 - Entry-node choice: each request is assigned an entry node, modeling the
   Gateway LB. Knob `entry_affinity = per_request | per_session`
   (default `per_request` uniform; Google Cloud Application Load Balancing
@@ -188,54 +196,23 @@ and the production 1 GiB cap. HRW placement and production chunk-range planning
 are reused. This decouples resident memory from configured logical capacity.
 `cache_mode=real` remains the calibration path for request-level fidelity.
 
-### 4.2 Seams to cut (refactor in the main crate)
+### 4.2 Production seams
 
-This is the only production-code change the simulator requires, and it pays
-for itself as plain testability even if the sim is abandoned:
+The current implementation uses three narrow boundaries:
 
-1. **Peer transport.** `PeerBackend` currently owns a `reqwest::Client` and
-   formats `/_internal/*` URLs. Extract a trait:
-
-   ```rust
-   type FetchFuture<'a> = Pin<
-       Box<dyn Future<Output = Result<Bytes, PeerFetchError>> + Send + 'a>,
-   >;
-
-   trait InternalTransport: Send + Sync {
-       fn fetch<'a>(&'a self, peer: &'a Peer, internal_path: &'a str)
-           -> FetchFuture<'a>;
-   }
-   ```
-
-   `PeerBackend` retains construction of the typed `/_internal/*` paths, so
-   neither transport can turn this seam into an arbitrary upstream fetcher.
-   Prod impl: current reqwest code (peer URL assembly, status→error mapping,
-   request-id header). Sim impl: matches that small internal protocol and calls
-   the *target node's* resolver directly (`load_tile_by_id`,
-   `load_bootstrap_bytes`, `load_leaf_bytes` — the exact functions the internal
-   HTTP endpoints wrap), plus counters for forwarded requests/bytes. Failure
-   injection (peer down / 429 / timeout) becomes a transport decorator.
-   `PeerBackend` stores
-   `Arc<dyn InternalTransport>`, and `ResourceResolver` gets an explicit
-   constructor for injected backends while `new` remains the production
-   convenience constructor. The sim transport resolves peers through a
-   registry of `Weak<ResourceResolver>` values; removing a node from that
-   registry must release its caches rather than keeping the node alive through
-   the transport.
-
-2. **Peer directory.** `PeerBackend` stores a trait-object-compatible
-   `PeerDirectory`. Production and real-cache simulation both implement it with
-   `Membership::peers()`. Each simulated node owns an independent chitchat
-   instance, including the production one-gossip-tick peer cache and failure
-   detector. Metadata-only modeled runs use the cheaper scripted directory,
-   whose membership changes occur at scheduled request indices.
-
-3. **Object store counting.** No trait needed — `ObjectStoreRegistry` already
-   abstracts backends. Register a counting decorator
-   (`CountingStore<LocalFileSystem>`) that tallies GET requests, ranges, and
-   bytes per node. (`NodeMetrics` already counts backend fetches and
-   `received_bytes`; the decorator adds range-level detail for read-
-   amplification analysis.)
+1. **Peer transport.** `PeerBackend` constructs typed `/_internal/*` paths and
+   calls `InternalTransport`. Production uses the reqwest implementation; the
+   simulator resolves the target node in-process and calls the same resolver
+   operations wrapped by the internal HTTP endpoints. Transport failures and
+   fixed peer latency are injected at this boundary.
+2. **Peer directory.** `PeerBackend` reads candidates through `PeerDirectory`.
+   Production and real-cache simulation use `Membership`; every real-cache node
+   owns an independent production chitchat instance. Modeled mode applies its
+   cheaper active-node set immediately at event boundaries.
+3. **Simulator support exports.** The `simulator-support` feature exposes the
+   PMTiles access plan, chunk-range planner, routing primitives, and injected
+   resolver constructors required by modeled and in-process runs. Normal
+   Ishikari builds do not expose those simulator-only APIs.
 
 No production `Clock` seam is needed. Phase 1A does not claim to model
 cross-request merging. Phase 1B uses Tokio's paused clock to exercise the real
@@ -260,30 +237,41 @@ For each trace entry `(user, z, x, y)` in Phase 1A, or viewport batch in Phase
 Per run, per node, harvested from each node's Prometheus registry
 (`NodeMetrics`) plus sim-side counters:
 
-- Tiles served by source (`cache` / `peer` / `local` / `miss`) — headline
-  **L1 hit rate** and **peer-forward rate**.
+- Tiles served by source (`self_cache` / `peer_cache` / `self_backend` /
+  `peer_backend` / `miss`) — headline **cache hit rate**, **L1 hit rate**, and
+  **peer-forward rate**.
 - Chunk cache hit / miss / post-fetch-hit; **backend GET count** and
   **backend bytes** (egress proxy); **read amplification** = backend bytes /
   tile bytes served.
 - Peer-transfer bytes (east-west traffic).
+- Gossip messages/bytes and unavailable-peer attempts caused by stale views.
+- Peer forwarding outcomes and backoff skips from the production
+  `NodeMetrics`, so failover attempts avoided during convergence are visible.
+- Identical in-flight peer fetch overlap by resource kind, so additional
+  response coalescing is considered only when measured fan-in justifies it.
+- Per-node inbound and outbound internal-resource counts, classified by the
+  shared production path classifier, for tile/index/provider hotspot analysis.
+- Per-sample membership convergence: converged/stale node views, missing and
+  extra peer references, min/max peer count, and virtual elapsed time.
 - Cache occupancy (`tile_cache_weighted_size`, `chunk_cache_weighted_size`).
 - **Load skew**: per-node share of local loads; report max/mean and CV.
 - Backend scheduler distributions: fetch duration/size/chunks, queue delay,
   pending chunks at dispatch, and waiters released per fetch group. Structured
   histogram snapshots are merged without parsing Prometheus text.
 
-Current output is one self-contained JSON document containing execution mode,
-tagged trace source (`generated` with workload config, or `replay` with input
-path), cluster config, aggregate metrics, and per-node summaries. Generated
-request traces are written separately as JSONL and can be replayed in-process
-with either serial or viewport-batch execution.
+Current output is one versioned (`schema_version`) self-contained JSON document
+containing execution mode, tagged trace source (`generated` with workload
+config, or `replay` with input path), cluster config, aggregate metrics, and
+per-node summaries. Generated request traces are written separately as JSONL
+and can be replayed in-process with either serial or viewport-batch execution.
 
 Churn replay emits configurable counter snapshots (default every 1,000
 requests), plus paired pre/post-event snapshots. Samples include active cache
-occupancy and per-node request counters, so hit-rate, backend-fetch, load-skew,
-and recovery curves can be derived over request count. The future sweep runner
-will append one run document (config + summary + bucketed series) per line to a
-sweep JSONL file.
+occupancy, per-node request counters, virtual elapsed time, and each node's
+agreement with the active membership set, so hit-rate, backend-fetch,
+load-skew, gossip-convergence, and recovery curves can be derived. The future
+sweep runner will append one run document (config + summary + bucketed series)
+per line to a sweep JSONL file.
 
 ## 6. Scenario catalog
 
@@ -319,11 +307,11 @@ Each scenario = a config grid × the workload of §3, run on the same seed(s).
   candidate #2.
 - **S5 — Cold start.** All caches empty, no churn: requests until hit rate
   plateaus. Informs deploy-time behavior and warm-up expectations.
-- **S6 — Terrain generation queueing (Q5). Phase 2 only.**
+- **S6 — Terrain generation queueing (Q5). Planned for Phase 2.**
 
 ## 7. Determinism
 
-- Seeded RNG (`rand::rngs::StdRng` or `ChaCha8`), one stream per user derived
+- Seeded `rand::rngs::StdRng`, one stream per user derived
   from `(seed, user_index)` so adding users doesn't perturb existing streams.
 - Single-threaded `tokio::runtime::Builder::new_current_thread()`. Phase 1A is
   fully serialized. Phase 1B polls one deterministic ordered viewport batch at
@@ -364,7 +352,7 @@ cache lookup counters remain scheduling-sensitive, and modeled peer counters
 cover tile forwarding but not every bootstrap/leaf control transfer. Use real
 mode when those counters, rather than capacity/egress trends, are the subject.
 
-## 9. Implementation plan
+## 9. Current Implementation
 
 Layout: the repository is a Cargo workspace with sibling `ishikari` and
 `ishikari-sim` crates, matching the biei/biei-sim layout. The production crate
@@ -372,47 +360,24 @@ exports the narrow injection seam only under its `simulator-support` feature;
 the simulator owns `rand`, census parsing, trace generation, scenarios, and its
 binary. Normal `ishikari` builds therefore carry no simulator dependencies.
 
-Steps (each independently landable):
-
-1. **Seam refactor** (`InternalTransport`, `PeerDirectory`, counting store
-   hook). Pure refactor, no behavior change; existing tests must pass
-   unchanged. This is the only step touching production code.
-2. **Workload generator**: census CDF loader + session walker + trace dump.
-   Unit-test against the k6 script's semantics (zoom distribution, viewport
-   dedup, mesh jitter bounds).
-3. **Sim harness**: build N in-process nodes over `data/japan.pmtiles`,
-   scripted membership, request loop, TileSource tally, metrics harvest,
-   JSONL output.
-4. **Phase 1B viewport runner**: ordered concurrent viewport batches under
-   paused Tokio time; verify that production merge metrics become non-zero.
-5. **Sweep runner**: config grid file (TOML) → sequential runs → JSONL.
-   (Parallelism across runs via separate processes if needed; keep the
-   harness itself single-threaded.)
-6. **Scenarios S1, S3, S4** (no churn machinery needed) + plotting script.
-7. **Churn events** (node join/kill plus ingress-set update) → **S2, S5**.
-   Implemented for serial and viewport-batch replay in both real and modeled
-   cache modes. Added nodes start cold; removed-node cumulative metrics are
-   retained. Real-cache mode lets independent chitchat views converge through
-   the production failure detector; modeled mode changes membership instantly.
-8. **k6 trace replay + calibration run** (§8).
-
-Rough order: steps 1–3 are the bulk (~1–2 days each); 4–7 are small.
-
-Current status: the transport/directory seam, workload generator, Phase 1A
+Implemented: the transport/directory seam, workload generator, Phase 1A
 in-process cluster, structured metrics report, Phase 1B viewport runner,
 validated in-process JSONL replay, and scripted node add/remove replay are
 implemented. Metadata-only per-node modeled tile/chunk caches and PMTiles
 access catalogs are also implemented for large logical-capacity sweeps. A
-self-contained HTML report visualizer renders churn timelines, interval rates,
-cache occupancy, and active-node load. Structured production scheduler
-histograms and aggregate node request-load skew are included in current JSON
-reports. Object-store request decoration, sweep orchestration, gossip packet
-loss and partition injection, and real-cluster replay remain.
+self-contained HTML report visualizer renders request-indexed churn charts,
+interval rates, peer failover/backoff activity, cache occupancy, and active-node
+load.
+Structured production scheduler histograms and aggregate node request-load
+skew are included in current JSON reports.
+
+Remaining implementation work is tracked once in
+`../issues/ishikari-todo.md`.
 
 ## 10. Phase 2 latency and queueing
 
 `--phase2` replays each trace user in its own Tokio task. Tiles in one viewport
-use the same concurrent batch semantics as k6, and the next viewport starts
+use concurrent batch semantics, and the next viewport starts
 after batch completion plus deterministic think-time jitter. Because Tokio time
 is paused, long virtual runs complete without wall-clock sleeps.
 
@@ -433,6 +398,11 @@ Representative measurements:
 - Phase 2, 100 ms backend latency and normal think time: p95 116 ms, p99 215 ms.
 - Phase 2, 200 VUs, 300 ms backend latency and no think time: p95 617 ms,
   p99 925 ms, max 2.465 s; peak in-flight requests reached about 600 per node.
+- Phase 2, 50 VUs, 3 nodes, 26,018 requests, and 100 ms backend latency exposed
+  cold index fan-in: Reader single-flight reduced peer bootstrap fetches from
+  286 to 2 and leaf fetches from 654 to 109. Identical overlap fell from
+  284/545 to zero; p95/p99 remained 112/219 ms. Peer tile overlap was only
+  25 of 10,898 fetches (0.23%), so tile response coalescing remains unwarranted.
 - GKE `asia-northeast1` production metrics (2026-07-13): 343 successful range
   fetches averaged 94.5 ms at 1.78 MiB; 67.1% completed within 100 ms, 92.4%
   within 200 ms, and all within 500 ms. A same-region controlled range probe
@@ -461,8 +431,8 @@ measured inputs.
   no MLT transcoding, no terrain generation.
 - No HTTP/serialization overhead; peer transfers are counted by tile byte
   length.
-- No client cache model beyond viewport dedup (browsers also have their own
-  tile cache; the k6 model ignores it, and we match the k6 model).
+- No client cache model beyond viewport dedup. Browser HTTP caches are outside
+  the simulator's current workload contract.
 
 ## Open questions
 
@@ -471,7 +441,7 @@ measured inputs.
 - Should the trace include tileset diversity (e.g. `japan` + a second
   tileset) to exercise per-tileset chunk coordinators and cache competition?
   Phase 1 starts single-tileset.
-- Zoom-walk model (§3.2): keep k6-compatible default, but decide parameters
-  worth sweeping once S3 baseline exists.
+- Zoom-walk model (§3.2): keep the current reset-only default, but decide
+  parameters worth sweeping once S3 baseline exists.
 - Whether S2's "requests to recover" should also be reported in wall-clock
   terms using a simple requests/sec assumption, for communicating results.

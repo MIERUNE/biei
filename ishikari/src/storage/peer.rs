@@ -1,16 +1,25 @@
 //! Peer routing and internal HTTP transport.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::{
     interned::TilesetId,
     membership::{Membership, Peer},
+    metrics::NodeMetrics,
     pmtiles::BootstrapTransfer,
 };
 
@@ -23,7 +32,14 @@ pub struct PeerBackend {
     peer_directory: Arc<dyn PeerDirectory>,
     router: HrwRouter,
     transport: Arc<dyn InternalTransport>,
+    retryable_failures: Arc<Mutex<HashMap<String, HashMap<&'static str, Instant>>>>,
+    inflight_fetches: Arc<Mutex<HashMap<(String, String), usize>>>,
+    metrics: NodeMetrics,
 }
+
+const PEER_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DERIVED_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type PeerFuture<'a> = Pin<Box<dyn Future<Output = Arc<[Peer]>> + Send + 'a>>;
 pub type FetchFuture<'a> =
@@ -112,7 +128,10 @@ impl InternalTransport for HttpInternalTransport {
     fn fetch<'a>(&'a self, peer: &'a Peer, path: &'a str) -> FetchFuture<'a> {
         Box::pin(async move {
             let url = format!("http://{}{}", peer.addr, path);
-            let mut request = self.http_client.get(url);
+            let mut request = self
+                .http_client
+                .get(url)
+                .timeout(peer_request_timeout(path));
             if let Some(id) = crate::request_id::current() {
                 request = request.header(crate::request_id::HEADER, id);
             }
@@ -151,6 +170,14 @@ impl InternalTransport for HttpInternalTransport {
     }
 }
 
+fn peer_request_timeout(path: &str) -> Duration {
+    if path.starts_with("/_internal/derived/") {
+        DERIVED_PEER_REQUEST_TIMEOUT
+    } else {
+        PEER_REQUEST_TIMEOUT
+    }
+}
+
 /// Errors returned while fetching internal resources from a peer.
 #[derive(Debug, Error)]
 pub enum PeerFetchError {
@@ -175,12 +202,14 @@ impl PeerBackend {
         membership: Membership,
         router: HrwRouter,
         http_client: Client,
+        metrics: NodeMetrics,
     ) -> Self {
         Self::with_dependencies(
             self_node_id,
             Arc::new(MembershipPeerDirectory { membership }),
             router,
             Arc::new(HttpInternalTransport { http_client }),
+            metrics,
         )
     }
 
@@ -190,31 +219,48 @@ impl PeerBackend {
         peer_directory: Arc<dyn PeerDirectory>,
         router: HrwRouter,
         transport: Arc<dyn InternalTransport>,
+        metrics: NodeMetrics,
     ) -> Self {
         Self {
             self_node_id,
             peer_directory,
             router,
             transport,
+            retryable_failures: Arc::new(Mutex::new(HashMap::new())),
+            inflight_fetches: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 
-    /// Returns the routed candidate peers for a tileset.
-    pub async fn route_tileset(&self, tileset_id: &TilesetId) -> Vec<ScoredPeer> {
+    async fn route_tileset_for(&self, tileset_id: &TilesetId, kind: &str) -> Vec<ScoredPeer> {
         let peers = self.peer_directory.peers().await;
-        self.router.route_tileset(&peers, tileset_id.as_ref())
+        self.route_with_backoff(&peers, peer_resource_label(kind), |peers| {
+            self.router.route_tileset(peers, tileset_id.as_ref())
+        })
     }
 
     /// Returns the routed candidate peers for a tile request.
     pub async fn route_tile(&self, tileset_id: &TilesetId, tile_id: u64) -> Vec<ScoredPeer> {
-        let peers = self.peer_directory.peers().await;
-        self.router.route_tile(&peers, tileset_id.as_ref(), tile_id)
+        self.route_tile_for(tileset_id, tile_id, "tile").await
     }
 
-    /// Returns the routed candidate peers for an arbitrary provider-resource key.
-    pub async fn route_key(&self, key: &str) -> Vec<ScoredPeer> {
+    async fn route_tile_for(
+        &self,
+        tileset_id: &TilesetId,
+        tile_id: u64,
+        kind: &str,
+    ) -> Vec<ScoredPeer> {
         let peers = self.peer_directory.peers().await;
-        self.router.route_key(&peers, key)
+        self.route_with_backoff(&peers, peer_resource_label(kind), |peers| {
+            self.router.route_tile(peers, tileset_id.as_ref(), tile_id)
+        })
+    }
+
+    async fn route_key_for(&self, key: &str, kind: &str) -> Vec<ScoredPeer> {
+        let peers = self.peer_directory.peers().await;
+        self.route_with_backoff(&peers, peer_resource_label(kind), |peers| {
+            self.router.route_key(peers, key)
+        })
     }
 
     /// Returns whether the given peer is the local node.
@@ -267,7 +313,7 @@ impl PeerBackend {
     ) -> Result<InternalFetchResponse, PeerFetchError> {
         let key = encode_tileset_path(tileset_id);
         let path = format!("/_internal/tiles/{key}/{tile_id}");
-        self.transport.fetch(peer, &path).await
+        self.fetch_from_peer(peer, &path, "tile").await
     }
 
     /// Routes a provider-resource request across key candidate peers.
@@ -282,57 +328,82 @@ impl PeerBackend {
         path: &str,
         kind: &str,
     ) -> Result<Option<Bytes>> {
-        let candidates = self.route_key(key).await;
+        let candidates = self.route_key_for(key, kind).await;
+        self.route_fetch_optional_candidates(candidates, key, path, kind)
+            .await
+    }
 
+    /// Routes a typed internal resource using the same Hilbert-group HRW
+    /// placement as stored tiles. The caller owns the internal wire format;
+    /// `None` means local fallback (including an older peer returning 404).
+    pub async fn route_fetch_optional_by_tile(
+        &self,
+        routing_id: &TilesetId,
+        tile_id: u64,
+        path: &str,
+        kind: &str,
+    ) -> Result<Option<Bytes>> {
+        let candidates = self.route_tile_for(routing_id, tile_id, kind).await;
+        self.route_fetch_optional_candidates(candidates, routing_id.as_ref(), path, kind)
+            .await
+    }
+
+    async fn route_fetch_optional_candidates(
+        &self,
+        candidates: Vec<ScoredPeer>,
+        routing_key: &str,
+        path: &str,
+        kind: &str,
+    ) -> Result<Option<Bytes>> {
         if candidates.is_empty()
             || candidates
                 .first()
                 .is_some_and(|peer| self.is_self(&peer.peer))
         {
-            debug!(key = key, kind = kind, "using local provider read");
+            debug!(routing_key, kind, "using local resource read");
             return Ok(None);
         }
 
         for peer in candidates {
             if self.is_self(&peer.peer) {
                 debug!(
-                    key = key,
+                    routing_key,
                     peer_id = %peer.peer.id,
                     kind = kind,
-                    "reached local node; falling back local"
+                    "reached local resource owner; falling back local"
                 );
                 return Ok(None);
             }
 
             debug!(
-                key = key,
+                routing_key,
                 peer_id = %peer.peer.id,
                 kind = kind,
-                "forwarding provider request to peer"
+                "forwarding resource request to peer"
             );
-            match self.transport.fetch(&peer.peer, path).await {
+            match self.fetch_from_peer(&peer.peer, path, kind).await {
                 Ok(response) => {
                     debug!(
-                        key = key,
+                        routing_key,
                         peer_id = %peer.peer.id,
                         kind = kind,
                         body_len = response.bytes.len(),
-                        "received provider bytes from peer"
+                        "received resource bytes from peer"
                     );
                     return Ok(Some(response.bytes));
                 }
                 Err(PeerFetchError::NotFound) => {
                     debug!(
-                        key = key,
+                        routing_key,
                         peer_id = %peer.peer.id,
                         kind = kind,
-                        "peer reported missing provider resource"
+                        "peer does not serve the typed resource; falling back local"
                     );
                     return Ok(None);
                 }
                 Err(error) if error.is_retryable() => {
                     warn!(
-                        key = key,
+                        routing_key,
                         peer_id = %peer.peer.id,
                         kind = kind,
                         error = %error,
@@ -342,7 +413,7 @@ impl PeerBackend {
                 }
                 Err(error) => {
                     warn!(
-                        key = key,
+                        routing_key,
                         peer_id = %peer.peer.id,
                         kind = kind,
                         error = %error,
@@ -354,9 +425,9 @@ impl PeerBackend {
         }
 
         debug!(
-            key = key,
+            routing_key,
             kind = kind,
-            "all provider forwards failed; falling back local"
+            "all resource forwards failed; falling back local"
         );
         Ok(None)
     }
@@ -368,84 +439,191 @@ impl PeerBackend {
         path: &str,
         kind: &str,
     ) -> Result<Option<Bytes>> {
-        let candidates = self.route_tileset(tileset_id).await;
-
-        if candidates.is_empty()
-            || candidates
-                .first()
-                .is_some_and(|peer| self.is_self(&peer.peer))
-        {
-            debug!(tileset_id = %tileset_id, kind = kind, "using local read");
-            return Ok(None);
-        }
-
-        for peer in candidates {
-            if self.is_self(&peer.peer) {
-                debug!(
-                    tileset_id = %tileset_id,
-                    peer_id = %peer.peer.id,
-                    kind = kind,
-                    "reached local node; falling back local"
-                );
-                return Ok(None);
-            }
-
-            debug!(
-                tileset_id = %tileset_id,
-                peer_id = %peer.peer.id,
-                kind = kind,
-                "forwarding request to peer"
-            );
-            match self.transport.fetch(&peer.peer, path).await {
-                Ok(response) => {
-                    debug!(
-                        tileset_id = %tileset_id,
-                        peer_id = %peer.peer.id,
-                        kind = kind,
-                        body_len = response.bytes.len(),
-                        "received bytes from peer"
-                    );
-                    return Ok(Some(response.bytes));
-                }
-                Err(PeerFetchError::NotFound) => {
-                    debug!(
-                        tileset_id = %tileset_id,
-                        peer_id = %peer.peer.id,
-                        kind = kind,
-                        "peer reported missing"
-                    );
-                    return Ok(None);
-                }
-                Err(error) if error.is_retryable() => {
-                    warn!(
-                        tileset_id = %tileset_id,
-                        peer_id = %peer.peer.id,
-                        kind = kind,
-                        error = %error,
-                        "forward failed; trying next candidate"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    warn!(
-                        tileset_id = %tileset_id,
-                        peer_id = %peer.peer.id,
-                        kind = kind,
-                        error = %error,
-                        "forward failed; falling back local"
-                    );
-                    return Ok(None);
-                }
-            }
-        }
-
-        debug!(
-            tileset_id = %tileset_id,
-            kind = kind,
-            "all forwards failed; falling back local"
-        );
-        Ok(None)
+        let candidates = self.route_tileset_for(tileset_id, kind).await;
+        self.route_fetch_optional_candidates(candidates, tileset_id.as_ref(), path, kind)
+            .await
     }
+
+    async fn fetch_from_peer(
+        &self,
+        peer: &Peer,
+        path: &str,
+        kind: &str,
+    ) -> Result<InternalFetchResponse, PeerFetchError> {
+        let (inflight_guard, duplicate) = PeerFetchGuard::enter(
+            Arc::clone(&self.inflight_fetches),
+            (peer.id.clone(), path.to_string()),
+        );
+        let resource = peer_resource_label(kind);
+        if duplicate {
+            self.metrics.record_peer_fetch_duplicate_inflight(resource);
+        }
+        let result = self.transport.fetch(peer, path).await;
+        drop(inflight_guard);
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(PeerFetchError::NotFound) => "not_found",
+            Err(PeerFetchError::Retryable(_)) => "retryable",
+            Err(PeerFetchError::Fatal(_)) => "fatal",
+        };
+        self.metrics.record_peer_forward(outcome);
+        self.metrics.record_peer_fetch(resource, outcome);
+
+        let mut failures = self
+            .retryable_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if result.as_ref().is_err_and(PeerFetchError::is_retryable) {
+            failures
+                .entry(peer.id.clone())
+                .or_default()
+                .insert(resource, Instant::now() + PEER_RETRY_BACKOFF);
+        } else if let Some(resources) = failures.get_mut(&peer.id) {
+            resources.remove(resource);
+            if resources.is_empty() {
+                failures.remove(&peer.id);
+            }
+        }
+        result
+    }
+
+    fn route_with_backoff(
+        &self,
+        peers: &[Peer],
+        resource: &'static str,
+        route: impl Fn(&[Peer]) -> Vec<ScoredPeer>,
+    ) -> Vec<ScoredPeer> {
+        let preferred = route(peers);
+        let available = self.available_peers(peers, resource);
+        let Cow::Owned(available) = available else {
+            return preferred;
+        };
+
+        // Count only suppressed peers that HRW would actually have selected as
+        // candidates. Backed-off peers outside the candidate set do not avoid a
+        // forward and therefore must not increase the backoff metric.
+        for candidate in &preferred {
+            if !available.iter().any(|peer| peer.id == candidate.peer.id) {
+                self.metrics.record_peer_forward("backoff");
+            }
+        }
+        route(&available)
+    }
+
+    fn available_peers<'a>(&self, peers: &'a [Peer], resource: &'static str) -> Cow<'a, [Peer]> {
+        let now = Instant::now();
+        let mut failures = self
+            .retryable_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures.retain(|_, resources| {
+            resources.retain(|_, retry_at| *retry_at > now);
+            !resources.is_empty()
+        });
+        if failures.is_empty() {
+            return Cow::Borrowed(peers);
+        }
+        if !failures
+            .values()
+            .any(|resources| resources.contains_key(resource))
+        {
+            return Cow::Borrowed(peers);
+        }
+        let available = peers
+            .iter()
+            .filter(|peer| {
+                !failures
+                    .get(&peer.id)
+                    .is_some_and(|resources| resources.contains_key(resource))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Cow::Owned(available)
+    }
+}
+
+struct PeerFetchGuard {
+    inflight: Arc<Mutex<HashMap<(String, String), usize>>>,
+    key: (String, String),
+}
+
+impl PeerFetchGuard {
+    fn enter(
+        inflight: Arc<Mutex<HashMap<(String, String), usize>>>,
+        key: (String, String),
+    ) -> (Self, bool) {
+        let duplicate = {
+            let mut requests = inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let count = requests.entry(key.clone()).or_default();
+            let duplicate = *count > 0;
+            *count += 1;
+            duplicate
+        };
+        (Self { inflight, key }, duplicate)
+    }
+}
+
+impl Drop for PeerFetchGuard {
+    fn drop(&mut self) {
+        let mut requests = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = requests.get_mut(&self.key) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            requests.remove(&self.key);
+        }
+    }
+}
+
+fn peer_resource_label(kind: &str) -> &'static str {
+    match kind {
+        "tile" => "tile",
+        "bootstrap" => "bootstrap",
+        "leaf" => "leaf",
+        "style" => "style",
+        "glyph" => "glyph",
+        "sprite" => "sprite",
+        "derived" => "derived",
+        _ => "other",
+    }
+}
+
+/// Classifies a typed internal forwarding path into a bounded metric label.
+pub fn internal_resource_kind(path: &str) -> Option<&'static str> {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    if path.starts_with("/_internal/tiles/") {
+        return Some("tile");
+    }
+    if path.starts_with("/_internal/derived/") {
+        return Some("derived");
+    }
+    if path.starts_with("/_internal/pmtiles/") {
+        if path.ends_with("/bootstrap") {
+            return Some("bootstrap");
+        }
+        if path.contains("/leaf/") {
+            return Some("leaf");
+        }
+    }
+    if path.starts_with("/_internal/provider/fonts/") {
+        return Some("glyph");
+    }
+    if path.starts_with("/_internal/provider/styles/") {
+        if path.ends_with("/style.json") {
+            return Some("style");
+        }
+        if path.contains("/sprite") {
+            return Some("sprite");
+        }
+        return Some("other");
+    }
+    None
 }
 
 /// Percent-encodes a tileset key for embedding in an internal URL path.
@@ -496,12 +674,16 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use tokio::sync::{Barrier, Semaphore};
 
     use super::{
-        FetchFuture, InternalFetchResponse, InternalTileSource, InternalTransport, PeerBackend,
-        PeerDirectory, PeerFetchError, PeerFuture,
+        DERIVED_PEER_REQUEST_TIMEOUT, FetchFuture, InternalFetchResponse, InternalTileSource,
+        InternalTransport, PEER_REQUEST_TIMEOUT, PEER_RETRY_BACKOFF, PeerBackend, PeerDirectory,
+        PeerFetchError, PeerFuture, internal_resource_kind, peer_request_timeout,
     };
-    use crate::{interned::TilesetId, membership::Peer, storage::routing::HrwRouter};
+    use crate::{
+        interned::TilesetId, membership::Peer, metrics::NodeMetrics, storage::routing::HrwRouter,
+    };
 
     struct StaticPeerDirectory {
         peers: Vec<Peer>,
@@ -517,6 +699,38 @@ mod tests {
     struct RecordingTransport {
         calls: Mutex<Vec<(String, String)>>,
         retry_peers: BTreeSet<String>,
+        not_found_peers: BTreeSet<String>,
+    }
+
+    struct BlockingTransport {
+        started: Barrier,
+        release: Semaphore,
+    }
+
+    impl BlockingTransport {
+        fn new() -> Self {
+            Self {
+                started: Barrier::new(3),
+                release: Semaphore::new(0),
+            }
+        }
+    }
+
+    impl InternalTransport for BlockingTransport {
+        fn fetch<'a>(&'a self, _peer: &'a Peer, _path: &'a str) -> FetchFuture<'a> {
+            Box::pin(async move {
+                self.started.wait().await;
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release semaphore closed")
+                    .forget();
+                Ok(InternalFetchResponse::tile(
+                    Bytes::from_static(b"peer response"),
+                    InternalTileSource::Cache,
+                ))
+            })
+        }
     }
 
     impl InternalTransport for RecordingTransport {
@@ -528,6 +742,9 @@ mod tests {
                     .push((peer.id.clone(), path.to_string()));
                 if self.retry_peers.contains(&peer.id) {
                     return Err(PeerFetchError::Retryable("injected failure".into()));
+                }
+                if self.not_found_peers.contains(&peer.id) {
+                    return Err(PeerFetchError::NotFound);
                 }
                 Ok(InternalFetchResponse::tile(
                     Bytes::from_static(b"peer response"),
@@ -544,6 +761,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derived_fetches_have_a_longer_peer_timeout() {
+        assert_eq!(
+            peer_request_timeout("/_internal/derived/mapterhorn%2Fplanet/hillshade/8/226/100"),
+            DERIVED_PEER_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            peer_request_timeout("/_internal/tiles/mierune%2Fomt/700"),
+            PEER_REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn classifies_internal_resource_paths_with_bounded_labels() {
+        assert_eq!(
+            internal_resource_kind("/_internal/tiles/demo%2Fterrain/42"),
+            Some("tile")
+        );
+        assert_eq!(
+            internal_resource_kind("/_internal/pmtiles/demo/bootstrap?metadata=true"),
+            Some("bootstrap")
+        );
+        assert_eq!(
+            internal_resource_kind("/_internal/pmtiles/demo/leaf/128/256"),
+            Some("leaf")
+        );
+        assert_eq!(
+            internal_resource_kind("/_internal/provider/styles/base/sprite@2x.png"),
+            Some("sprite")
+        );
+        assert_eq!(
+            internal_resource_kind("/_internal/derived/mapterhorn%2Fplanet/hillshade/8/226/100"),
+            Some("derived")
+        );
+        assert_eq!(internal_resource_kind("/_internal/metrics"), None);
+    }
+
     #[tokio::test]
     async fn injected_directory_drives_production_hrw_routing() {
         let peers = vec![peer("node-a", 8001), peer("node-b", 8002)];
@@ -554,6 +808,7 @@ mod tests {
             Arc::new(StaticPeerDirectory { peers }),
             router,
             Arc::new(RecordingTransport::default()),
+            NodeMetrics::new(),
         );
 
         let actual = backend
@@ -573,6 +828,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_resource_uses_tile_group_hrw_owner() {
+        let peers = vec![peer("node-a", 8001), peer("node-b", 8002)];
+        let router = HrwRouter::new(2, 512);
+        let routing_id = TilesetId::new_unchecked("derived:hillshade:mapterhorn/planet");
+        let tile_id = 700;
+        let expected_owner = router.route_tile(&peers, routing_id.as_ref(), tile_id)[0]
+            .peer
+            .id
+            .clone();
+        let transport = Arc::new(RecordingTransport::default());
+        let metrics = NodeMetrics::new();
+        let backend = PeerBackend::with_dependencies(
+            "entry".to_string(),
+            Arc::new(StaticPeerDirectory { peers }),
+            router,
+            transport.clone(),
+            metrics.clone(),
+        );
+        let path = "/_internal/derived/mapterhorn%2Fplanet/hillshade/8/226/100";
+
+        let bytes = backend
+            .route_fetch_optional_by_tile(&routing_id, tile_id, path, "derived")
+            .await
+            .expect("route")
+            .expect("peer body");
+
+        assert_eq!(bytes, Bytes::from_static(b"peer response"));
+        assert_eq!(
+            *transport.calls.lock().expect("calls lock"),
+            vec![(expected_owner, path.to_string())]
+        );
+        assert!(
+            metrics
+                .encode()
+                .contains("ishikari_peer_fetch_total{outcome=\"success\",resource=\"derived\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_typed_internal_route_falls_back_local() {
+        let target = peer("old-node", 8001);
+        let transport = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            retry_peers: BTreeSet::new(),
+            not_found_peers: BTreeSet::from([target.id.clone()]),
+        });
+        let backend = PeerBackend::with_dependencies(
+            "entry".to_string(),
+            Arc::new(StaticPeerDirectory {
+                peers: vec![target],
+            }),
+            HrwRouter::new(1, 512),
+            transport,
+            NodeMetrics::new(),
+        );
+
+        let routed = backend
+            .route_fetch_optional_by_tile(
+                &TilesetId::new_unchecked("derived:hillshade:mapterhorn/planet"),
+                700,
+                "/_internal/derived/mapterhorn%2Fplanet/hillshade/8/226/100",
+                "derived",
+            )
+            .await
+            .expect("route");
+
+        assert_eq!(routed, None);
+    }
+
+    #[tokio::test]
     async fn injected_transport_receives_encoded_internal_tile_path() {
         let transport = Arc::new(RecordingTransport::default());
         let backend = PeerBackend::with_dependencies(
@@ -580,6 +905,7 @@ mod tests {
             Arc::new(StaticPeerDirectory { peers: Vec::new() }),
             HrwRouter::new(1, 512),
             transport.clone(),
+            NodeMetrics::new(),
         );
 
         let bytes = backend
@@ -603,20 +929,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retryable_transport_failure_uses_next_hrw_candidate() {
+    async fn identical_concurrent_peer_fetches_are_measured_and_cleaned_up() {
+        let transport = Arc::new(BlockingTransport::new());
+        let metrics = NodeMetrics::new();
+        let backend = PeerBackend::with_dependencies(
+            "node-a".to_string(),
+            Arc::new(StaticPeerDirectory { peers: Vec::new() }),
+            HrwRouter::new(1, 512),
+            transport.clone(),
+            metrics.clone(),
+        );
+        let target = peer("node-b", 8002);
+        let tileset = TilesetId::new_unchecked("demo/terrain");
+
+        let first = tokio::spawn({
+            let backend = backend.clone();
+            let target = target.clone();
+            let tileset = tileset.clone();
+            async move { backend.fetch_tile_bytes(&target, &tileset, 42).await }
+        });
+        let second = tokio::spawn({
+            let backend = backend.clone();
+            let target = target.clone();
+            let tileset = tileset.clone();
+            async move { backend.fetch_tile_bytes(&target, &tileset, 42).await }
+        });
+
+        transport.started.wait().await;
+        assert_eq!(metrics.snapshot().peer_tile_duplicate_inflight, 1);
+        assert_eq!(
+            backend
+                .inflight_fetches
+                .lock()
+                .expect("inflight fetch mutex poisoned")
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        transport.release.add_permits(2);
+        first.await.expect("first task").expect("first fetch");
+        second.await.expect("second task").expect("second fetch");
+        assert!(
+            backend
+                .inflight_fetches
+                .lock()
+                .expect("inflight fetch mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_metric_counts_only_suppressed_hrw_candidates() {
+        let peers = vec![
+            peer("node-a", 8001),
+            peer("node-b", 8002),
+            peer("node-c", 8003),
+        ];
+        let router = HrwRouter::new(1, 512);
+        let key = "style:https://example.test/base.json";
+        let preferred = router.route_key(&peers, key)[0].peer.id.clone();
+        let non_candidate = peers
+            .iter()
+            .find(|peer| peer.id != preferred)
+            .expect("non-candidate peer")
+            .id
+            .clone();
+        let metrics = NodeMetrics::new();
+        let backend = PeerBackend::with_dependencies(
+            "entry".to_string(),
+            Arc::new(StaticPeerDirectory {
+                peers: peers.clone(),
+            }),
+            router,
+            Arc::new(RecordingTransport::default()),
+            metrics.clone(),
+        );
+
+        {
+            let mut failures = backend
+                .retryable_failures
+                .lock()
+                .expect("retryable failures lock");
+            failures
+                .entry(non_candidate)
+                .or_default()
+                .insert("style", tokio::time::Instant::now() + PEER_RETRY_BACKOFF);
+        }
+        let routed = backend.route_key_for(key, "style").await;
+        assert_eq!(routed[0].peer.id, preferred);
+        assert_eq!(metrics.snapshot().peer_forward_backoff_skips, 0);
+
+        {
+            let mut failures = backend
+                .retryable_failures
+                .lock()
+                .expect("retryable failures lock");
+            failures
+                .entry(preferred.clone())
+                .or_default()
+                .insert("style", tokio::time::Instant::now() + PEER_RETRY_BACKOFF);
+        }
+        let routed = backend.route_key_for(key, "style").await;
+        assert_ne!(routed[0].peer.id, preferred);
+        assert_eq!(metrics.snapshot().peer_forward_backoff_skips, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_transport_failure_backs_off_only_the_failed_resource_kind() {
         let peers = vec![peer("node-a", 8001), peer("node-b", 8002)];
         let router = HrwRouter::new(2, 512);
         let routed = router.route_tileset(&peers, "demo/terrain");
         let first_peer = routed[0].peer.id.clone();
         let transport = Arc::new(RecordingTransport {
             calls: Mutex::new(Vec::new()),
-            retry_peers: BTreeSet::from([first_peer]),
+            retry_peers: BTreeSet::from([first_peer.clone()]),
+            not_found_peers: BTreeSet::new(),
         });
+        let metrics = NodeMetrics::new();
         let backend = PeerBackend::with_dependencies(
             "entry".to_string(),
             Arc::new(StaticPeerDirectory { peers }),
             router,
             transport.clone(),
+            metrics.clone(),
         );
 
         let result = backend
@@ -625,14 +1062,57 @@ mod tests {
             .expect("routed leaf");
 
         assert_eq!(result, Some(Bytes::from_static(b"peer response")));
-        let calls = transport.calls.lock().expect("calls lock");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, routed[0].peer.id);
-        assert_eq!(calls[1].0, routed[1].peer.id);
+        {
+            let calls = transport.calls.lock().expect("calls lock");
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].0, routed[0].peer.id);
+            assert_eq!(calls[1].0, routed[1].peer.id);
+            assert!(
+                calls
+                    .iter()
+                    .all(|(_, path)| path == "/_internal/pmtiles/demo%2Fterrain/leaf/128/256")
+            );
+        }
+
+        let during_backoff = backend
+            .route_tileset_for(&TilesetId::new_unchecked("demo/terrain"), "leaf")
+            .await;
         assert!(
-            calls
+            during_backoff
                 .iter()
-                .all(|(_, path)| path == "/_internal/pmtiles/demo%2Fterrain/leaf/128/256")
+                .all(|candidate| candidate.peer.id != first_peer)
+        );
+
+        let unrelated_tiles = backend
+            .route_tile(&TilesetId::new_unchecked("demo/terrain"), 700)
+            .await;
+        assert!(
+            unrelated_tiles
+                .iter()
+                .any(|candidate| candidate.peer.id == first_peer)
+        );
+
+        tokio::time::advance(PEER_RETRY_BACKOFF).await;
+        let after_backoff = backend
+            .route_tileset_for(&TilesetId::new_unchecked("demo/terrain"), "leaf")
+            .await;
+        assert!(
+            after_backoff
+                .iter()
+                .any(|candidate| candidate.peer.id == first_peer)
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.peer_forward_retryable, 1);
+        assert_eq!(snapshot.peer_forward_successes, 1);
+        assert_eq!(snapshot.peer_forward_backoff_skips, 1);
+        let encoded = metrics.encode();
+        assert!(
+            encoded
+                .contains("ishikari_peer_fetch_total{outcome=\"retryable\",resource=\"leaf\"} 1")
+        );
+        assert!(
+            encoded.contains("ishikari_peer_fetch_total{outcome=\"success\",resource=\"leaf\"} 1")
         );
     }
 }

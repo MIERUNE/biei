@@ -17,6 +17,7 @@ use object_store::{
     Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path as ObjectPath,
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::debug;
 use url::Url;
 
@@ -178,6 +179,7 @@ pub struct ChunkFetcher {
     sources: TilesetSources,
     chunk_size: u64,
     backend_latency: BackendLatencyModel,
+    backend_fetch_permits: Arc<Semaphore>,
     fetch_sequence: Arc<AtomicU64>,
     received_bytes: Arc<AtomicU64>,
     metrics: NodeMetrics,
@@ -187,15 +189,19 @@ impl ChunkFetcher {
     pub fn new(
         tileset_sources: String,
         chunk_size: u64,
+        backend_fetch_concurrency: usize,
         backend_latency: BackendLatencyModel,
         registry: &ObjectStoreRegistry,
         metrics: NodeMetrics,
     ) -> Result<Self> {
         let sources = TilesetSources::parse(&tileset_sources, registry)?;
+        let backend_fetch_concurrency = backend_fetch_concurrency.max(1);
+        metrics.set_backend_fetch_concurrency_limit(backend_fetch_concurrency);
         Ok(Self {
             sources,
             chunk_size,
             backend_latency,
+            backend_fetch_permits: Arc::new(Semaphore::new(backend_fetch_concurrency)),
             fetch_sequence: Arc::new(AtomicU64::new(0)),
             received_bytes: Arc::new(AtomicU64::new(0)),
             metrics,
@@ -225,10 +231,6 @@ impl ChunkFetcher {
                 "no data source configured for tileset {tileset_id}"
             ))
         })?;
-        // Tokio's clock is wall-clock backed in production and virtual under
-        // the simulator's paused-time runtime, so this metric remains useful in
-        // both environments.
-        let fetch_started_at = tokio::time::Instant::now();
         let start_chunk = chunk_range.start;
         let end_chunk = chunk_range.end;
         // Chunk indices derive from PMTiles offsets read off the backend; guard the
@@ -259,6 +261,29 @@ impl ChunkFetcher {
             prefetched_bytes = prefetched_bytes,
             "fetching backend chunks"
         );
+
+        // The per-tileset coordinator bounds one archive, while this semaphore
+        // bounds the process as a whole. Distinct missing ids therefore cannot
+        // multiply object-store concurrency without limit. The metric guard is
+        // cancellation-safe while a request waits for admission.
+        let queue_started_at = tokio::time::Instant::now();
+        let waiting = BackendFetchGaugeGuard::new(self.metrics.clone(), "waiting");
+        let permit = self
+            .backend_fetch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ChunkFetchError::Message("backend fetch admission closed".into()))?;
+        drop(waiting);
+        self.metrics
+            .record_backend_fetch_queue(queue_started_at.elapsed());
+        let _active = BackendFetchGaugeGuard::new(self.metrics.clone(), "active");
+        let _permit = permit;
+
+        // Tokio's clock is wall-clock backed in production and virtual under
+        // the simulator's paused-time runtime, so this metric remains useful in
+        // both environments. Queue time is recorded separately above.
+        let fetch_started_at = tokio::time::Instant::now();
 
         let sequence = self.fetch_sequence.fetch_add(1, Ordering::Relaxed);
         let backend_delay = self
@@ -328,6 +353,25 @@ impl ChunkFetcher {
         );
 
         Ok(bytes)
+    }
+}
+
+struct BackendFetchGaugeGuard {
+    metrics: NodeMetrics,
+    state: &'static str,
+}
+
+impl BackendFetchGaugeGuard {
+    fn new(metrics: NodeMetrics, state: &'static str) -> Self {
+        metrics.adjust_backend_fetch_concurrency(state, 1);
+        Self { metrics, state }
+    }
+}
+
+impl Drop for BackendFetchGaugeGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .adjust_backend_fetch_concurrency(self.state, -1);
     }
 }
 
@@ -457,6 +501,8 @@ fn normalize_source_url(source_url: &str) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         BackendLatencyModel, ChunkFetcher, object_path_under, parse_source_entries,
         select_namespace,
@@ -588,6 +634,7 @@ mod tests {
         let fetcher = ChunkFetcher::new(
             directory.to_string_lossy().into_owned(),
             4,
+            32,
             BackendLatencyModel::fixed(100),
             &ObjectStoreRegistry::new(),
             metrics.clone(),
@@ -602,6 +649,66 @@ mod tests {
         let duration = metrics.histogram_snapshot().backend_fetch_duration_seconds;
         assert_eq!(duration.count, 1);
         assert!((duration.sum - 0.1).abs() < 1e-9, "sum={}", duration.sum);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_wide_limit_serializes_distinct_tilesets() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ishikari-fetcher-concurrency-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("first.pmtiles"), b"abcdefgh").unwrap();
+        std::fs::write(directory.join("second.pmtiles"), b"ijklmnop").unwrap();
+
+        let metrics = NodeMetrics::new();
+        let fetcher = ChunkFetcher::new(
+            directory.to_string_lossy().into_owned(),
+            4,
+            1,
+            BackendLatencyModel::fixed(100),
+            &ObjectStoreRegistry::new(),
+            metrics.clone(),
+        )
+        .unwrap();
+        let first_fetcher = fetcher.clone();
+        let first = tokio::spawn(async move {
+            first_fetcher
+                .fetch_chunk_group(&TilesetId::try_new("first").unwrap(), 0..1, 8)
+                .await
+        });
+        tokio::task::yield_now().await;
+        let second = tokio::spawn(async move {
+            fetcher
+                .fetch_chunk_group(&TilesetId::try_new("second").unwrap(), 0..1, 8)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let saturated = metrics.encode();
+        assert!(saturated.contains("ishikari_backend_fetch_concurrency{state=\"active\"} 1"));
+        assert!(saturated.contains("ishikari_backend_fetch_concurrency{state=\"waiting\"} 1"));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(first.await.unwrap().unwrap().as_ref(), b"abcd");
+        assert_eq!(second.await.unwrap().unwrap().as_ref(), b"ijkl");
+
+        let encoded = metrics.encode();
+        assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"active\"} 0"));
+        assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"waiting\"} 0"));
+        let queue = metrics
+            .histogram_snapshot()
+            .backend_fetch_queue_duration_seconds;
+        assert_eq!(queue.count, 2);
+        assert!(queue.sum >= 0.1, "queue sum={}", queue.sum);
 
         std::fs::remove_dir_all(directory).unwrap();
     }

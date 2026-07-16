@@ -1,9 +1,7 @@
 //! Shared bounded upstream fetch helpers for provider resources.
 
 use std::{
-    collections::HashMap,
-    hash::Hash,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,11 +9,14 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use moka::sync::Cache;
 use object_store::{Attribute, Error as ObjectStoreError, ObjectStoreExt};
-use tokio::sync::watch;
 use url::Url;
 
-use crate::server::{AppState, HttpError};
-use crate::storage::ObjectStoreRegistry;
+use crate::{
+    metrics::NodeMetrics,
+    server::{AppState, HttpError},
+    singleflight::{Flight, SingleFlight},
+    storage::ObjectStoreRegistry,
+};
 
 const PROVIDER_RESOURCE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const STYLE_POSITIVE_TTL: Duration = Duration::from_secs(300);
@@ -28,7 +29,7 @@ const PROVIDER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 pub(crate) struct ProviderFetchCache {
     entries: Cache<ProviderFetchCacheKey, CachedProviderFetch>,
-    inflight: Arc<Mutex<HashMap<ProviderFetchCacheKey, watch::Sender<bool>>>>,
+    inflight: SingleFlight<ProviderFetchCacheKey, HttpError>,
 }
 
 impl ProviderFetchCache {
@@ -38,7 +39,7 @@ impl ProviderFetchCache {
                 .max_capacity(PROVIDER_RESOURCE_CACHE_MAX_BYTES)
                 .weigher(provider_fetch_cache_weight)
                 .build(),
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: SingleFlight::default(),
         }
     }
 
@@ -71,49 +72,13 @@ impl ProviderFetchCache {
         );
     }
 
-    fn begin_fetch(&self, key: ProviderFetchCacheKey) -> FetchFlight {
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("provider fetch inflight mutex poisoned");
-        if let Some(sender) = inflight.get(&key) {
-            return FetchFlight::Follower(sender.subscribe());
-        }
-
-        let (sender, _) = watch::channel(false);
-        inflight.insert(key.clone(), sender);
-        FetchFlight::Leader(FetchLeaderGuard {
-            inflight: Arc::clone(&self.inflight),
-            key,
-        })
+    fn begin_fetch(&self, key: ProviderFetchCacheKey) -> Flight<ProviderFetchCacheKey, HttpError> {
+        self.inflight.begin(key)
     }
 
     pub(crate) fn weighted_size(&self) -> u64 {
         self.entries.run_pending_tasks();
         self.entries.weighted_size()
-    }
-}
-
-enum FetchFlight {
-    Leader(FetchLeaderGuard),
-    Follower(watch::Receiver<bool>),
-}
-
-struct FetchLeaderGuard {
-    inflight: Arc<Mutex<HashMap<ProviderFetchCacheKey, watch::Sender<bool>>>>,
-    key: ProviderFetchCacheKey,
-}
-
-impl Drop for FetchLeaderGuard {
-    fn drop(&mut self) {
-        let sender = self
-            .inflight
-            .lock()
-            .expect("provider fetch inflight mutex poisoned")
-            .remove(&self.key);
-        if let Some(sender) = sender {
-            let _ = sender.send(true);
-        }
     }
 }
 
@@ -155,6 +120,24 @@ impl CachedProviderFetch {
             Self::NotFound { .. } => Err((StatusCode::NOT_FOUND, "not found".to_string())),
         }
     }
+
+    fn cache_outcome(&self) -> &'static str {
+        match self {
+            Self::Found { .. } => "hit",
+            Self::NotFound { .. } => "negative_hit",
+        }
+    }
+}
+
+fn record_cached_provider_fetch(
+    metrics: &NodeMetrics,
+    resource: &'static str,
+    entry: &CachedProviderFetch,
+    joined_singleflight: bool,
+) {
+    if !joined_singleflight {
+        metrics.record_provider_resource_cache(resource, entry.cache_outcome());
+    }
 }
 
 pub(crate) async fn fetch_limited_bytes(
@@ -174,13 +157,25 @@ pub(crate) async fn fetch_limited_bytes_with_content_type(
     accepted_content_types: &[&str],
 ) -> Result<Bytes, HttpError> {
     let key = ProviderFetchCacheKey::new(resource, &url, accepted_content_types);
+    let mut recorded_miss = false;
+    let mut joined_singleflight = false;
     loop {
         if let Some(entry) = state.provider_fetch_cache.get(&key) {
+            // A follower already recorded the request as a miss plus a join.
+            // Reading the leader's freshly inserted value is not an independent
+            // cache hit and must not inflate cache-hit-ratio dashboards.
+            record_cached_provider_fetch(&state.metrics, resource, &entry, joined_singleflight);
             return entry.into_result();
+        }
+        if !recorded_miss {
+            state
+                .metrics
+                .record_provider_resource_cache(resource, "miss");
+            recorded_miss = true;
         }
 
         match state.provider_fetch_cache.begin_fetch(key.clone()) {
-            FetchFlight::Leader(_guard) => {
+            Flight::Leader(guard) => {
                 let result = fetch_limited_bytes_uncached(
                     &state.object_store_registry,
                     &url,
@@ -190,18 +185,41 @@ pub(crate) async fn fetch_limited_bytes_with_content_type(
                 )
                 .await;
                 match &result {
-                    Ok(bytes) => state
-                        .provider_fetch_cache
-                        .put_found(key.clone(), bytes.clone()),
+                    Ok(bytes) => {
+                        state
+                            .provider_fetch_cache
+                            .put_found(key.clone(), bytes.clone());
+                        state
+                            .metrics
+                            .record_provider_resource_cache(resource, "insert");
+                    }
                     Err((StatusCode::NOT_FOUND, _)) => {
                         state.provider_fetch_cache.put_not_found(key.clone());
+                        state
+                            .metrics
+                            .record_provider_resource_cache(resource, "negative_insert");
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        state
+                            .metrics
+                            .record_provider_resource_cache(resource, "error");
+                    }
+                }
+                if let Err(error) = &result
+                    && error.0 != StatusCode::NOT_FOUND
+                {
+                    guard.complete_with_error(error.clone());
                 }
                 return result;
             }
-            FetchFlight::Follower(mut receiver) => {
-                let _ = receiver.changed().await;
+            Flight::Follower(follower) => {
+                state
+                    .metrics
+                    .record_provider_resource_cache(resource, "singleflight_join");
+                joined_singleflight = true;
+                if let Some(error) = follower.wait().await {
+                    return Err(error);
+                }
             }
         }
     }
@@ -345,8 +363,11 @@ fn content_type_matches(value: &str, accepted: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchFlight, ProviderFetchCache, ProviderFetchCacheKey, content_type_matches, positive_ttl,
+        CachedProviderFetch, ProviderFetchCacheKey, content_type_matches, positive_ttl,
+        record_cached_provider_fetch,
     };
+    use crate::metrics::NodeMetrics;
+    use bytes::Bytes;
     use std::time::Duration;
 
     #[test]
@@ -383,72 +404,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_fetch_leader_guard_cleans_inflight_on_drop() {
-        let cache = ProviderFetchCache::new();
-        let key = ProviderFetchCacheKey::new("style", "https://styles.example/base", &[]);
-
-        let leader = match cache.begin_fetch(key.clone()) {
-            FetchFlight::Leader(guard) => guard,
-            FetchFlight::Follower(_) => panic!("first fetch should lead"),
-        };
-        assert_eq!(
-            cache
-                .inflight
-                .lock()
-                .expect("provider fetch inflight mutex poisoned")
-                .len(),
-            1
-        );
-
-        drop(leader);
-
-        assert_eq!(
-            cache
-                .inflight
-                .lock()
-                .expect("provider fetch inflight mutex poisoned")
-                .len(),
-            0
-        );
-        match cache.begin_fetch(key) {
-            FetchFlight::Leader(_) => {}
-            FetchFlight::Follower(_) => panic!("new fetch should lead after guard drop"),
-        }
-    }
-
-    #[tokio::test]
-    async fn follower_is_woken_and_slot_freed_when_leader_is_cancelled() {
-        let cache = ProviderFetchCache::new();
-        let key = ProviderFetchCacheKey::new("style", "https://styles.example/base", &[]);
-
-        let leader = match cache.begin_fetch(key.clone()) {
-            FetchFlight::Leader(guard) => guard,
-            FetchFlight::Follower(_) => panic!("first fetch should lead"),
-        };
-        let mut follower = match cache.begin_fetch(key.clone()) {
-            FetchFlight::Follower(receiver) => receiver,
-            FetchFlight::Leader(_) => panic!("second fetch should follow"),
+    fn singleflight_joiner_does_not_record_a_cache_hit() {
+        let metrics = NodeMetrics::new();
+        let entry = CachedProviderFetch::Found {
+            bytes: Bytes::from_static(b"style"),
+            expires_at: std::time::Instant::now() + Duration::from_secs(60),
         };
 
-        // Simulate the leader's request task being cancelled: the guard is
-        // dropped without the cache being populated.
-        drop(leader);
+        record_cached_provider_fetch(&metrics, "style", &entry, true);
+        assert!(!metrics.encode().contains(
+            "ishikari_provider_resource_cache_total{outcome=\"hit\",resource=\"style\"}"
+        ));
 
-        // The follower must be woken, not left hanging.
-        let changed = tokio::time::timeout(Duration::from_secs(1), follower.changed())
-            .await
-            .expect("follower should be woken when the leader is cancelled");
-        assert!(
-            changed.is_ok(),
-            "leader cancellation should notify followers before the channel closes"
-        );
-
-        // The inflight slot is freed, so the next request re-leads and retries.
-        match cache.begin_fetch(key) {
-            FetchFlight::Leader(_) => {}
-            FetchFlight::Follower(_) => {
-                panic!("slot should be free to re-lead after cancellation")
-            }
-        }
+        record_cached_provider_fetch(&metrics, "style", &entry, false);
+        assert!(metrics.encode().contains(
+            "ishikari_provider_resource_cache_total{outcome=\"hit\",resource=\"style\"} 1"
+        ));
     }
 }

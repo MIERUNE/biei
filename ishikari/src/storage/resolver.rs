@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::{
-    chunked_store::{BackendLatencyModel, ChunkedStore},
+    chunked_store::{BackendLatencyModel, ChunkedStore, ChunkedStoreConfig},
     peer::{InternalTileSource, PeerBackend, PeerFetchError},
     pmtiles::{DistributedPmtilesStorage, PmtilesReadSource},
     routing::HrwRouter,
@@ -31,7 +31,6 @@ use crate::{
 
 const RESOURCE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const INTERNAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const INTERNAL_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct TilesetInfo {
@@ -55,6 +54,7 @@ pub struct ResourceResolverConfig {
     pub tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub backend_fetch_concurrency: usize,
     pub artificial_backend_delay_ms: u64,
     pub tile_cache_max_bytes: u64,
     pub chunk_cache_max_bytes: u64,
@@ -69,6 +69,7 @@ pub struct ResourceResolverStorageConfig {
     pub tileset_sources: String,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub backend_fetch_concurrency: usize,
     pub backend_latency: BackendLatencyModel,
     pub tile_cache_max_bytes: u64,
     pub peer_tile_cache_policy: PeerTileCachePolicy,
@@ -155,6 +156,7 @@ impl ResourceResolver {
             tile_group_size,
             chunk_size_bytes,
             max_fetch_chunks,
+            backend_fetch_concurrency,
             artificial_backend_delay_ms,
             tile_cache_max_bytes,
             chunk_cache_max_bytes,
@@ -164,17 +166,23 @@ impl ResourceResolver {
         } = config;
         let http_client = Client::builder()
             .connect_timeout(INTERNAL_HTTP_CONNECT_TIMEOUT)
-            .timeout(INTERNAL_HTTP_REQUEST_TIMEOUT)
             .use_rustls_tls()
             .build()
             .context("failed to build HTTP client")?;
         let router = HrwRouter::new(candidate_count, tile_group_size);
-        let peer_backend = PeerBackend::new(self_node_id, membership, router, http_client);
+        let peer_backend = PeerBackend::new(
+            self_node_id,
+            membership,
+            router,
+            http_client,
+            metrics.clone(),
+        );
         Self::build_with_peer_backend(
             ResourceResolverStorageConfig {
                 tileset_sources,
                 chunk_size_bytes,
                 max_fetch_chunks,
+                backend_fetch_concurrency,
                 backend_latency: BackendLatencyModel::fixed(artificial_backend_delay_ms),
                 tile_cache_max_bytes,
                 peer_tile_cache_policy: PeerTileCachePolicy::EntryAndOwner,
@@ -201,11 +209,14 @@ impl ResourceResolver {
         peer_backend: PeerBackend,
     ) -> Result<Self> {
         let chunked_store = ChunkedStore::new(
-            config.tileset_sources,
-            config.chunk_size_bytes,
-            config.max_fetch_chunks,
-            config.backend_latency,
-            config.chunk_cache_max_bytes,
+            ChunkedStoreConfig {
+                tileset_sources: config.tileset_sources,
+                chunk_size: config.chunk_size_bytes,
+                max_fetch_chunks: config.max_fetch_chunks,
+                backend_fetch_concurrency: config.backend_fetch_concurrency,
+                backend_latency: config.backend_latency,
+                chunk_cache_max_bytes: config.chunk_cache_max_bytes,
+            },
             &config.object_store_registry,
             config.metrics.clone(),
         )?;
@@ -261,6 +272,19 @@ impl ResourceResolver {
     ) -> Result<Option<Bytes>> {
         self.peer_backend
             .route_fetch_optional_by_key(key, internal_path, kind)
+            .await
+    }
+
+    /// Routes a typed generated-tile resource by the normal tile-group HRW
+    /// policy. `None` means this node should produce the resource locally.
+    pub async fn route_derived_resource(
+        &self,
+        routing_id: &TilesetId,
+        tile_id: u64,
+        internal_path: &str,
+    ) -> Result<Option<Bytes>> {
+        self.peer_backend
+            .route_fetch_optional_by_tile(routing_id, tile_id, internal_path, "derived")
             .await
     }
 
@@ -799,11 +823,13 @@ mod tests {
             peer("node-b", 8002),
             peer("node-c", 8003),
         ];
+        let metrics = NodeMetrics::new();
         let peer_backend = PeerBackend::with_dependencies(
             "entry".to_string(),
             Arc::new(StaticDirectory { peers }),
             HrwRouter::new(3, 512),
             transport,
+            metrics.clone(),
         );
         // The local path is never read (the peer 404 short-circuits before any
         // local resolve), but it is resolved eagerly at construction, so point
@@ -814,13 +840,14 @@ mod tests {
                 tileset_sources,
                 chunk_size_bytes: 1024 * 1024,
                 max_fetch_chunks: 4,
+                backend_fetch_concurrency: 32,
                 backend_latency: BackendLatencyModel::fixed(0),
                 tile_cache_max_bytes: 1024 * 1024,
                 peer_tile_cache_policy: PeerTileCachePolicy::EntryAndOwner,
                 chunk_cache_max_bytes: 1024 * 1024,
                 tile_negative_ttl: Duration::from_secs(60),
                 object_store_registry: Arc::new(ObjectStoreRegistry::new()),
-                metrics: NodeMetrics::new(),
+                metrics,
             },
             peer_backend,
         )

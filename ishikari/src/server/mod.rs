@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -49,6 +49,16 @@ pub struct TileRuntimeConfig {
 /// permit — so the count can never leak.
 struct CpuWorkSlot {
     inflight: Arc<AtomicUsize>,
+}
+
+struct CacheMaintenanceGuard {
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for CacheMaintenanceGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+    }
 }
 
 impl CpuWorkSlot {
@@ -143,8 +153,12 @@ pub struct AppState {
         (crate::interned::TilesetId, u64),
         Option<Arc<server::tileset::terrain::dem::DemTile>>,
     >,
+    /// Coalesces Moka maintenance when multiple metrics collectors scrape at
+    /// once. Followers may report the previous eventually-consistent size.
+    cache_maintenance_running: Arc<AtomicBool>,
     /// Shared bound for all CPU-heavy blocking work initiated by request paths.
     cpu_work_semaphore: Arc<tokio::sync::Semaphore>,
+    cpu_work_concurrency: usize,
     /// Count of admitted CPU-work units (holding a permit or queued for one).
     /// Work beyond `cpu_work_max_inflight` is shed with 503 so an extreme flood
     /// fails fast instead of growing the wait queue and blocking backlog.
@@ -221,9 +235,11 @@ impl AppState {
                     negative_ttl: derived_negative_ttl,
                 })
                 .build(),
+            cache_maintenance_running: Arc::new(AtomicBool::new(false)),
             cpu_work_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 cpu_work_concurrency.max(1),
             )),
+            cpu_work_concurrency: cpu_work_concurrency.max(1),
             cpu_work_inflight: Arc::new(AtomicUsize::new(0)),
             cpu_work_max_inflight: cpu_work_max_inflight.max(cpu_work_concurrency.max(1)),
             derived_negative_ttl,
@@ -269,9 +285,14 @@ impl AppState {
     /// blocking-pool backlog, so an extreme flood fails fast instead of growing
     /// memory without limit. Hold the returned permit for the whole blocking job
     /// (move it into the `spawn_blocking` closure).
-    pub(crate) async fn admit_cpu_work(&self) -> Result<CpuWorkPermit, HttpError> {
+    pub(crate) async fn admit_cpu_work(
+        &self,
+        work: &'static str,
+    ) -> Result<CpuWorkPermit, HttpError> {
+        let queue_started = std::time::Instant::now();
         let slot = CpuWorkSlot::try_reserve(&self.cpu_work_inflight, self.cpu_work_max_inflight)
             .ok_or_else(|| {
+                self.metrics.record_cpu_work_admission(work, "shed");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "server overloaded".to_string(),
@@ -283,11 +304,15 @@ impl AppState {
             .acquire_owned()
             .await
             .map_err(|_| {
+                self.metrics.record_cpu_work_admission(work, "shutdown");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "cpu work is shutting down".to_string(),
                 )
             })?;
+        self.metrics.record_cpu_work_admission(work, "accepted");
+        self.metrics
+            .record_cpu_work_queue_duration(work, queue_started.elapsed());
         Ok(CpuWorkPermit {
             _permit: permit,
             _slot: slot,
@@ -296,6 +321,15 @@ impl AppState {
 
     pub(crate) fn derived_negative_ttl(&self) -> Duration {
         self.derived_negative_ttl
+    }
+
+    fn try_start_cache_maintenance(&self) -> Option<CacheMaintenanceGuard> {
+        self.cache_maintenance_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| CacheMaintenanceGuard {
+                running: Arc::clone(&self.cache_maintenance_running),
+            })
     }
 }
 
@@ -398,6 +432,10 @@ fn internal_router() -> Router<AppState> {
         .route(
             "/_internal/tiles/{tileset_id}/{tile_id}",
             get(server::tileset::internal_tile_handler),
+        )
+        .route(
+            "/_internal/derived/{tileset_id}/{product}/{z}/{x}/{y}",
+            get(server::tileset::internal_derived_tile_handler),
         )
         .route(
             "/_internal/pmtiles/{tileset_id}/bootstrap",
@@ -613,23 +651,62 @@ async fn track_http_metrics(
     request: Request,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let internal_resource = crate::storage::internal_resource_kind(request.uri().path());
     let endpoint = matched
         .as_ref()
         .map(MatchedPath::as_str)
         .unwrap_or("unknown")
         .to_string();
     let response = next.run(request).await;
-    metrics.record_http(&endpoint, response.status().as_u16());
+    // Exclude the scrape itself: its handler performs cache-gauge maintenance,
+    // and recording that work in the exported histogram makes scrape latency
+    // self-referential on the following scrape.
+    if endpoint == "/_internal/metrics" {
+        metrics.record_http_request(&endpoint, response.status().as_u16());
+    } else {
+        metrics.record_http(&endpoint, response.status().as_u16(), started.elapsed());
+    }
+    if let Some(resource) = internal_resource {
+        let outcome = match response.status() {
+            status if status.is_success() => "success",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => "retryable",
+            _ => "error",
+        };
+        metrics.record_internal_resource_request(resource, outcome);
+    }
     response
 }
 
 /// Serves the Prometheus exposition, refreshing point-in-time gauges first.
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let view = state.membership.cluster_view().await;
+    // Moka updates weighted size through deferred maintenance. Flush once for
+    // concurrent scrapes and run the independent caches in parallel.
+    if let Some(_guard) = state.try_start_cache_maintenance() {
+        tokio::join!(
+            state.mlt_cache.run_pending_tasks(),
+            state.derived_tile_cache.run_pending_tasks(),
+            state.dem_tile_cache.run_pending_tasks(),
+        );
+    }
     state
         .metrics
         .set_membership(view.live_ids.len() as i64, view.dead_ids.len() as i64);
     state.metrics.set_drain(state.drain.is_draining());
+    let cpu_inflight = state.cpu_work_inflight.load(Ordering::Relaxed);
+    let cpu_running = state
+        .cpu_work_concurrency
+        .saturating_sub(state.cpu_work_semaphore.available_permits());
+    state.metrics.set_cpu_work(
+        cpu_inflight,
+        cpu_running,
+        state.cpu_work_concurrency,
+        state.cpu_work_max_inflight,
+    );
     state
         .metrics
         .set_cache_bytes("tile", state.resource_resolver.tile_cache_weighted_size());
@@ -639,6 +716,15 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     state
         .metrics
         .set_cache_bytes("provider", state.provider_fetch_cache.weighted_size());
+    state
+        .metrics
+        .set_cache_bytes("mlt", state.mlt_cache.weighted_size());
+    state
+        .metrics
+        .set_cache_bytes("derived", state.derived_tile_cache.weighted_size());
+    state
+        .metrics
+        .set_cache_bytes("dem", state.dem_tile_cache.weighted_size());
     state
         .metrics
         .sync_backend_fetch_bytes(state.resource_resolver.received_bytes());

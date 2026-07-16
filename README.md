@@ -60,6 +60,46 @@ the default root with its full path (`analysis/hrnowc` →
 `{default-root}/analysis/hrnowc.pmtiles`). A single bare `ISKR_TILESET_SOURCES` stays the
 default root.
 
+## Composite Mapterhorn tileset
+
+Set `ISKR_MAPTERHORN_TILESET` to a logical tileset such as
+`mapterhorn/planet` and `ISKR_MAPTERHORN_MAXZOOM` to the advertised detail
+zoom to expose Mapterhorn's base and detail archives as one tileset. Requests at
+z0–12 use the logical base archive. Requests at z13+ resolve to the z6 ancestor
+detail archive in the same namespace (`mapterhorn/6-{x6}-{y6}.pmtiles`).
+
+Detail presence is probed on first use, single-flighted, and cached. Missing
+detail coverage returns 404; Ishikari does not substitute an overzoomed z12
+tile. Source reads still use normal HRW routing, chunk caching, range batching,
+and negative caching.
+
+Generated contour and hillshade outputs use the same tile-group HRW placement.
+The owner single-flights generation, caches the result, and performs optional
+MLT transcoding; another node generates locally only when the owner is
+unavailable.
+
+## MLT output
+
+PMTiles containing native MLT tiles are served as stored. Stored MVT tiles can
+also be transcoded on demand by using the `.mlt` path suffix or
+`Accept: application/vnd.maplibre-tile`; ordinary requests remain as stored.
+Transcodes are single-flighted into a bounded per-pod cache and run on the
+blocking pool behind the shared `ISKR_CPU_WORK_CONCURRENCY` budget. Transcoded
+outputs are not forwarded between peers.
+
+## Observability
+
+Prometheus metrics are exposed only on the internal listener at
+`/_internal/metrics`. In addition to bounded route/status counters, Ishikari
+reports end-to-end HTTP latency by route and status class, object-store range
+fetch duration, size, admission queue delay, and concurrency saturation; chunk
+batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes.
+`ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a
+process and defaults to 32. CPU-heavy DEM decode, terrain generation, and MLT
+transcoding expose admission, queue delay, current saturation, and shed counts.
+Derived terrain cold-generation metrics separate source fetch/decode time from
+product generation time and record compressed output size per fixed product.
+
 ## Simulator
 
 `ishikari-sim` generates deterministic population-weighted viewport traces and
@@ -154,8 +194,9 @@ cargo run -p ishikari-sim -- visualize \
 ```
 
 Churn reports provide request-indexed trend charts with churn event markers,
-interval cache/peer rates, backend fetch rate and transfer volume per 1,000
-requests, active cache occupancy, and final node load.
+interval cache/peer rates, peer failover and backoff activity, backend fetch
+rate and transfer volume per 1,000 requests, active cache occupancy, and final
+node load.
 The HTML embeds the report and has no server or external asset dependency.
 
 Tile source labels distinguish both placement and backend involvement.
@@ -245,8 +286,15 @@ by source, timeouts, and peak in-flight requests per node. The common result
 also reports backend fetch size/duration, batching queue delay, pending chunks,
 group waiters, and node request-load skew (max/mean and coefficient of
 variation). Each virtual user waits for its viewport batch, then sleeps for
-`1200 +/- 500 ms` by default, matching the k6 closed-user model. The measured
-profile uses a deterministic lognormal range-fetch latency plus a per-MiB
-transfer term. Fixed controlled sweeps remain available through
+`1200 +/- 500 ms` by default, matching the closed-user workload model. The
+measured profile uses a deterministic lognormal range-fetch latency plus a
+per-MiB transfer term. Fixed controlled sweeps remain available through
 `--artificial-backend-delay-ms`; sigma and the transfer slope can also be
 supplied directly.
+
+## Development documents
+
+- [Design contract and guardrails](specs/ishikari-spec.md)
+- [Open work and decisions](issues/ishikari-todo.md)
+- [Derived isoline and hillshade specification](specs/isoline-and-hillshade-spec.md)
+- [Simulator specification](specs/simulator-spec.md)

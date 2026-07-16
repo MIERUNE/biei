@@ -7,9 +7,9 @@ mod resolver;
 mod routing;
 mod store_registry;
 
-#[cfg(not(feature = "simulator-support"))]
-pub(crate) use peer::InternalTileSource;
 pub(crate) use peer::TILE_SOURCE_HEADER;
+#[cfg(not(feature = "simulator-support"))]
+pub(crate) use peer::{InternalTileSource, internal_resource_kind};
 pub use resolver::{
     ResourceResolver, ResourceResolverConfig, TileSource, TilesetError, TilesetInfo,
 };
@@ -28,7 +28,7 @@ pub use chunked_store::plan_chunk_fetch_ranges;
 #[doc(hidden)]
 pub use peer::{
     FetchFuture, InternalFetchResponse, InternalTileSource, InternalTransport, PeerBackend,
-    PeerDirectory, PeerFetchError, PeerFuture,
+    PeerDirectory, PeerFetchError, PeerFuture, internal_resource_kind,
 };
 #[cfg(feature = "simulator-support")]
 #[doc(hidden)]

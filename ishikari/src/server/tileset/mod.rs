@@ -14,8 +14,8 @@ pub(crate) use preview::{
     preview_style_handler, render_preview_html,
 };
 pub(crate) use terrain::{
-    derived_tile_handler, derived_tilejson_handler, namespaced_derived_tile_handler,
-    namespaced_derived_tilejson_handler,
+    derived_tile_handler, derived_tilejson_handler, internal_derived_tile_handler,
+    namespaced_derived_tile_handler, namespaced_derived_tilejson_handler,
 };
 pub(crate) use tile::{internal_tile_handler, namespaced_tile_handler, tile_handler};
 pub(crate) use tilejson::{namespaced_tilejson_handler, tilejson_handler};

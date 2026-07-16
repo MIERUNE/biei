@@ -245,7 +245,7 @@ async fn transcoded_mlt(
             // MLT encoding (FSST/FastPFOR plus gzip) is CPU-heavy. Keep it off
             // Tokio workers and under the shared CPU-work admission limit (which
             // sheds with 503 under extreme overload).
-            let permit = state.admit_cpu_work().await?;
+            let permit = state.admit_cpu_work("mlt_transcode").await?;
             tokio::task::spawn_blocking(move || {
                 // A dropped request cannot cancel blocking work. Keep the permit
                 // in this closure so abandoned work remains within the limit.

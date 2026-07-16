@@ -1,14 +1,16 @@
 //! PMTiles archive reader over an abstract storage interface.
 
-use std::future::Future;
-use std::sync::Arc;
+use std::{future::Future, hash::Hash, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::interned::TilesetId;
+use crate::{
+    interned::TilesetId,
+    singleflight::{Flight, Follower, LeaderGuard, SingleFlight},
+};
 
 use super::{
     cache::{ArchiveBootstrap, ArchiveCache, LeafCacheKey},
@@ -69,12 +71,73 @@ pub trait Storage: Send + Sync {
 pub struct Reader<R> {
     pub archive_cache: ArchiveCache,
     storage: R,
+    bootstrap_inflight: SingleFlight<TilesetId, ReaderFlightError>,
+    metadata_inflight: SingleFlight<TilesetId, ReaderFlightError>,
+    leaf_inflight: SingleFlight<LeafCacheKey, ReaderFlightError>,
 }
 
 #[derive(Clone)]
 struct EntryResolution {
     entry: DirectoryEntry,
     leaf_ranges: Vec<ArchiveRange>,
+}
+
+/// Cloneable error snapshot shared with single-flight followers. Storage errors
+/// remain typed because the service layer uses them to distinguish timeouts;
+/// other reader errors retain their complete printable context.
+#[derive(Clone, Debug)]
+struct ReaderFlightError {
+    message: Arc<str>,
+    storage: Option<StorageError>,
+}
+
+impl ReaderFlightError {
+    fn capture(error: &anyhow::Error) -> Self {
+        let storage = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StorageError>())
+            .cloned();
+        let message = if storage.is_some() {
+            error.to_string()
+        } else {
+            format!("{error:#}")
+        };
+        Self {
+            message: Arc::from(message),
+            storage,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        let Some(storage) = self.storage else {
+            return anyhow!(self.message.to_string());
+        };
+        if self.message.as_ref() == storage.to_string() {
+            anyhow::Error::new(storage)
+        } else {
+            anyhow::Error::new(storage).context(self.message.to_string())
+        }
+    }
+}
+
+fn complete_reader_flight<K, T>(
+    guard: LeaderGuard<K, ReaderFlightError>,
+    result: Result<T>,
+) -> Result<T>
+where
+    K: Eq + Hash,
+{
+    if let Err(error) = &result {
+        guard.complete_with_error(ReaderFlightError::capture(error));
+    }
+    result
+}
+
+async fn wait_reader_flight(follower: Follower<ReaderFlightError>) -> Result<()> {
+    if let Some(error) = follower.wait().await {
+        return Err(error.into_error());
+    }
+    Ok(())
 }
 
 /// Byte range occupied by one tile in a PMTiles archive.
@@ -110,6 +173,9 @@ where
         Ok(Self {
             archive_cache: ArchiveCache::new(),
             storage,
+            bootstrap_inflight: SingleFlight::default(),
+            metadata_inflight: SingleFlight::default(),
+            leaf_inflight: SingleFlight::default(),
         })
     }
 
@@ -231,12 +297,31 @@ where
         self: &Arc<Self>,
         tileset_id: &TilesetId,
     ) -> Result<Option<Arc<Metadata>>> {
-        if let Some(archive) = self.archive_cache.get(tileset_id)
-            && let Some(metadata) = archive.metadata
-        {
-            return Ok(Some(metadata));
+        loop {
+            if let Some(archive) = self.archive_cache.get(tileset_id)
+                && let Some(metadata) = archive.metadata
+            {
+                return Ok(Some(metadata));
+            }
+            if self.archive_cache.is_known_absent(tileset_id) {
+                return Ok(None);
+            }
+            match self.metadata_inflight.begin(tileset_id.clone()) {
+                Flight::Leader(guard) => {
+                    let result = self.load_metadata_uncached(tileset_id).await;
+                    return complete_reader_flight(guard, result);
+                }
+                Flight::Follower(follower) => {
+                    wait_reader_flight(follower).await?;
+                }
+            }
         }
+    }
 
+    async fn load_metadata_uncached(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+    ) -> Result<Option<Arc<Metadata>>> {
         match self.storage.fetch_bootstrap_bytes(tileset_id, true).await {
             Ok(Some(transfer)) => {
                 let mut archive = decode_bootstrap_bytes(transfer.bootstrap)
@@ -279,16 +364,32 @@ where
         self: &Arc<Self>,
         tileset_id: &TilesetId,
     ) -> Result<Option<ArchiveBootstrap>> {
-        if let Some(archive) = self.archive_cache.get(tileset_id) {
-            return Ok(Some(archive));
+        loop {
+            if let Some(archive) = self.archive_cache.get(tileset_id) {
+                return Ok(Some(archive));
+            }
+            // Skip the peer forward and backend read for an archive we just found
+            // absent (short TTL), so enumerating a missing tileset cannot amplify
+            // into unbounded peer round-trips and object-store probes.
+            if self.archive_cache.is_known_absent(tileset_id) {
+                return Ok(None);
+            }
+            match self.bootstrap_inflight.begin(tileset_id.clone()) {
+                Flight::Leader(guard) => {
+                    let result = self.load_bootstrap_uncached(tileset_id).await;
+                    return complete_reader_flight(guard, result);
+                }
+                Flight::Follower(follower) => {
+                    wait_reader_flight(follower).await?;
+                }
+            }
         }
-        // Skip the peer forward and backend read for an archive we just found
-        // absent (short TTL), so enumerating a missing tileset cannot amplify
-        // into unbounded peer round-trips and object-store probes.
-        if self.archive_cache.is_known_absent(tileset_id) {
-            return Ok(None);
-        }
+    }
 
+    async fn load_bootstrap_uncached(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+    ) -> Result<Option<ArchiveBootstrap>> {
         match self.storage.fetch_bootstrap_bytes(tileset_id, false).await {
             Ok(Some(transfer)) => {
                 let archive = decode_bootstrap_bytes(transfer.bootstrap)
@@ -306,7 +407,7 @@ where
             }
         }
 
-        self.load_bootstrap_local(tileset_id).await
+        self.load_bootstrap_local_uncached(tileset_id).await
     }
 
     /// Loads or reuses the cached header/root bootstrap from local backend storage.
@@ -314,13 +415,29 @@ where
         self: &Arc<Self>,
         tileset_id: &TilesetId,
     ) -> Result<Option<ArchiveBootstrap>> {
-        if let Some(archive) = self.archive_cache.get(tileset_id) {
-            return Ok(Some(archive));
+        loop {
+            if let Some(archive) = self.archive_cache.get(tileset_id) {
+                return Ok(Some(archive));
+            }
+            if self.archive_cache.is_known_absent(tileset_id) {
+                return Ok(None);
+            }
+            match self.bootstrap_inflight.begin(tileset_id.clone()) {
+                Flight::Leader(guard) => {
+                    let result = self.load_bootstrap_local_uncached(tileset_id).await;
+                    return complete_reader_flight(guard, result);
+                }
+                Flight::Follower(follower) => {
+                    wait_reader_flight(follower).await?;
+                }
+            }
         }
-        if self.archive_cache.is_known_absent(tileset_id) {
-            return Ok(None);
-        }
+    }
 
+    async fn load_bootstrap_local_uncached(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+    ) -> Result<Option<ArchiveBootstrap>> {
         let initial_bytes = match self
             .storage
             .read_range(tileset_id, 0, INITIAL_BYTES_LEN, None)
@@ -488,9 +605,40 @@ where
         archive_end: u64,
     ) -> Result<Arc<Directory>> {
         let leaf_key = LeafCacheKey::new(tileset_id, offset);
-        if let Some(directory) = self.archive_cache.get_leaf(&leaf_key) {
-            return Ok(directory);
+        loop {
+            if let Some(directory) = self.archive_cache.get_leaf(&leaf_key) {
+                return Ok(directory);
+            }
+            match self.leaf_inflight.begin(leaf_key.clone()) {
+                Flight::Leader(guard) => {
+                    let result = self
+                        .load_leaf_directory_uncached(
+                            tileset_id,
+                            leaf_key,
+                            offset,
+                            length,
+                            compression,
+                            archive_end,
+                        )
+                        .await;
+                    return complete_reader_flight(guard, result);
+                }
+                Flight::Follower(follower) => {
+                    wait_reader_flight(follower).await?;
+                }
+            }
         }
+    }
+
+    async fn load_leaf_directory_uncached(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+        leaf_key: LeafCacheKey,
+        offset: u64,
+        length: usize,
+        compression: Compression,
+        archive_end: u64,
+    ) -> Result<Arc<Directory>> {
         match self
             .storage
             .fetch_leaf_bytes(tileset_id, offset, length)
@@ -650,7 +798,54 @@ fn parse_metadata_bytes(header: &Header, bytes: Bytes) -> Result<Metadata> {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_section_offset;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use anyhow::Result;
+    use bytes::Bytes;
+
+    use super::{BootstrapTransfer, Reader, Storage, StorageError, checked_section_offset};
+    use crate::interned::TilesetId;
+
+    struct SlowFailingStorage {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Storage for SlowFailingStorage {
+        async fn read_range<'a>(
+            &'a self,
+            _tileset_id: &'a TilesetId,
+            _start: u64,
+            _length: usize,
+            _archive_len: Option<u64>,
+        ) -> Result<Bytes, StorageError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(StorageError::Timeout("injected timeout".into()))
+        }
+
+        fn fetch_bootstrap_bytes<'a>(
+            &'a self,
+            _tileset_id: &'a TilesetId,
+            _include_metadata: bool,
+        ) -> impl Future<Output = Result<Option<BootstrapTransfer>>> + Send + 'a {
+            std::future::ready(Ok(None))
+        }
+
+        fn fetch_leaf_bytes<'a>(
+            &'a self,
+            _tileset_id: &'a TilesetId,
+            _offset: u64,
+            _length: usize,
+        ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {
+            std::future::ready(Ok(None))
+        }
+    }
 
     #[test]
     fn section_entry_must_stay_within_declared_range() {
@@ -670,5 +865,42 @@ mod tests {
                 .to_string()
                 .contains("overflows")
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_bootstrap_failures_share_one_backend_attempt() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(
+            Reader::new(SlowFailingStorage {
+                reads: Arc::clone(&reads),
+            })
+            .expect("reader"),
+        );
+        let tileset_id = TilesetId::new_unchecked("failing/archive");
+
+        let (first, second) = tokio::join!(
+            reader.load_bootstrap_local(&tileset_id),
+            reader.load_bootstrap_local(&tileset_id)
+        );
+
+        let first_error = match first {
+            Err(error) => error,
+            Ok(_) => panic!("first request unexpectedly succeeded"),
+        };
+        let second_error = match second {
+            Err(error) => error,
+            Ok(_) => panic!("second request unexpectedly succeeded"),
+        };
+        assert!(format!("{first_error:#}").contains("injected timeout"));
+        assert!(format!("{second_error:#}").contains("injected timeout"));
+        assert!(matches!(
+            first_error.downcast_ref::<StorageError>(),
+            Some(StorageError::Timeout(_))
+        ));
+        assert!(matches!(
+            second_error.downcast_ref::<StorageError>(),
+            Some(StorageError::Timeout(_))
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 }

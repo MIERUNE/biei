@@ -30,3 +30,6 @@ spec:
               value: "mapterhorn/planet"
             - name: ISKR_MAPTERHORN_MAXZOOM
               value: "16"
+            # Bound aggregate GCS range-read concurrency across all archives.
+            - name: ISKR_BACKEND_FETCH_CONCURRENCY
+              value: "32"

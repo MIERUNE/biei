@@ -22,14 +22,22 @@ struct Inner {
     egress_bytes: IntCounter,
     internal_bytes: IntCounter,
     http_requests: IntCounterVec,
+    http_request_duration: HistogramVec,
     tiles_served: IntCounterVec,
     tile_cache: IntCounterVec,
+    peer_forward: IntCounterVec,
+    peer_fetch: IntCounterVec,
+    peer_fetch_duplicate_inflight: IntCounterVec,
+    internal_resource_requests: IntCounterVec,
+    provider_resource_cache: IntCounterVec,
     mapterhorn_resolve: IntCounterVec,
     cache_bytes: IntGaugeVec,
     backend_fetch_bytes: IntCounter,
     backend_fetch_duration: HistogramVec,
     backend_fetch_size_bytes: HistogramVec,
     backend_fetch_chunks: HistogramVec,
+    backend_fetch_queue_duration: Histogram,
+    backend_fetch_concurrency: IntGaugeVec,
     chunk_size_bytes: IntGauge,
     max_fetch_chunks: IntGauge,
     chunk_fetch_merge_window_seconds: Gauge,
@@ -38,6 +46,13 @@ struct Inner {
     chunk_fetch_group_waiters: HistogramVec,
     chunk_cache: IntCounterVec,
     chunk_fetch_wait: IntCounterVec,
+    cpu_work_admission: IntCounterVec,
+    cpu_work_queue_duration: HistogramVec,
+    cpu_work: IntGaugeVec,
+    terrain_source_duration: HistogramVec,
+    terrain_generation_duration: HistogramVec,
+    terrain_source_tiles: HistogramVec,
+    terrain_output_size_bytes: HistogramVec,
     membership_size: IntGaugeVec,
     drain_state: IntGauge,
 }
@@ -45,6 +60,23 @@ struct Inner {
 /// Point-in-time counters used by tests and the in-process simulator.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, serde::Serialize)]
 pub struct NodeMetricsSnapshot {
+    pub peer_forward_successes: u64,
+    pub peer_forward_not_found: u64,
+    pub peer_forward_retryable: u64,
+    pub peer_forward_fatal: u64,
+    pub peer_forward_backoff_skips: u64,
+    pub peer_tile_fetches: u64,
+    pub peer_bootstrap_fetches: u64,
+    pub peer_leaf_fetches: u64,
+    pub peer_provider_fetches: u64,
+    pub peer_tile_duplicate_inflight: u64,
+    pub peer_bootstrap_duplicate_inflight: u64,
+    pub peer_leaf_duplicate_inflight: u64,
+    pub peer_provider_duplicate_inflight: u64,
+    pub internal_tile_requests: u64,
+    pub internal_bootstrap_requests: u64,
+    pub internal_leaf_requests: u64,
+    pub internal_provider_requests: u64,
     pub backend_fetches: u64,
     pub backend_fetch_successes: u64,
     pub backend_fetch_not_found: u64,
@@ -98,6 +130,7 @@ impl HistogramSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct NodeHistogramSnapshot {
     pub backend_fetch_duration_seconds: HistogramSnapshot,
+    pub backend_fetch_queue_duration_seconds: HistogramSnapshot,
     pub backend_fetch_size_bytes: HistogramSnapshot,
     pub backend_fetch_chunks: HistogramSnapshot,
     pub queue_delay_immediate_seconds: HistogramSnapshot,
@@ -111,6 +144,8 @@ impl NodeHistogramSnapshot {
     pub fn merge(&mut self, other: &Self) {
         self.backend_fetch_duration_seconds
             .merge(&other.backend_fetch_duration_seconds);
+        self.backend_fetch_queue_duration_seconds
+            .merge(&other.backend_fetch_queue_duration_seconds);
         self.backend_fetch_size_bytes
             .merge(&other.backend_fetch_size_bytes);
         self.backend_fetch_chunks.merge(&other.backend_fetch_chunks);
@@ -148,6 +183,17 @@ impl NodeMetrics {
             &["endpoint", "status"],
         )
         .expect("valid metric");
+        let http_request_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_http_request_duration_seconds",
+                "End-to-end HTTP request duration by route and status class",
+            )
+            .buckets(vec![
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ]),
+            &["endpoint", "status_class"],
+        )
+        .expect("valid metric");
         let tiles_served = IntCounterVec::new(
             Opts::new(
                 "ishikari_tiles_served_total",
@@ -162,6 +208,46 @@ impl NodeMetrics {
                 "Tile cache lookups and inserts by outcome",
             ),
             &["outcome"],
+        )
+        .expect("valid metric");
+        let peer_forward = IntCounterVec::new(
+            Opts::new(
+                "ishikari_peer_forward_total",
+                "Peer forwarding attempts and backoff skips by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        let peer_fetch = IntCounterVec::new(
+            Opts::new(
+                "ishikari_peer_fetch_total",
+                "Internal peer fetch attempts by resource and outcome",
+            ),
+            &["resource", "outcome"],
+        )
+        .expect("valid metric");
+        let peer_fetch_duplicate_inflight = IntCounterVec::new(
+            Opts::new(
+                "ishikari_peer_fetch_duplicate_inflight_total",
+                "Peer fetches overlapping an identical in-flight peer/path request",
+            ),
+            &["resource"],
+        )
+        .expect("valid metric");
+        let internal_resource_requests = IntCounterVec::new(
+            Opts::new(
+                "ishikari_internal_resource_requests_total",
+                "Internal resource requests served by resource and outcome",
+            ),
+            &["resource", "outcome"],
+        )
+        .expect("valid metric");
+        let provider_resource_cache = IntCounterVec::new(
+            Opts::new(
+                "ishikari_provider_resource_cache_total",
+                "Provider resource cache activity by resource and outcome",
+            ),
+            &["resource", "outcome"],
         )
         .expect("valid metric");
         let mapterhorn_resolve = IntCounterVec::new(
@@ -219,6 +305,24 @@ impl NodeMetrics {
             )
             .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
             &["outcome"],
+        )
+        .expect("valid metric");
+        let backend_fetch_queue_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "ishikari_backend_fetch_queue_duration_seconds",
+                "Time an object-storage range fetch waits for the process-wide concurrency limit",
+            )
+            .buckets(vec![
+                0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        )
+        .expect("valid metric");
+        let backend_fetch_concurrency = IntGaugeVec::new(
+            Opts::new(
+                "ishikari_backend_fetch_concurrency",
+                "Process-wide object-storage range-fetch admission state",
+            ),
+            &["state"],
         )
         .expect("valid metric");
         let chunk_size_bytes = IntGauge::new(
@@ -279,6 +383,82 @@ impl NodeMetrics {
             &["outcome"],
         )
         .expect("valid metric");
+        let cpu_work_admission = IntCounterVec::new(
+            Opts::new(
+                "ishikari_cpu_work_admission_total",
+                "CPU-heavy work admission attempts by work kind and outcome",
+            ),
+            &["work", "outcome"],
+        )
+        .expect("valid metric");
+        let cpu_work_queue_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_cpu_work_queue_duration_seconds",
+                "Time admitted CPU-heavy work waits for a blocking-work permit",
+            )
+            .buckets(vec![
+                0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["work"],
+        )
+        .expect("valid metric");
+        let cpu_work = IntGaugeVec::new(
+            Opts::new(
+                "ishikari_cpu_work",
+                "Current and configured CPU-heavy work admission state",
+            ),
+            &["state"],
+        )
+        .expect("valid metric");
+        let terrain_source_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_terrain_source_duration_seconds",
+                "Time to fetch and decode a derived terrain product's DEM neighborhood",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ]),
+            &["product"],
+        )
+        .expect("valid metric");
+        let terrain_generation_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_terrain_generation_duration_seconds",
+                "CPU time to generate and compress a derived terrain product",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ]),
+            &["product"],
+        )
+        .expect("valid metric");
+        let terrain_source_tiles = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_terrain_source_tiles",
+                "Number of present DEM source tiles used by a derived terrain generation",
+            )
+            .buckets(vec![1.0, 4.0, 6.0, 8.0, 9.0]),
+            &["product"],
+        )
+        .expect("valid metric");
+        let terrain_output_size_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "ishikari_terrain_output_size_bytes",
+                "Compressed byte size of generated terrain tile responses",
+            )
+            .buckets(vec![
+                4_096.0,
+                16_384.0,
+                65_536.0,
+                131_072.0,
+                262_144.0,
+                524_288.0,
+                1_048_576.0,
+                2_097_152.0,
+            ]),
+            &["product"],
+        )
+        .expect("valid metric");
         let membership_size = IntGaugeVec::new(
             Opts::new("ishikari_membership_size", "Cluster member count by state"),
             &["state"],
@@ -294,14 +474,22 @@ impl NodeMetrics {
             Box::new(egress_bytes.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(internal_bytes.clone()),
             Box::new(http_requests.clone()),
+            Box::new(http_request_duration.clone()),
             Box::new(tiles_served.clone()),
             Box::new(tile_cache.clone()),
+            Box::new(peer_forward.clone()),
+            Box::new(peer_fetch.clone()),
+            Box::new(peer_fetch_duplicate_inflight.clone()),
+            Box::new(internal_resource_requests.clone()),
+            Box::new(provider_resource_cache.clone()),
             Box::new(mapterhorn_resolve.clone()),
             Box::new(cache_bytes.clone()),
             Box::new(backend_fetch_bytes.clone()),
             Box::new(backend_fetch_duration.clone()),
             Box::new(backend_fetch_size_bytes.clone()),
             Box::new(backend_fetch_chunks.clone()),
+            Box::new(backend_fetch_queue_duration.clone()),
+            Box::new(backend_fetch_concurrency.clone()),
             Box::new(chunk_size_bytes.clone()),
             Box::new(max_fetch_chunks.clone()),
             Box::new(chunk_fetch_merge_window_seconds.clone()),
@@ -310,6 +498,13 @@ impl NodeMetrics {
             Box::new(chunk_fetch_group_waiters.clone()),
             Box::new(chunk_cache.clone()),
             Box::new(chunk_fetch_wait.clone()),
+            Box::new(cpu_work_admission.clone()),
+            Box::new(cpu_work_queue_duration.clone()),
+            Box::new(cpu_work.clone()),
+            Box::new(terrain_source_duration.clone()),
+            Box::new(terrain_generation_duration.clone()),
+            Box::new(terrain_source_tiles.clone()),
+            Box::new(terrain_output_size_bytes.clone()),
             Box::new(membership_size.clone()),
             Box::new(drain_state.clone()),
         ] {
@@ -321,14 +516,22 @@ impl NodeMetrics {
             egress_bytes,
             internal_bytes,
             http_requests,
+            http_request_duration,
             tiles_served,
             tile_cache,
+            peer_forward,
+            peer_fetch,
+            peer_fetch_duplicate_inflight,
+            internal_resource_requests,
+            provider_resource_cache,
             mapterhorn_resolve,
             cache_bytes,
             backend_fetch_bytes,
             backend_fetch_duration,
             backend_fetch_size_bytes,
             backend_fetch_chunks,
+            backend_fetch_queue_duration,
+            backend_fetch_concurrency,
             chunk_size_bytes,
             max_fetch_chunks,
             chunk_fetch_merge_window_seconds,
@@ -337,6 +540,13 @@ impl NodeMetrics {
             chunk_fetch_group_waiters,
             chunk_cache,
             chunk_fetch_wait,
+            cpu_work_admission,
+            cpu_work_queue_duration,
+            cpu_work,
+            terrain_source_duration,
+            terrain_generation_duration,
+            terrain_source_tiles,
+            terrain_output_size_bytes,
             membership_size,
             drain_state,
         }))
@@ -359,11 +569,25 @@ impl NodeMetrics {
     }
 
     /// Records one completed HTTP request against a bounded route pattern.
-    pub fn record_http(&self, endpoint: &str, status: u16) {
+    pub fn record_http(&self, endpoint: &str, status: u16, duration: Duration) {
+        self.record_http_request(endpoint, status);
+        self.record_http_duration(endpoint, status, duration);
+    }
+
+    /// Records an HTTP request count without adding a duration observation.
+    pub fn record_http_request(&self, endpoint: &str, status: u16) {
         self.0
             .http_requests
             .with_label_values(&[endpoint, &status.to_string()])
             .inc();
+    }
+
+    /// Records an HTTP duration observation without incrementing request count.
+    pub fn record_http_duration(&self, endpoint: &str, status: u16, duration: Duration) {
+        self.0
+            .http_request_duration
+            .with_label_values(&[endpoint, status_class(status)])
+            .observe(duration.as_secs_f64());
     }
 
     /// Records one external tile response by its served-from source.
@@ -374,6 +598,43 @@ impl NodeMetrics {
     /// Records one tile-cache event.
     pub fn record_tile_cache(&self, outcome: &str) {
         self.0.tile_cache.with_label_values(&[outcome]).inc();
+    }
+
+    /// Records one peer forwarding outcome or one routing skip due to backoff.
+    pub fn record_peer_forward(&self, outcome: &str) {
+        self.0.peer_forward.with_label_values(&[outcome]).inc();
+    }
+
+    /// Records one internal peer network attempt by bounded resource kind.
+    pub fn record_peer_fetch(&self, resource: &str, outcome: &str) {
+        self.0
+            .peer_fetch
+            .with_label_values(&[resource, outcome])
+            .inc();
+    }
+
+    /// Records a peer fetch that overlaps an identical peer/path request.
+    pub fn record_peer_fetch_duplicate_inflight(&self, resource: &str) {
+        self.0
+            .peer_fetch_duplicate_inflight
+            .with_label_values(&[resource])
+            .inc();
+    }
+
+    /// Records one internal resource request served by this node.
+    pub fn record_internal_resource_request(&self, resource: &str, outcome: &str) {
+        self.0
+            .internal_resource_requests
+            .with_label_values(&[resource, outcome])
+            .inc();
+    }
+
+    /// Records provider-cache activity for the bounded style/glyph/sprite kinds.
+    pub fn record_provider_resource_cache(&self, resource: &str, outcome: &str) {
+        self.0
+            .provider_resource_cache
+            .with_label_values(&[resource, outcome])
+            .inc();
     }
 
     /// Records one Mapterhorn composite resolution outcome: `base`, `detail`,
@@ -420,6 +681,37 @@ impl NodeMetrics {
             .backend_fetch_chunks
             .with_label_values(&[outcome])
             .observe(chunks as f64);
+    }
+
+    /// Exposes the process-wide backend-fetch concurrency ceiling.
+    pub fn set_backend_fetch_concurrency_limit(&self, limit: usize) {
+        self.0
+            .backend_fetch_concurrency
+            .with_label_values(&["active"])
+            .set(0);
+        self.0
+            .backend_fetch_concurrency
+            .with_label_values(&["waiting"])
+            .set(0);
+        self.0
+            .backend_fetch_concurrency
+            .with_label_values(&["limit"])
+            .set(limit as i64);
+    }
+
+    /// Adjusts the current backend-fetch admission state (`active` or `waiting`).
+    pub fn adjust_backend_fetch_concurrency(&self, state: &str, delta: i64) {
+        self.0
+            .backend_fetch_concurrency
+            .with_label_values(&[state])
+            .add(delta);
+    }
+
+    /// Records time spent waiting for the process-wide backend-fetch permit.
+    pub fn record_backend_fetch_queue(&self, duration: Duration) {
+        self.0
+            .backend_fetch_queue_duration
+            .observe(duration.as_secs_f64());
     }
 
     /// Exposes backend chunking configuration for comparing deployments.
@@ -470,6 +762,64 @@ impl NodeMetrics {
         self.0.chunk_fetch_wait.with_label_values(&[outcome]).inc();
     }
 
+    /// Records admission or shedding for one of the fixed CPU-work kinds.
+    pub fn record_cpu_work_admission(&self, work: &str, outcome: &str) {
+        self.0
+            .cpu_work_admission
+            .with_label_values(&[work, outcome])
+            .inc();
+    }
+
+    /// Records how long admitted work waited for a CPU-work permit.
+    pub fn record_cpu_work_queue_duration(&self, work: &str, duration: Duration) {
+        self.0
+            .cpu_work_queue_duration
+            .with_label_values(&[work])
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Sets current and configured CPU-work admission values.
+    pub fn set_cpu_work(&self, inflight: usize, running: usize, concurrency: usize, max: usize) {
+        for (state, value) in [
+            ("inflight", inflight),
+            ("running", running),
+            ("concurrency", concurrency),
+            ("max_inflight", max),
+        ] {
+            self.0
+                .cpu_work
+                .with_label_values(&[state])
+                .set(value as i64);
+        }
+    }
+
+    /// Records the successful cold-generation cost for one fixed terrain product.
+    pub fn record_terrain_generation(
+        &self,
+        product: &str,
+        source_duration: Duration,
+        generation_duration: Duration,
+        source_tiles: usize,
+        output_bytes: usize,
+    ) {
+        self.0
+            .terrain_source_duration
+            .with_label_values(&[product])
+            .observe(source_duration.as_secs_f64());
+        self.0
+            .terrain_generation_duration
+            .with_label_values(&[product])
+            .observe(generation_duration.as_secs_f64());
+        self.0
+            .terrain_source_tiles
+            .with_label_values(&[product])
+            .observe(source_tiles as f64);
+        self.0
+            .terrain_output_size_bytes
+            .with_label_values(&[product])
+            .observe(output_bytes as f64);
+    }
+
     /// Returns a structured snapshot without parsing Prometheus text output.
     pub fn snapshot(&self) -> NodeMetricsSnapshot {
         let backend_count = |outcome: &str| {
@@ -490,8 +840,73 @@ impl NodeMetrics {
                 .with_label_values(&[flush])
                 .get_sample_count()
         };
+        let peer_fetch_count = |resource: &str| {
+            ["success", "not_found", "retryable", "fatal"]
+                .into_iter()
+                .map(|outcome| {
+                    self.0
+                        .peer_fetch
+                        .with_label_values(&[resource, outcome])
+                        .get()
+                })
+                .sum()
+        };
+        let internal_request_count = |resource: &str| {
+            ["success", "not_found", "retryable", "error"]
+                .into_iter()
+                .map(|outcome| {
+                    self.0
+                        .internal_resource_requests
+                        .with_label_values(&[resource, outcome])
+                        .get()
+                })
+                .sum()
+        };
 
         NodeMetricsSnapshot {
+            peer_forward_successes: counter(&self.0.peer_forward, "success"),
+            peer_forward_not_found: counter(&self.0.peer_forward, "not_found"),
+            peer_forward_retryable: counter(&self.0.peer_forward, "retryable"),
+            peer_forward_fatal: counter(&self.0.peer_forward, "fatal"),
+            peer_forward_backoff_skips: counter(&self.0.peer_forward, "backoff"),
+            peer_tile_fetches: peer_fetch_count("tile"),
+            peer_bootstrap_fetches: peer_fetch_count("bootstrap"),
+            peer_leaf_fetches: peer_fetch_count("leaf"),
+            peer_provider_fetches: ["style", "glyph", "sprite", "derived", "other"]
+                .into_iter()
+                .map(peer_fetch_count)
+                .sum(),
+            peer_tile_duplicate_inflight: self
+                .0
+                .peer_fetch_duplicate_inflight
+                .with_label_values(&["tile"])
+                .get(),
+            peer_bootstrap_duplicate_inflight: self
+                .0
+                .peer_fetch_duplicate_inflight
+                .with_label_values(&["bootstrap"])
+                .get(),
+            peer_leaf_duplicate_inflight: self
+                .0
+                .peer_fetch_duplicate_inflight
+                .with_label_values(&["leaf"])
+                .get(),
+            peer_provider_duplicate_inflight: ["style", "glyph", "sprite", "derived", "other"]
+                .into_iter()
+                .map(|resource| {
+                    self.0
+                        .peer_fetch_duplicate_inflight
+                        .with_label_values(&[resource])
+                        .get()
+                })
+                .sum(),
+            internal_tile_requests: internal_request_count("tile"),
+            internal_bootstrap_requests: internal_request_count("bootstrap"),
+            internal_leaf_requests: internal_request_count("leaf"),
+            internal_provider_requests: ["style", "glyph", "sprite", "derived", "other"]
+                .into_iter()
+                .map(internal_request_count)
+                .sum(),
             backend_fetches: backend_fetch_successes
                 + backend_fetch_not_found
                 + backend_fetch_errors
@@ -543,6 +958,9 @@ impl NodeMetrics {
             backend_fetch_duration_seconds: merge_histograms(
                 &self.0.backend_fetch_duration,
                 &["success", "not_found", "error", "timeout"],
+            ),
+            backend_fetch_queue_duration_seconds: histogram_snapshot(
+                &self.0.backend_fetch_queue_duration,
             ),
             backend_fetch_size_bytes: merge_histograms(
                 &self.0.backend_fetch_size_bytes,
@@ -611,6 +1029,17 @@ impl NodeMetrics {
             return String::new();
         }
         String::from_utf8(buffer).unwrap_or_default()
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
     }
 }
 

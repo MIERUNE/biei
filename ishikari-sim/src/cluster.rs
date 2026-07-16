@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     sync::{
         Arc, RwLock, Weak,
@@ -7,6 +7,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use ishikari::{
@@ -16,7 +17,7 @@ use ishikari::{
     storage::{
         FetchFuture, HrwRouter, InternalTransport, ObjectStoreRegistry, PeerBackend, PeerDirectory,
         PeerFetchError, PeerFuture, PeerTileCachePolicy, ResourceResolver,
-        ResourceResolverStorageConfig, TileSource, TilesetId,
+        ResourceResolverStorageConfig, TileSource, TilesetId, internal_resource_kind,
     },
 };
 use serde::Serialize;
@@ -39,6 +40,7 @@ pub struct ClusterConfig {
     pub tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub backend_fetch_concurrency: usize,
     #[serde(flatten)]
     pub backend_latency: BackendLatencyConfig,
     pub peer_latency_ms: u64,
@@ -58,6 +60,7 @@ impl Default for ClusterConfig {
             tile_group_size: 512,
             chunk_size_bytes: 1024 * 1024,
             max_fetch_chunks: 4,
+            backend_fetch_concurrency: 32,
             backend_latency: BackendLatencyConfig::default(),
             peer_latency_ms: 0,
             gossip_interval_ms: 200,
@@ -91,6 +94,10 @@ impl ClusterConfig {
         ensure!(
             self.max_fetch_chunks > 0,
             "max_fetch_chunks must be greater than zero"
+        );
+        ensure!(
+            self.backend_fetch_concurrency > 0,
+            "backend_fetch_concurrency must be greater than zero"
         );
         ensure!(
             self.gossip_interval_ms > 0,
@@ -165,23 +172,29 @@ impl PeerDirectory for ChitchatPeerDirectory {
 
 #[derive(Default)]
 struct NodeRegistry {
-    nodes: RwLock<HashMap<String, Weak<ResourceResolver>>>,
+    nodes: RwLock<HashMap<String, RegisteredNode>>,
+}
+
+struct RegisteredNode {
+    resolver: Weak<ResourceResolver>,
+    metrics: NodeMetrics,
 }
 
 impl NodeRegistry {
-    fn register(&self, id: String, resolver: &Arc<ResourceResolver>) {
-        self.nodes
-            .write()
-            .expect("node registry poisoned")
-            .insert(id, Arc::downgrade(resolver));
+    fn register(&self, id: String, resolver: &Arc<ResourceResolver>, metrics: NodeMetrics) {
+        self.nodes.write().expect("node registry poisoned").insert(
+            id,
+            RegisteredNode {
+                resolver: Arc::downgrade(resolver),
+                metrics,
+            },
+        );
     }
 
-    fn get(&self, id: &str) -> Option<Arc<ResourceResolver>> {
-        self.nodes
-            .read()
-            .expect("node registry poisoned")
-            .get(id)
-            .and_then(Weak::upgrade)
+    fn get(&self, id: &str) -> Option<(Arc<ResourceResolver>, NodeMetrics)> {
+        let nodes = self.nodes.read().expect("node registry poisoned");
+        let node = nodes.get(id)?;
+        Some((node.resolver.upgrade()?, node.metrics.clone()))
     }
 
     fn remove(&self, id: &str) {
@@ -196,6 +209,7 @@ impl NodeRegistry {
 struct TransportCounters {
     requests: AtomicU64,
     bytes: AtomicU64,
+    unavailable_requests: AtomicU64,
 }
 
 struct SimInternalTransport {
@@ -211,10 +225,23 @@ impl InternalTransport for SimInternalTransport {
             if !self.latency.is_zero() {
                 tokio::time::sleep(self.latency).await;
             }
-            let resolver = self.registry.get(&peer.id).ok_or_else(|| {
+            let (resolver, metrics) = self.registry.get(&peer.id).ok_or_else(|| {
+                self.counters
+                    .unavailable_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 PeerFetchError::Retryable(format!("simulator peer {} is unavailable", peer.id))
             })?;
-            let response = resolver.fetch_internal_for_simulator(path).await?;
+            let result = resolver.fetch_internal_for_simulator(path).await;
+            if let Some(resource) = internal_resource_kind(path) {
+                let outcome = match &result {
+                    Ok(_) => "success",
+                    Err(PeerFetchError::NotFound) => "not_found",
+                    Err(PeerFetchError::Retryable(_)) => "retryable",
+                    Err(PeerFetchError::Fatal(_)) => "error",
+                };
+                metrics.record_internal_resource_request(resource, outcome);
+            }
+            let response = result?;
             self.counters
                 .bytes
                 .fetch_add(response.bytes.len() as u64, Ordering::Relaxed);
@@ -233,6 +260,7 @@ pub struct SimCluster {
     transport: Arc<dyn InternalTransport>,
     transport_counters: Arc<TransportCounters>,
     next_node_index: usize,
+    simulation_started_at: Instant,
     report: SimReport,
 }
 
@@ -259,12 +287,14 @@ impl SimCluster {
             transport,
             transport_counters,
             next_node_index: 0,
+            simulation_started_at: Instant::now(),
             report: SimReport::default(),
         };
         for _ in 0..initial_node_count {
             cluster.add_node().await?;
         }
         cluster.wait_for_membership_convergence().await?;
+        cluster.simulation_started_at = Instant::now();
         Ok(cluster)
     }
 
@@ -309,7 +339,8 @@ impl SimCluster {
             directory,
             self.transport.clone(),
         )?;
-        self.registry.register(peer.id.clone(), &node.resolver);
+        self.registry
+            .register(peer.id.clone(), &node.resolver, node.metrics.clone());
         self.nodes.push(node);
         self.next_node_index += 1;
         Ok(peer.id)
@@ -367,7 +398,7 @@ impl SimCluster {
             views.insert(
                 node.id.clone(),
                 node.membership
-                    .peers()
+                    .peers_for_simulator_observation()
                     .await
                     .iter()
                     .map(|peer| peer.id.clone())
@@ -460,7 +491,11 @@ impl SimCluster {
         self.prepare_on(entry, entry_node)
     }
 
-    pub fn observation(&self) -> ClusterObservation {
+    pub fn request_count(&self) -> u64 {
+        self.report.requests
+    }
+
+    pub async fn observation(&self) -> ClusterObservation {
         let mut metrics = NodeMetricsSnapshot::default();
         for node in &self.retired_nodes {
             add_metrics(&mut metrics, node.metrics);
@@ -468,9 +503,52 @@ impl SimCluster {
         for node in &self.nodes {
             add_metrics(&mut metrics, node.metrics.snapshot());
         }
+        let expected = self.active_node_ids().into_iter().collect::<BTreeSet<_>>();
+        let mut membership_converged_nodes = 0;
+        let mut membership_missing_peer_refs = 0;
+        let mut membership_extra_peer_refs = 0;
+        let mut membership_min_peer_count = usize::MAX;
+        let mut membership_max_peer_count = 0;
+        for node in &self.nodes {
+            let actual = node
+                .membership
+                .peers_for_simulator_observation()
+                .await
+                .iter()
+                .map(|peer| peer.id.clone())
+                .collect::<BTreeSet<_>>();
+            let missing = expected.difference(&actual).count();
+            let extra = actual.difference(&expected).count();
+            if missing == 0 && extra == 0 {
+                membership_converged_nodes += 1;
+            }
+            membership_missing_peer_refs += missing;
+            membership_extra_peer_refs += extra;
+            membership_min_peer_count = membership_min_peer_count.min(actual.len());
+            membership_max_peer_count = membership_max_peer_count.max(actual.len());
+        }
+        let (gossip_messages, gossip_bytes) = self.gossip_transport.statistics();
         ClusterObservation {
             requests: self.report.requests,
             active_nodes: self.nodes.len(),
+            virtual_elapsed_ms: Some(
+                self.simulation_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            gossip_messages,
+            gossip_bytes,
+            membership_converged_nodes,
+            membership_stale_nodes: self.nodes.len() - membership_converged_nodes,
+            membership_missing_peer_refs,
+            membership_extra_peer_refs,
+            membership_min_peer_count: if self.nodes.is_empty() {
+                0
+            } else {
+                membership_min_peer_count
+            },
+            membership_max_peer_count,
             cache_hits: self.report.l1_cache_hits,
             by_source: self.report.by_source.clone(),
             node_requests: self
@@ -479,6 +557,12 @@ impl SimCluster {
                 .map(|node| (node.id.clone(), node.requests))
                 .collect(),
             peer_requests: self.transport_counters.requests.load(Ordering::Relaxed),
+            peer_unavailable_requests: self
+                .transport_counters
+                .unavailable_requests
+                .load(Ordering::Relaxed),
+            peer_retryable_failures: metrics.peer_forward_retryable,
+            peer_backoff_skips: metrics.peer_forward_backoff_skips,
             backend_fetches: metrics.backend_fetches,
             backend_bytes: self
                 .retired_nodes
@@ -538,6 +622,12 @@ impl SimCluster {
         }
         self.report.peer_requests = self.transport_counters.requests.load(Ordering::Relaxed);
         self.report.peer_bytes = self.transport_counters.bytes.load(Ordering::Relaxed);
+        self.report.peer_unavailable_requests = self
+            .transport_counters
+            .unavailable_requests
+            .load(Ordering::Relaxed);
+        (self.report.gossip_messages, self.report.gossip_bytes) =
+            self.gossip_transport.statistics();
         self.report.backend_bytes = self
             .retired_nodes
             .iter()
@@ -602,12 +692,14 @@ fn build_node(
         directory,
         HrwRouter::new(config.candidate_count, config.tile_group_size),
         transport,
+        metrics.clone(),
     );
     let resolver = Arc::new(ResourceResolver::with_peer_backend(
         ResourceResolverStorageConfig {
             tileset_sources: config.tileset_sources.clone(),
             chunk_size_bytes: config.chunk_size_bytes,
             max_fetch_chunks: config.max_fetch_chunks,
+            backend_fetch_concurrency: config.backend_fetch_concurrency,
             backend_latency,
             tile_cache_max_bytes: config.tile_cache_max_bytes,
             peer_tile_cache_policy: if config.cache_peer_tiles {
@@ -724,6 +816,10 @@ mod tests {
                 ..ClusterConfig::default()
             },
             ClusterConfig {
+                backend_fetch_concurrency: 0,
+                ..ClusterConfig::default()
+            },
+            ClusterConfig {
                 gossip_interval_ms: 0,
                 ..ClusterConfig::default()
             },
@@ -829,6 +925,14 @@ mod tests {
 
         cluster.remove_node("node-0").await.expect("remove node");
 
+        let stale_observation = cluster.observation().await;
+        assert_eq!(stale_observation.membership_stale_nodes, 2);
+        assert_eq!(stale_observation.membership_missing_peer_refs, 0);
+        assert_eq!(stale_observation.membership_extra_peer_refs, 2);
+        assert!(stale_observation.gossip_messages > 0);
+        assert!(stale_observation.gossip_bytes > 0);
+        assert!(stale_observation.virtual_elapsed_ms.is_some());
+
         let stale_views = cluster.membership_peer_ids().await;
         assert!(
             stale_views
@@ -844,5 +948,9 @@ mod tests {
         let converged_views = cluster.membership_peer_ids().await;
         let expected = vec!["node-1".to_string(), "node-2".to_string()];
         assert!(converged_views.values().all(|peers| peers == &expected));
+        let converged_observation = cluster.observation().await;
+        assert_eq!(converged_observation.membership_converged_nodes, 2);
+        assert_eq!(converged_observation.membership_stale_nodes, 0);
+        assert_eq!(converged_observation.membership_extra_peer_refs, 0);
     }
 }

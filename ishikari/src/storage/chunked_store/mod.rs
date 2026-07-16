@@ -6,8 +6,8 @@ mod fetcher;
 mod store;
 
 pub use fetcher::{BackendLatencyModel, ChunkFetchError};
-pub(crate) use store::ChunkReadSource;
 pub use store::ChunkedStore;
+pub(crate) use store::{ChunkReadSource, ChunkedStoreConfig};
 
 #[cfg(feature = "simulator-support")]
 pub use coordinator::plan_chunk_fetch_ranges;
