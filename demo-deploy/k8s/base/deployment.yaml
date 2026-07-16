@@ -83,8 +83,9 @@ spec:
               value: "https://tiles.example.invalid/{tileset_id}/tileset.json"
             - name: BIEI_CORES
               value: "2"
-            # Point MapLibre's ambient tile/glyph cache at the mounted volume
-            # below; without this it falls back to /tmp and the volume is unused.
+            # Fallback native ambient-cache path. Normal operation uses biei's
+            # process-wide Rust resource cache; this path is read only when the
+            # Rust FileSources are disabled for diagnostics.
             - name: BIEI_MAPLIBRE_CACHE_PATH
               value: "/var/cache/biei/maplibre-ambient-cache.sqlite"
             - name: RUST_LOG

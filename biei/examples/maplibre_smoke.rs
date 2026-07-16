@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let mut render_elapsed = Vec::with_capacity(args.repeat);
     for _ in 0..args.repeat {
         let render_started = StdInstant::now();
-        rendered = Some(renderer.render(&task).await.context("render image")?);
+        rendered = Some(renderer.render(&task).await.context("render image")?.output);
         render_elapsed.push(render_started.elapsed());
     }
     let rendered = rendered.expect("repeat is at least 1");

@@ -1,0 +1,13 @@
+{
+  "events": [
+    {
+      "at_request": 500,
+      "action": "add"
+    },
+    {
+      "at_request": 1500,
+      "action": "remove",
+      "node_id": "node-0"
+    }
+  ]
+}

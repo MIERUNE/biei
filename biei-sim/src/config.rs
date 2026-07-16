@@ -98,6 +98,9 @@ pub struct SimConfig {
     /// Number of synthetic nodes instantiated by the simulator. Production
     /// discovers peers from membership/gossip and does not use this.
     pub node_count: usize,
+    /// Actual CPU service capacity per node. Native-render concurrency is a
+    /// separate cluster setting because resource waits do not consume a core.
+    pub cpu_cores_per_node: usize,
     pub cluster: ClusterConfig,
     pub costs: CostConfig,
     pub workload: WorkloadConfig,
@@ -110,6 +113,7 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             node_count: 2,
+            cpu_cores_per_node: 16,
             cluster: ClusterConfig {
                 renderer_slots_per_node: 16,
                 render_permits_per_node: None,
@@ -128,7 +132,13 @@ impl Default for SimConfig {
                     Duration::from_millis(30),
                     Duration::from_millis(70),
                 ),
-                render_cost: CostRange::new(Duration::from_millis(5), Duration::from_millis(30)),
+                // Initial observed point values: ~20 ms CPU, ~165 ms warm
+                // in-render resource wait, and ~480 ms first-render wait. They
+                // are not distributions or sizing evidence; M12 replaces them
+                // with a provenance-bearing production profile.
+                render_cpu_cost: CostRange::fixed(Duration::from_millis(20)),
+                render_resource_cost: CostRange::fixed(Duration::from_millis(165)),
+                first_render_resource_cost: CostRange::fixed(Duration::from_millis(480)),
                 hop_latency: Duration::from_millis(5),
                 sla: Duration::from_millis(1000),
             },

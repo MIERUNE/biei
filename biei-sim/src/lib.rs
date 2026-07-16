@@ -3,6 +3,9 @@
 //! impls. Production code at the crate root should not depend on anything in
 //! here.
 
+pub mod calibrated_costs;
+pub mod calibration;
+pub mod calibration_runner;
 pub mod channel_transport;
 pub mod chitchat_bus;
 pub mod churn;

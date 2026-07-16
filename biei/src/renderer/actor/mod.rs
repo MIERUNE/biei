@@ -4,6 +4,7 @@
 //! actor owns the backend on one OS thread and exposes async request/reply
 //! methods to worker tasks.
 
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -17,6 +18,7 @@ mod addlayer;
 mod camera;
 mod encode;
 
+use super::RendererOutput;
 use super::overlay::{OverlaySlotPool, build_overlay_geojson, populate_static_slots};
 use addlayer::{AddLayerSourceCache, render_static_with_overlays_and_addlayer};
 use camera::{auto_padding_for_overlays, padding_to_edge_insets};
@@ -24,9 +26,11 @@ use encode::encode_image;
 #[cfg(test)]
 use encode::rgba_to_rgb_on_white;
 
+#[cfg(test)]
+use crate::types::RenderOutput;
 use crate::types::{
-    ImageFormat, InternalTask, PixelRatio, RenderOutput, RenderRequest, RendererError, SourceRef,
-    StyleRevision, TaskId, WorkerId,
+    ImageFormat, InternalTask, PixelRatio, RenderRequest, RendererError, SourceRef, StyleRevision,
+    TaskId, WorkerId,
 };
 
 // Native renderer destruction flushes backend state and may take a few tens of
@@ -48,6 +52,7 @@ struct RendererActorSupervisorInner {
     available_slots: AtomicUsize,
     max_orphaned_threads: usize,
     orphaned_threads: AtomicUsize,
+    orphaned_by_worker: Mutex<HashMap<WorkerId, usize>>,
     replacements_succeeded: AtomicU64,
     replacements_exhausted: AtomicU64,
     replacements_failed: AtomicU64,
@@ -75,6 +80,7 @@ impl RendererActorSupervisor {
                 // attacker to leak threads indefinitely.
                 max_orphaned_threads: total_slots,
                 orphaned_threads: AtomicUsize::new(0),
+                orphaned_by_worker: Mutex::new(HashMap::new()),
                 replacements_succeeded: AtomicU64::new(0),
                 replacements_exhausted: AtomicU64::new(0),
                 replacements_failed: AtomicU64::new(0),
@@ -86,19 +92,18 @@ impl RendererActorSupervisor {
         self.inner.available_slots.load(Ordering::Acquire) > 0
     }
 
-    /// Whether in-process recovery is still possible. False once every slot is
-    /// unavailable AND the orphan budget is exhausted: renders cannot be
-    /// cancelled (engine constraint), a wedged Still render may never finish,
-    /// and no replacement can be spawned — the only full recovery is a process
-    /// restart (production-spec §8.4). Liveness should fail in that state so
-    /// the orchestrator restarts the pod.
+    /// Whether in-process recovery can restore full capacity. False once any
+    /// slot is unavailable AND the orphan budget is exhausted: renders cannot
+    /// be cancelled (engine constraint), no replacement can be spawned, and a
+    /// partially dead process could otherwise stay ready forever. Liveness
+    /// should fail so the orchestrator restores the missing capacity.
     pub fn is_livable(&self) -> bool {
-        self.inner.available_slots.load(Ordering::Acquire) > 0
+        self.inner.available_slots.load(Ordering::Acquire) == self.inner.total_slots
             || self.inner.orphaned_threads.load(Ordering::Acquire) < self.inner.max_orphaned_threads
     }
 
     /// Test hook: consume the entire orphan budget to simulate the
-    /// unrecoverable state (`is_livable() == false` once no slot is available).
+    /// unrecoverable state (`is_livable() == false` once any slot is unavailable).
     #[cfg(test)]
     pub(crate) fn exhaust_orphan_budget_for_test(&self) {
         self.inner
@@ -117,20 +122,35 @@ impl RendererActorSupervisor {
         }
     }
 
-    fn try_reserve_orphan(&self) -> bool {
-        self.inner
-            .orphaned_threads
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.inner.max_orphaned_threads).then_some(current + 1)
-            })
-            .is_ok()
+    fn try_reserve_orphan(&self, worker_id: WorkerId) -> bool {
+        let mut by_worker = lock_unpoisoned(&self.inner.orphaned_by_worker);
+        if by_worker.contains_key(&worker_id)
+            || self.inner.orphaned_threads.load(Ordering::Acquire)
+                >= self.inner.max_orphaned_threads
+        {
+            return false;
+        }
+        by_worker.insert(worker_id, 1);
+        self.inner.orphaned_threads.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
-    fn reserve_orphan_unchecked(&self) {
+    fn reserve_orphan_unchecked(&self, worker_id: WorkerId) {
+        *lock_unpoisoned(&self.inner.orphaned_by_worker)
+            .entry(worker_id)
+            .or_default() += 1;
         self.inner.orphaned_threads.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn release_orphan(&self) {
+    fn release_orphan(&self, worker_id: WorkerId) {
+        let mut by_worker = lock_unpoisoned(&self.inner.orphaned_by_worker);
+        let Some(count) = by_worker.get_mut(&worker_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            by_worker.remove(&worker_id);
+        }
         self.inner.orphaned_threads.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -212,7 +232,7 @@ pub trait BlockingRenderBackend: 'static {
         style: &ResolvedStyle,
         task: &RenderTaskView,
     ) -> Result<(), RendererError>;
-    fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError>;
+    fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError>;
     fn error_invalidates_loaded_state(&self, _err: &RendererError) -> bool {
         true
     }
@@ -220,6 +240,7 @@ pub trait BlockingRenderBackend: 'static {
 }
 
 pub struct RendererActor {
+    worker_id: WorkerId,
     tx: mpsc::Sender<RenderCmd>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     thread_status: Arc<AtomicU8>,
@@ -234,7 +255,7 @@ enum RenderCmd {
     },
     Render {
         task: RenderTaskView,
-        reply: oneshot::Sender<Result<RenderOutput, RendererError>>,
+        reply: oneshot::Sender<Result<RendererOutput, RendererError>>,
     },
     Retire,
     Shutdown,
@@ -289,10 +310,12 @@ impl RendererActor {
         let thread_status = Arc::new(AtomicU8::new(THREAD_RUNNING));
         let exit_status = Arc::clone(&thread_status);
         let exit_supervisor = supervisor.clone();
+        let worker_id = config.worker_id;
         let thread = thread::Builder::new()
             .name(format!("biei-renderer-{}", config.worker_id))
             .spawn(move || {
                 let _exit = ActorThreadExit {
+                    worker_id,
                     status: exit_status,
                     supervisor: exit_supervisor,
                 };
@@ -303,6 +326,7 @@ impl RendererActor {
             })?;
 
         Ok(Self {
+            worker_id,
             tx,
             thread: Mutex::new(Some(thread)),
             thread_status,
@@ -330,7 +354,7 @@ impl RendererActor {
         await_actor_reply(deadline, rx).await
     }
 
-    pub async fn render(&self, task: RenderTaskView) -> Result<RenderOutput, RendererError> {
+    pub async fn render(&self, task: RenderTaskView) -> Result<RendererOutput, RendererError> {
         let (reply, rx) = oneshot::channel();
         let deadline = task.deadline;
         self.tx
@@ -357,7 +381,7 @@ impl RendererActor {
             let _ = handle.join();
             return true;
         }
-        if !self.supervisor.try_reserve_orphan() {
+        if !self.supervisor.try_reserve_orphan(self.worker_id) {
             return false;
         }
         match self.thread_status.compare_exchange(
@@ -372,14 +396,14 @@ impl RendererActor {
                 true
             }
             Err(THREAD_FINISHED) => {
-                self.supervisor.release_orphan();
+                self.supervisor.release_orphan(self.worker_id);
                 let handle = thread.take().expect("renderer thread exists");
                 drop(thread);
                 let _ = handle.join();
                 true
             }
             Err(_) => {
-                self.supervisor.release_orphan();
+                self.supervisor.release_orphan(self.worker_id);
                 false
             }
         }
@@ -410,7 +434,7 @@ impl Drop for RendererActor {
                     )
                     .is_ok()
                 {
-                    self.supervisor.reserve_orphan_unchecked();
+                    self.supervisor.reserve_orphan_unchecked(self.worker_id);
                 }
                 tracing::warn!(
                     "renderer actor thread did not stop promptly; detaching to avoid blocking shutdown"
@@ -421,6 +445,7 @@ impl Drop for RendererActor {
 }
 
 struct ActorThreadExit {
+    worker_id: WorkerId,
     status: Arc<AtomicU8>,
     supervisor: RendererActorSupervisor,
 }
@@ -428,7 +453,7 @@ struct ActorThreadExit {
 impl Drop for ActorThreadExit {
     fn drop(&mut self) {
         if self.status.swap(THREAD_FINISHED, Ordering::AcqRel) == THREAD_ORPHANED {
-            self.supervisor.release_orphan();
+            self.supervisor.release_orphan(self.worker_id);
         }
     }
 }
@@ -553,7 +578,6 @@ enum ActiveRenderer {
     Static {
         key: RendererKey,
         loaded_style: Option<StyleRevision>,
-        observer_state: ObserverState,
         renderer: maplibre_native::ImageRenderer<maplibre_native::Static>,
         /// Pre-allocated overlay slots (style-setup-time fixed). Per-request
         /// overlay rendering only updates each slot's GeoJSON source via
@@ -568,7 +592,6 @@ enum ActiveRenderer {
     Tile {
         key: RendererKey,
         loaded_style: Option<StyleRevision>,
-        observer_state: ObserverState,
         renderer: maplibre_native::ImageRenderer<maplibre_native::Tile>,
     },
 }
@@ -611,7 +634,6 @@ impl MapLibreNativeBackend {
         &mut self,
         key: RendererKey,
         size: maplibre_native::Size,
-        deadline: Instant,
     ) -> Result<
         (
             &mut maplibre_native::ImageRenderer<maplibre_native::Static>,
@@ -628,9 +650,7 @@ impl MapLibreNativeBackend {
         if needs_rebuild {
             let mut renderer = build_renderer(key, size, self.ambient_cache_path.as_deref())?
                 .build_static_renderer();
-            let observer_state = ObserverState::default();
-            install_map_observer(&mut renderer, observer_state.clone());
-            load_style_json(&mut renderer, &style, &observer_state, deadline)?;
+            load_style_json(&mut renderer, &style)?;
             let slots = populate_static_slots(&mut renderer).map_err(|err| {
                 RendererError::StyleLoadFailed {
                     style_id: style.revision.id.clone(),
@@ -640,7 +660,6 @@ impl MapLibreNativeBackend {
             self.active_renderer = Some(ActiveRenderer::Static {
                 key,
                 loaded_style: Some(style.revision.clone()),
-                observer_state,
                 renderer,
                 slots,
                 addlayer_sources: AddLayerSourceCache::new(),
@@ -648,7 +667,6 @@ impl MapLibreNativeBackend {
         }
         let Some(ActiveRenderer::Static {
             loaded_style,
-            observer_state,
             renderer,
             slots,
             addlayer_sources,
@@ -658,7 +676,7 @@ impl MapLibreNativeBackend {
             unreachable!("static renderer was inserted")
         };
         if loaded_style.as_ref() != Some(&style.revision) {
-            load_style_json(renderer, &style, observer_state, deadline)?;
+            load_style_json(renderer, &style)?;
             *loaded_style = Some(style.revision.clone());
             *slots =
                 populate_static_slots(renderer).map_err(|err| RendererError::StyleLoadFailed {
@@ -675,7 +693,6 @@ impl MapLibreNativeBackend {
         &mut self,
         key: RendererKey,
         size: maplibre_native::Size,
-        deadline: Instant,
     ) -> Result<&mut maplibre_native::ImageRenderer<maplibre_native::Tile>, RendererError> {
         let style = self.style()?.clone();
         let needs_rebuild = !matches!(
@@ -685,19 +702,15 @@ impl MapLibreNativeBackend {
         if needs_rebuild {
             let mut renderer = build_renderer(key, size, self.ambient_cache_path.as_deref())?
                 .build_tile_renderer();
-            let observer_state = ObserverState::default();
-            install_map_observer(&mut renderer, observer_state.clone());
-            load_style_json(&mut renderer, &style, &observer_state, deadline)?;
+            load_style_json(&mut renderer, &style)?;
             self.active_renderer = Some(ActiveRenderer::Tile {
                 key,
                 loaded_style: Some(style.revision.clone()),
-                observer_state,
                 renderer,
             });
         }
         let Some(ActiveRenderer::Tile {
             loaded_style,
-            observer_state,
             renderer,
             ..
         }) = self.active_renderer.as_mut()
@@ -705,7 +718,7 @@ impl MapLibreNativeBackend {
             unreachable!("tile renderer was inserted")
         };
         if loaded_style.as_ref() != Some(&style.revision) {
-            load_style_json(renderer, &style, observer_state, deadline)?;
+            load_style_json(renderer, &style)?;
             *loaded_style = Some(style.revision.clone());
         }
         renderer.set_map_size(size);
@@ -717,12 +730,12 @@ impl MapLibreNativeBackend {
             RenderRequest::Tile { tile_size, .. } => {
                 let key = RendererKey::new(crate::types::RenderMode::Tile, task.pixel_ratio);
                 let size = render_size(tile_size, tile_size)?;
-                self.ensure_tile_renderer(key, size, task.deadline)?;
+                self.ensure_tile_renderer(key, size)?;
             }
             RenderRequest::StaticImage { width, height, .. } => {
                 let key = RendererKey::new(crate::types::RenderMode::Static, task.pixel_ratio);
                 let size = render_size(width, height)?;
-                self.ensure_static_renderer(key, size, task.deadline)?;
+                self.ensure_static_renderer(key, size)?;
             }
         }
         Ok(())
@@ -740,60 +753,6 @@ impl MapLibreNativeBackend {
     }
 }
 
-#[derive(Clone, Default)]
-struct ObserverState {
-    inner: Arc<Mutex<ObserverFlags>>,
-}
-
-#[derive(Default)]
-struct ObserverFlags {
-    style_loaded: bool,
-    failure: Option<MapLoadFailure>,
-}
-
-#[derive(Clone, Debug)]
-struct MapLoadFailure {
-    error: maplibre_native::MapLoadError,
-}
-
-struct ObserverSnapshot {
-    style_loaded: bool,
-    failure: Option<MapLoadFailure>,
-}
-
-impl ObserverState {
-    fn start_loading(&self) {
-        let mut flags = lock_observer_flags(&self.inner);
-        flags.style_loaded = false;
-        flags.failure = None;
-    }
-
-    fn finish_loading_style(&self) {
-        let mut flags = lock_observer_flags(&self.inner);
-        flags.style_loaded = true;
-    }
-
-    fn fail_loading_map(&self, error: maplibre_native::MapLoadError) {
-        let mut flags = lock_observer_flags(&self.inner);
-        flags.style_loaded = false;
-        flags.failure = Some(MapLoadFailure { error });
-    }
-
-    fn snapshot(&self) -> ObserverSnapshot {
-        let flags = lock_observer_flags(&self.inner);
-        ObserverSnapshot {
-            style_loaded: flags.style_loaded,
-            failure: flags.failure.clone(),
-        }
-    }
-}
-
-fn lock_observer_flags(mutex: &Mutex<ObserverFlags>) -> MutexGuard<'_, ObserverFlags> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 impl BlockingRenderBackend for MapLibreNativeBackend {
     fn load_profile(
         &mut self,
@@ -804,13 +763,14 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
         self.ensure_renderer_for_task(task)
     }
 
-    fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
-        let image = match task.request {
+    fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
+        let (image, source_setup_duration) = match task.request {
             RenderRequest::Tile { z, x, y, tile_size } => {
                 let key = RendererKey::new(crate::types::RenderMode::Tile, task.pixel_ratio);
                 let size = render_size(tile_size, tile_size)?;
-                self.ensure_tile_renderer(key, size, task.deadline)?
+                self.ensure_tile_renderer(key, size)?
                     .render_tile(z, x, y)
+                    .map(|image| (image, None))
             }
             RenderRequest::StaticImage {
                 positioning:
@@ -830,8 +790,7 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
             } => {
                 let key = RendererKey::new(crate::types::RenderMode::Static, task.pixel_ratio);
                 let size = render_size(width, height)?;
-                let (renderer, slots, addlayer_sources) =
-                    self.ensure_static_renderer(key, size, task.deadline)?;
+                let (renderer, slots, addlayer_sources) = self.ensure_static_renderer(key, size)?;
                 let camera = maplibre_native::CameraUpdate::new()
                     .center(maplibre_native::LatLng { lat, lng: lon })
                     .zoom(zoom)
@@ -865,8 +824,7 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
             } => {
                 let key = RendererKey::new(crate::types::RenderMode::Static, task.pixel_ratio);
                 let size = render_size(width, height)?;
-                let (renderer, slots, addlayer_sources) =
-                    self.ensure_static_renderer(key, size, task.deadline)?;
+                let (renderer, slots, addlayer_sources) = self.ensure_static_renderer(key, size)?;
                 let bounds = maplibre_native::LatLngBounds {
                     southwest: maplibre_native::LatLng {
                         lat: min_lat,
@@ -905,8 +863,7 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
             } => {
                 let key = RendererKey::new(crate::types::RenderMode::Static, task.pixel_ratio);
                 let size = render_size(width, height)?;
-                let (renderer, slots, addlayer_sources) =
-                    self.ensure_static_renderer(key, size, task.deadline)?;
+                let (renderer, slots, addlayer_sources) = self.ensure_static_renderer(key, size)?;
                 // Build the overlay geometry collection once and ask mbgl
                 // for a camera that fits it. The same overlays then get
                 // installed by `assign_slots` below — that re-builds a
@@ -938,7 +895,10 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
         }
         .map_err(|err| RendererError::RenderFailed(err.to_string()))?;
 
-        encode_image(&image, task.output_format)
+        Ok(RendererOutput {
+            output: encode_image(&image, task.output_format)?,
+            source_setup_duration,
+        })
     }
 
     fn error_invalidates_loaded_state(&self, err: &RendererError) -> bool {
@@ -973,21 +933,6 @@ fn build_renderer(
     Ok(builder)
 }
 
-fn install_map_observer<S>(renderer: &mut maplibre_native::ImageRenderer<S>, state: ObserverState) {
-    let observer = renderer.map_observer();
-    observer.set_will_start_loading_map_callback({
-        let state = state.clone();
-        move || state.start_loading()
-    });
-    observer.set_did_finish_loading_style_callback({
-        let state = state.clone();
-        move || state.finish_loading_style()
-    });
-    observer.set_did_fail_loading_map_callback(move |error| {
-        state.fail_loading_map(error);
-    });
-}
-
 fn render_size(width: u16, height: u16) -> Result<maplibre_native::Size, RendererError> {
     if width == 0 || height == 0 {
         return Err(RendererError::RenderFailed(
@@ -1003,43 +948,14 @@ fn render_size(width: u16, height: u16) -> Result<maplibre_native::Size, Rendere
 fn load_style_json<S>(
     renderer: &mut maplibre_native::ImageRenderer<S>,
     style: &ResolvedStyle,
-    observer_state: &ObserverState,
-    deadline: Instant,
 ) -> Result<(), RendererError> {
-    observer_state.start_loading();
-    // load_style_from_json_str returns a non-Send request handle; immediate
-    // drop is fine. Completion is observed via did_finish_loading_style and
-    // wait_for_style_load's tick loop.
-    let _ = renderer.load_style_from_json_str(&style.style_json);
-    wait_for_style_load(observer_state, style, deadline)
-}
-
-fn wait_for_style_load(
-    state: &ObserverState,
-    style: &ResolvedStyle,
-    deadline: Instant,
-) -> Result<(), RendererError> {
-    let run_loop = maplibre_native::RunLoopHandle::current();
-    loop {
-        let snapshot = state.snapshot();
-        if let Some(failure) = snapshot.failure {
-            return Err(style_load_failure(&style.revision, failure));
-        }
-        if snapshot.style_loaded {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(RendererError::Timeout);
-        }
-        run_loop.tick();
-    }
-}
-
-fn style_load_failure(revision: &StyleRevision, failure: MapLoadFailure) -> RendererError {
-    RendererError::StyleLoadFailed {
-        style_id: revision.id.clone(),
-        source: failure.error.to_string(),
-    }
+    renderer
+        .load_style_from_json_str(&style.style_json)
+        .wait()
+        .map_err(|error| RendererError::StyleLoadFailed {
+            style_id: style.revision.id.clone(),
+            source: error.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -1058,11 +974,12 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             Ok(RenderOutput {
                 bytes: vec![task.id as u8].into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1077,12 +994,13 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             std::thread::sleep(std::time::Duration::from_millis(50));
             Ok(RenderOutput {
                 bytes: vec![task.id as u8].into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1099,11 +1017,12 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             Ok(RenderOutput {
                 bytes: vec![task.id as u8].into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1128,7 +1047,7 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, _task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, _task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             Err(RendererError::RenderFailed(
                 "test render failure".to_string(),
             ))
@@ -1153,7 +1072,7 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, _task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, _task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             panic!("synthetic renderer panic");
         }
 
@@ -1415,8 +1334,8 @@ mod tests {
             .expect("profile loads");
         let output = actor.render(task).await.expect("render succeeds");
 
-        assert_eq!(output.bytes.as_ref(), &[7]);
-        assert_eq!(output.format, ImageFormat::Png);
+        assert_eq!(output.output.bytes.as_ref(), &[7]);
+        assert_eq!(output.output.format, ImageFormat::Png);
         assert!(actor.is_alive());
     }
 
@@ -1535,6 +1454,43 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(supervisor.snapshot().orphaned_threads, 0);
+    }
+
+    #[test]
+    fn orphan_budget_is_fair_across_workers() {
+        let supervisor = RendererActorSupervisor::new(2);
+
+        assert!(supervisor.try_reserve_orphan(7));
+        assert!(
+            !supervisor.try_reserve_orphan(7),
+            "one hot worker must not consume another slot's orphan budget"
+        );
+        assert!(supervisor.try_reserve_orphan(8));
+        assert_eq!(supervisor.snapshot().orphaned_threads, 2);
+
+        supervisor.release_orphan(7);
+        assert!(supervisor.try_reserve_orphan(7));
+        supervisor.release_orphan(7);
+        supervisor.release_orphan(8);
+        assert_eq!(supervisor.snapshot().orphaned_threads, 0);
+    }
+
+    #[test]
+    fn exhausted_orphan_budget_does_not_leave_a_partially_dead_node_livable() {
+        let supervisor = RendererActorSupervisor::new(2);
+        let mut first_slot_available = true;
+
+        supervisor.set_slot_available(&mut first_slot_available, false);
+        supervisor.exhaust_orphan_budget_for_test();
+
+        assert!(
+            supervisor.is_ready(),
+            "one healthy slot still serves readiness"
+        );
+        assert!(
+            !supervisor.is_livable(),
+            "a permanently lost slot at exhausted budget needs process recovery"
+        );
     }
 
     #[tokio::test]

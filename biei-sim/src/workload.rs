@@ -24,6 +24,11 @@ use biei::types::{
     SourceHash, SourceRef, StyleId, StyleRevision,
 };
 
+pub(crate) struct WorkloadSummary {
+    pub submitted_total: u64,
+    pub submitted_measured: u64,
+}
+
 pub(crate) async fn run_workload(
     config: WorkloadConfig,
     cluster: &mut WorkloadCluster,
@@ -31,12 +36,13 @@ pub(crate) async fn run_workload(
     activity: Arc<ProfileActivityTracker>,
     seed: u64,
     mut churn: Option<&mut ChurnTracker>,
-) -> Result<u64> {
+) -> Result<WorkloadSummary> {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let start = Instant::now();
     let deadline = start + config.duration;
     let record_after = start + config.warmup;
     let mut next_id: u64 = 0;
+    let mut measured_next_id: u64 = 0;
     let mut style_count = config.style_count.max(1);
 
     let mut next_new_style_at: Option<Instant> = if config.new_style_rate > 0.0 {
@@ -98,8 +104,11 @@ pub(crate) async fn run_workload(
         }
 
         for _ in 0..n_tasks {
-            if let Some(tracker) = churn.as_deref_mut() {
-                tracker.before_request(cluster, &metrics, next_id).await?;
+            let measured = now >= record_after;
+            if measured && let Some(tracker) = churn.as_deref_mut() {
+                tracker
+                    .before_request(cluster, &metrics, measured_next_id)
+                    .await?;
             }
             let style = sample_style(
                 now,
@@ -142,15 +151,17 @@ pub(crate) async fn run_workload(
             };
             activity.record(task.worker_profile(), now);
             next_id += 1;
+            if measured {
+                measured_next_id += 1;
+            }
 
             let (node, counters) = cluster.select(&mut rng);
-            counters.submit();
+            counters.submit(measured);
             let m = metrics.clone();
-            let task_arrived_at = task.arrived_at;
             inflight.spawn(async move {
                 let outcome = node.handle_incoming(task).await;
-                counters.record(&outcome);
-                if task_arrived_at >= record_after {
+                counters.record(&outcome, measured);
+                if measured {
                     m.record(outcome);
                 }
             });
@@ -159,9 +170,12 @@ pub(crate) async fn run_workload(
 
     while inflight.join_next().await.is_some() {}
     if let Some(tracker) = churn {
-        tracker.before_request(cluster, &metrics, next_id).await?;
+        tracker.after_workload(cluster, &metrics);
     }
-    Ok(next_id)
+    Ok(WorkloadSummary {
+        submitted_total: next_id,
+        submitted_measured: measured_next_id,
+    })
 }
 
 fn render_request_for_style(style: u32, tile_style_count: usize) -> RenderRequest {

@@ -84,22 +84,23 @@ impl ClusterViewCache {
 
     async fn get_or_load(&self, gossip: &dyn GossipBus) -> Arc<ClusterView> {
         loop {
+            // Avoid constructing a watch receiver on the normal fresh-cache
+            // path. The second check below closes the completion race before
+            // a caller can wait.
+            if let Some(view) = {
+                let state = lock_unpoisoned(&self.state);
+                usable_cached_view(&state)
+            } {
+                return view;
+            }
+
             let mut changed = self.changed.subscribe();
             let should_load = {
                 let mut state = lock_unpoisoned(&self.state);
-                if let Some(cached) = state
-                    .cached
-                    .as_ref()
-                    .filter(|cached| cached.expires_at > Instant::now())
-                {
-                    return Arc::clone(&cached.view);
+                if let Some(view) = usable_cached_view(&state) {
+                    return view;
                 }
                 if state.loading {
-                    if let Some(cached) = &state.cached {
-                        // A bounded stale snapshot is preferable to making a
-                        // request wait behind a gossip refresh.
-                        return Arc::clone(&cached.view);
-                    }
                     false
                 } else {
                     state.loading = true;
@@ -119,6 +120,13 @@ impl ClusterViewCache {
             let _ = changed.changed().await;
         }
     }
+}
+
+fn usable_cached_view(state: &ClusterViewCacheState) -> Option<Arc<ClusterView>> {
+    let cached = state.cached.as_ref()?;
+    // A bounded stale snapshot is preferable to making a request wait behind
+    // the single refresh already in progress.
+    (cached.expires_at > Instant::now() || state.loading).then(|| Arc::clone(&cached.view))
 }
 
 struct ClusterViewLoad<'a> {
@@ -305,6 +313,13 @@ impl Node {
         self.inner.pool.cpu_permits_inuse()
     }
 
+    /// Tasks currently executing locally on this node's workers (render permit
+    /// held, any stage). Zero means the node has no in-flight *local* work —
+    /// the signal the simulator uses to reap a fully-drained node.
+    pub fn render_permits_inuse(&self) -> usize {
+        self.inner.pool.render_permits_inuse()
+    }
+
     /// Entry point: workload / external client lands here. Dispatcher
     /// decides; we either dispatch locally, forward to another node and
     /// await its outcome, or reject.
@@ -322,7 +337,7 @@ impl Node {
         let arrived_at = task.arrived_at;
         let task_id = task.id;
         let request_id = task.request_id.clone();
-        let had_source = task.source.is_some();
+        let had_source = task.has_source();
 
         if tokio::time::Instant::now() >= task.deadline {
             tracing::debug!(
@@ -448,7 +463,7 @@ impl Node {
         let now = tokio::time::Instant::now();
         let task_id = wire_task.id;
         let request_id = wire_task.request_id.clone();
-        let had_source = wire_task.source.is_some();
+        let had_source = wire_task.source.is_some() || wire_task.request.has_addlayer_source();
         if !self.inner.style_catalog.accepts_revision(&wire_task.style) {
             tracing::debug!(
                 task_id,
@@ -547,7 +562,7 @@ impl Node {
                                 task.id,
                                 task.request_id.clone(),
                                 task.arrived_at,
-                                task.source.is_some(),
+                                task.has_source(),
                                 RejectionReason::DeadlineExceeded,
                             ));
                         }
@@ -561,7 +576,12 @@ impl Node {
         &self,
         task: &InternalTask,
     ) -> Result<Option<PreparedProfile>, crate::types::RendererError> {
-        self.inner.profile_preparer.prepare_profile(task).await
+        let started_at = Instant::now();
+        let result = self.inner.profile_preparer.prepare_profile(task).await;
+        self.inner
+            .metrics
+            .record_profile_prepare(started_at.elapsed(), result.is_ok());
+        result
     }
 
     async fn process_local_task(
@@ -625,9 +645,8 @@ impl Node {
         let task_id = task.id;
         let request_id = task.request_id.clone();
         let arrived_at = task.arrived_at;
-        let had_source = task.source.is_some();
-        let fallback_task = task.clone();
-        let mut forwarded_task = task;
+        let had_source = task.has_source();
+        let forwarded_task = task;
 
         if forwarded_task.forwarding_hops >= MAX_FORWARDING_HOPS {
             tracing::debug!(
@@ -655,8 +674,6 @@ impl Node {
             );
         }
 
-        forwarded_task.forwarding_hops = forwarded_task.forwarding_hops.saturating_add(1);
-
         let mut last_retryable_rejection: Option<RejectionReason> = None;
         let mut saw_transport_failure = false;
 
@@ -676,7 +693,7 @@ impl Node {
             let drain_worker = candidate.drain_worker;
             let fwd = ForwardRequest {
                 task: forwarded_task
-                    .to_wire_with_hop_latency(tokio::time::Instant::now(), self.inner.hop_latency),
+                    .to_forward_wire(tokio::time::Instant::now(), self.inner.hop_latency),
                 route_tier,
                 drain_worker,
             };
@@ -737,7 +754,7 @@ impl Node {
                 ?reason,
                 "all forward candidates rejected retryably; trying local overflow fallback"
             );
-            let prepared_profile = match self.prepare_local_profile(&fallback_task).await {
+            let prepared_profile = match self.prepare_local_profile(&forwarded_task).await {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     return fail(
@@ -752,7 +769,7 @@ impl Node {
             };
             return match self
                 .process_local_task(
-                    fallback_task,
+                    forwarded_task,
                     prepared_profile,
                     RouteTier::Tier4Overflow,
                     None,
@@ -899,7 +916,7 @@ mod tests {
     use tokio::time::Instant;
 
     use crate::config::{CostRange, Tier1Strategy};
-    use crate::renderer::{BoxRenderer, Renderer};
+    use crate::renderer::{BoxRenderer, Renderer, RendererOutput};
     use crate::types::{
         ClusterView, ImageFormat, InternalTask, NodeStateView, PixelRatio, RenderOutput,
         RenderRequest, RendererError, Scale, SourceHash, StyleId, StyleRevision, TaskId, WorkerId,
@@ -1072,12 +1089,13 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             self.renders.fetch_add(1, Ordering::SeqCst);
             Ok(RenderOutput {
                 bytes: vec![task.request_id.as_str().len() as u8].into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1098,7 +1116,7 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, _task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, _task: &InternalTask) -> Result<RendererOutput, RendererError> {
             panic!("render must not run after style setup fails")
         }
     }
@@ -1124,7 +1142,7 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             if let Some(notify) = &self.render_started {
                 notify.notify_one();
             }
@@ -1134,7 +1152,8 @@ mod tests {
             Ok(RenderOutput {
                 bytes: vec![task.id as u8].into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1195,7 +1214,9 @@ mod tests {
             costs: CostConfig {
                 style_setup_cost: CostRange::fixed(Duration::from_millis(1)),
                 source_load_cost: CostRange::fixed(Duration::from_millis(1)),
-                render_cost: CostRange::fixed(Duration::from_millis(1)),
+                render_cpu_cost: CostRange::fixed(Duration::from_millis(1)),
+                render_resource_cost: CostRange::fixed(Duration::ZERO),
+                first_render_resource_cost: CostRange::fixed(Duration::ZERO),
                 hop_latency: Duration::ZERO,
                 sla: Duration::from_secs(1),
             },
@@ -1290,7 +1311,9 @@ mod tests {
             costs: CostConfig {
                 style_setup_cost: CostRange::fixed(Duration::from_millis(1)),
                 source_load_cost: CostRange::fixed(Duration::from_millis(1)),
-                render_cost: CostRange::fixed(Duration::from_millis(1)),
+                render_cpu_cost: CostRange::fixed(Duration::from_millis(1)),
+                render_resource_cost: CostRange::fixed(Duration::ZERO),
+                first_render_resource_cost: CostRange::fixed(Duration::ZERO),
                 hop_latency: Duration::ZERO,
                 sla: Duration::from_secs(1),
             },

@@ -298,20 +298,20 @@ pub fn large_scale_16cores_with_slots(
     cfg
 }
 
-/// `large_scale_16cores` with fixed warm slots and CPU render permits, but a
-/// variable task execution permit count. Used to test I/O overlap above core
-/// count without increasing render/encode parallelism.
+/// `large_scale_16cores` with fixed warm slots and native-render residency
+/// permits, but a variable task execution permit count. Actual CPU service is
+/// capped independently by `SimConfig::cpu_cores_per_node`.
 pub fn large_scale_16cores_with_execution_permits(
     total_rate: f64,
     publish_interval: Duration,
     renderer_slots_per_node: usize,
     render_permits_per_node: usize,
-    cpu_render_permits_per_node: usize,
+    native_render_permits_per_node: usize,
 ) -> SimConfig {
     let mut cfg = large_scale_16cores(total_rate, publish_interval);
     cfg.cluster.renderer_slots_per_node = renderer_slots_per_node;
     cfg.cluster.render_permits_per_node = Some(render_permits_per_node);
-    cfg.cluster.cpu_render_permits_per_node = Some(cpu_render_permits_per_node);
+    cfg.cluster.cpu_render_permits_per_node = Some(native_render_permits_per_node);
     cfg
 }
 

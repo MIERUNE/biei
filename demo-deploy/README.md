@@ -113,6 +113,9 @@ in-cluster isolation.
 ## Checks
 
 ```sh
+# Render the GKE overlay offline and verify its portable CPU-only HPA policy.
+bash demo-deploy/check-hpa.sh
+
 kubectl -n map-demo port-forward deploy/biei 8080:8080
 
 curl 'http://localhost:8080/carto/voyager-gl-style/static/[139.6,35.6,139.9,35.8]/512x384.webp?padding=20' -o bbox.webp
@@ -139,4 +142,5 @@ curl -s localhost:9090/_internal/metrics
   membership.
 - The headless gossip Service uses `publishNotReadyAddresses: true` so pods can
   discover each other during cold start.
-- Software rendering is CPU-bound. Tune `BIEI_CORES` and CPU limits together.
+- Rendering combines CPU work with in-render provider I/O. Tune `BIEI_CORES`
+  and CPU limits together, but do not infer queue health from CPU alone.

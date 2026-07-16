@@ -25,6 +25,10 @@ pub async fn run() -> anyhow::Result<()> {
         crate::renderer::file_source::register_file_sources(
             options.mln_resource_cache_capacity_bytes,
             options.mln_resource_private_hosts.clone(),
+            crate::renderer::file_source::FileSourceIoPermits {
+                regular: options.mln_regular_permits,
+                body: options.mln_body_permits,
+            },
         )?;
     }
     let runtime = if options.cluster {

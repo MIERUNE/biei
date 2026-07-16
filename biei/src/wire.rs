@@ -13,8 +13,9 @@ use tokio::time::Instant;
 
 use crate::types::{
     CachePolicy, CompletedInfo, DeadlineStage, FailureKind, ImageFormat, InternalTask,
-    RejectionReason, RenderOutput, RenderRequest, RequestId, RouteTier, Scale, SourceHash,
-    SourceRef, StyleId, StyleRevision, TaskId, TaskOutcome, TaskResult, WorkerId,
+    RejectionReason, RenderMode, RenderObservation, RenderOutput, RenderRequest, RequestId,
+    RouteTier, Scale, SourceHash, SourceRef, StyleId, StyleRevision, TaskId, TaskOutcome,
+    TaskResult, WorkerId,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +90,12 @@ impl InternalTask {
             forwarding_hops: self.forwarding_hops,
         }
     }
+
+    pub fn to_forward_wire(&self, now: Instant, hop_latency: Duration) -> WireTask {
+        let mut wire = self.to_wire_with_hop_latency(now, hop_latency);
+        wire.forwarding_hops = self.forwarding_hops.saturating_add(1);
+        wire
+    }
 }
 
 impl WireTask {
@@ -140,6 +147,9 @@ pub enum OutcomeResult {
         #[serde(default)]
         worker_id: Option<WorkerId>,
         route_tier: RouteTier,
+        /// Peer-local elapsed times measured from the peer's reconstructed
+        /// arrival. The origin preserves their differences but anchors the
+        /// timeline at its actual response receipt time.
         render_started_ms: u64,
         cpu_started_ms: u64,
         cpu_completed_ms: u64,
@@ -148,6 +158,8 @@ pub enum OutcomeResult {
         cold_start: bool,
         source_loaded: bool,
         admitted_at_overflow: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_observation: Option<WireRenderObservation>,
     },
     Rejected {
         reason: RejectionReason,
@@ -161,6 +173,47 @@ pub enum OutcomeResult {
         #[serde(default)]
         kind: FailureKind,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireRenderObservation {
+    pub render_mode: RenderMode,
+    pub scale: Scale,
+    pub output_format: ImageFormat,
+    pub width: u16,
+    pub height: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_setup_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_setup_ms: Option<u64>,
+}
+
+impl From<RenderObservation> for WireRenderObservation {
+    fn from(observation: RenderObservation) -> Self {
+        Self {
+            render_mode: observation.render_mode,
+            scale: observation.scale,
+            output_format: observation.output_format,
+            width: observation.width,
+            height: observation.height,
+            style_setup_ms: observation.style_setup_duration.map(duration_millis),
+            source_setup_ms: observation.source_setup_duration.map(duration_millis),
+        }
+    }
+}
+
+impl From<WireRenderObservation> for RenderObservation {
+    fn from(observation: WireRenderObservation) -> Self {
+        Self {
+            render_mode: observation.render_mode,
+            scale: observation.scale,
+            output_format: observation.output_format,
+            width: observation.width,
+            height: observation.height,
+            style_setup_duration: observation.style_setup_ms.map(Duration::from_millis),
+            source_setup_duration: observation.source_setup_ms.map(Duration::from_millis),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,8 +303,13 @@ impl ForwardResponse {
 
     /// Convert a wire response back into the current in-process outcome.
     pub fn into_task_outcome(self, arrived_at: Instant) -> TaskOutcome {
+        // The peer's offsets use its own monotonic clock and therefore only
+        // describe durations within the peer. Anchor them at the time the full
+        // response reached this process so end-to-end latency also includes
+        // request and response transport.
+        let received_at = Instant::now();
         let ForwardResponse { outcome, output } = self;
-        outcome.into_task_outcome(arrived_at, output)
+        outcome.into_task_outcome(arrived_at, received_at, output)
     }
 
     pub fn rejected_reason(&self) -> Option<RejectionReason> {
@@ -294,6 +352,7 @@ impl OutcomeHeader {
                     cold_start: info.cold_start,
                     source_loaded: info.source_loaded,
                     admitted_at_overflow: info.admitted_at_overflow,
+                    render_observation: info.render_observation.map(Into::into),
                 }
             }
             TaskResult::Rejected { reason } => OutcomeResult::Rejected {
@@ -319,6 +378,7 @@ impl OutcomeHeader {
     pub fn into_task_outcome(
         self,
         arrived_at: Instant,
+        received_at: Instant,
         output: Option<RenderOutput>,
     ) -> TaskOutcome {
         let OutcomeHeader {
@@ -342,11 +402,21 @@ impl OutcomeHeader {
                 cold_start,
                 source_loaded,
                 admitted_at_overflow,
+                render_observation,
             } => {
-                let started_at = arrived_at + Duration::from_millis(render_started_ms);
-                let cpu_started_at = arrived_at + Duration::from_millis(cpu_started_ms);
-                let cpu_completed_at = arrived_at + Duration::from_millis(cpu_completed_ms);
-                let completed_at = arrived_at + Duration::from_millis(completed_ms);
+                let completed_at = received_at.max(arrived_at);
+                let peer_duration = Duration::from_millis(completed_ms);
+                let peer_arrived_at = completed_at
+                    .checked_sub(peer_duration)
+                    .unwrap_or(arrived_at)
+                    .max(arrived_at);
+                let peer_duration = completed_at.duration_since(peer_arrived_at);
+                let peer_offset = |offset_ms| {
+                    peer_arrived_at + Duration::from_millis(offset_ms).min(peer_duration)
+                };
+                let started_at = peer_offset(render_started_ms);
+                let cpu_started_at = peer_offset(cpu_started_ms);
+                let cpu_completed_at = peer_offset(cpu_completed_ms);
                 if let Some(output) = output {
                     TaskResult::Completed {
                         info: CompletedInfo {
@@ -361,6 +431,7 @@ impl OutcomeHeader {
                             cold_start,
                             source_loaded,
                             admitted_at_overflow,
+                            render_observation: render_observation.map(Into::into),
                         },
                         output,
                     }
@@ -407,10 +478,11 @@ impl OutcomeHeader {
 }
 
 fn millis_since(instant: Instant, base: Instant) -> u64 {
-    instant
-        .saturating_duration_since(base)
-        .as_millis()
-        .min(u64::MAX as u128) as u64
+    duration_millis(instant.saturating_duration_since(base))
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 #[cfg(test)]
@@ -462,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_budget_subtracts_forward_hop_latency() {
+    fn forward_wire_increments_hop_and_subtracts_hop_latency() {
         let now = Instant::now();
         let task = InternalTask {
             id: 42,
@@ -482,12 +554,13 @@ mod tests {
             forwarding_hops: 1,
         };
 
-        let wire = task.to_wire_with_hop_latency(now, Duration::from_millis(125));
+        let wire = task.to_forward_wire(now, Duration::from_millis(125));
         assert_eq!(wire.remaining_budget_ms, 2875);
+        assert_eq!(wire.forwarding_hops, 2);
     }
 
-    #[test]
-    fn forward_response_reconstructs_peer_times_from_arrival_offsets() {
+    #[tokio::test(start_paused = true)]
+    async fn forward_response_latency_includes_transport_time() {
         let now = Instant::now();
         let response = ForwardResponse {
             outcome: OutcomeHeader {
@@ -508,6 +581,7 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: None,
                 },
             },
             output: Some(RenderOutput {
@@ -516,14 +590,19 @@ mod tests {
             }),
         };
 
+        tokio::time::advance(Duration::from_millis(150)).await;
         let outcome = response.into_task_outcome(now);
         let TaskResult::Completed { info, output } = outcome.result else {
             panic!("expected completed outcome");
         };
-        assert_eq!(info.started_at, now + Duration::from_millis(25));
-        assert_eq!(info.cpu_started_at, now + Duration::from_millis(40));
-        assert_eq!(info.cpu_completed_at, now + Duration::from_millis(70));
-        assert_eq!(info.completed_at, now + Duration::from_millis(100));
+        // The peer took 100 ms from its own arrival to completion. The full
+        // origin-side request took 150 ms, so the remaining 50 ms is transport
+        // time. Anchor the peer offsets at receipt while preserving its stage
+        // durations.
+        assert_eq!(info.started_at, now + Duration::from_millis(75));
+        assert_eq!(info.cpu_started_at, now + Duration::from_millis(90));
+        assert_eq!(info.cpu_completed_at, now + Duration::from_millis(120));
+        assert_eq!(info.completed_at, now + Duration::from_millis(150));
         assert_eq!(output.format, ImageFormat::Png);
     }
 
@@ -549,6 +628,7 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: None,
                 },
                 output: RenderOutput {
                     bytes: vec![1, 2, 3].into(),
@@ -615,12 +695,22 @@ mod tests {
                 cold_start: false,
                 source_loaded: false,
                 admitted_at_overflow: false,
+                render_observation: Some(WireRenderObservation {
+                    render_mode: RenderMode::Static,
+                    scale: Scale::X2,
+                    output_format: ImageFormat::Png,
+                    width: 640,
+                    height: 360,
+                    style_setup_ms: Some(42),
+                    source_setup_ms: Some(7),
+                }),
             },
         };
         let json = serde_json::to_string(&completed).expect("completed header JSON");
         assert!(json.contains("\"completed\""));
         let decoded: OutcomeHeader = serde_json::from_str(&json).expect("completed decodes");
         assert_eq!(decoded.completed_format(), Some(ImageFormat::Png));
+        assert_eq!(decoded, completed);
 
         let rejected = OutcomeHeader {
             task_id: 2,
@@ -716,6 +806,7 @@ mod tests {
                 cold_start: false,
                 source_loaded: true,
                 admitted_at_overflow: false,
+                render_observation: None,
             },
         };
         let image = [1, 2, 3, 4, 5];

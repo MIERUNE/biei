@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match the Ubuntu 24.04 production image and avoid rebuilding mbgl-core in
+  # every runner. Runtime compatibility still belongs to the container smoke
+  # test; this job covers compilation, unit/integration tests, and linting.
+  MLN_PRECOMPILE: "1"
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libssl-dev libcurl4-openssl-dev \
+            libjpeg-dev libpng-dev libwebp-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libuv1-dev libicu-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-gl-opengl-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-gl-opengl-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace --locked --features biei/gl-opengl
+
+      - name: Test workspace
+        run: cargo test --workspace --locked --features biei/gl-opengl
+
+      - name: Lint workspace
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --features biei/gl-opengl -- -D warnings
+
+  manifests:
+    name: Deployment manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.0
+
+      - name: Check shell syntax
+        run: bash -n demo-deploy/check-hpa.sh demo-deploy/smoke.sh scripts/dev-cluster.sh
+
+      - name: Check portable HPA overlay
+        run: bash demo-deploy/check-hpa.sh

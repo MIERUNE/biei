@@ -156,10 +156,10 @@
           if (hasLabel(m.labels, 'outcome', 'hit')) out.cacheHit += m.value;
           else if (hasLabel(m.labels, 'outcome', 'miss')) out.cacheMiss += m.value;
           break;
-        case 'biei_cpu_render_duration_seconds_sum':
+        case 'biei_native_render_duration_seconds_sum':
           out.renderSum += m.value;
           break;
-        case 'biei_cpu_render_duration_seconds_count':
+        case 'biei_native_render_duration_seconds_count':
           out.renderCount += m.value;
           break;
         case 'biei_cpu_permits_inuse':

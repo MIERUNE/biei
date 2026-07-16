@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -445,6 +446,19 @@ impl RenderRequest {
             RenderRequest::StaticImage { .. } => RenderMode::Static,
         }
     }
+
+    pub fn has_addlayer_source(&self) -> bool {
+        matches!(
+            self,
+            RenderRequest::StaticImage {
+                addlayer: Some(AddLayer {
+                    source: Some(_),
+                    ..
+                }),
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
@@ -465,9 +479,9 @@ pub struct InternalTask {
     /// warm judgment use this together with request mode and scale via
     /// `worker_profile()`.
     pub style: StyleRevision,
-    /// Optional addlayer source (= the one inline source the request brings
-    /// beyond what the base style provides). `None` for tasks that render
-    /// the base style alone.
+    /// Optional modeled source reference used by the shared worker/simulator
+    /// path. Production addlayer sources live in `request` and are resolved by
+    /// the profile preparer before rendering.
     pub source: Option<SourceRef>,
     pub request: RenderRequest,
     /// MapLibre / maplibre-native internal name for the device-pixel
@@ -492,6 +506,10 @@ impl InternalTask {
             render_mode: self.request.render_mode(),
             scale: self.pixel_ratio.to_scale(),
         }
+    }
+
+    pub fn has_source(&self) -> bool {
+        self.source.is_some() || self.request.has_addlayer_source()
     }
 }
 
@@ -633,7 +651,7 @@ pub struct TaskOutcome {
     pub task_id: TaskId,
     pub request_id: RequestId,
     pub arrived_at: Instant,
-    /// Whether the task carried an addlayer source.
+    /// Whether the task carried either a modeled source or an addlayer source.
     pub had_source: bool,
     /// Stage where a deadline rejection happened, when known.
     pub deadline_stage: Option<DeadlineStage>,
@@ -715,7 +733,7 @@ pub struct CompletedInfo {
     pub completed_at: Instant,
     pub style_swap: bool,
     pub cold_start: bool,
-    /// True if the task's addlayer source was a cache miss and had to be
+    /// True if a modeled or addlayer source was a cache miss and had to be
     /// loaded. False if it hit the cache or the task had no source.
     pub source_loaded: bool,
     /// True if the task was admitted when the chosen worker's queue had
@@ -723,6 +741,47 @@ pub struct CompletedInfo {
     /// leaning on the overflow band between soft and hard limits rather than
     /// refusing the request.
     pub admitted_at_overflow: bool,
+    /// Bounded-cardinality render metadata and stage durations used to
+    /// calibrate the simulator from production metrics. Cache hits have no
+    /// render observation because they bypass the worker entirely.
+    pub render_observation: Option<RenderObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderObservation {
+    pub render_mode: RenderMode,
+    pub scale: Scale,
+    pub output_format: ImageFormat,
+    /// Logical output dimensions. `scale` carries the device-pixel multiplier.
+    pub width: u16,
+    pub height: u16,
+    /// Present only when this request changed the worker profile.
+    pub style_setup_duration: Option<Duration>,
+    /// Present only when a modeled or addlayer source cache miss required
+    /// setup.
+    pub source_setup_duration: Option<Duration>,
+}
+
+impl RenderObservation {
+    pub fn from_task(
+        task: &InternalTask,
+        style_setup_duration: Option<Duration>,
+        source_setup_duration: Option<Duration>,
+    ) -> Self {
+        let (width, height) = match &task.request {
+            RenderRequest::Tile { tile_size, .. } => (*tile_size, *tile_size),
+            RenderRequest::StaticImage { width, height, .. } => (*width, *height),
+        };
+        Self {
+            render_mode: task.request.render_mode(),
+            scale: task.pixel_ratio.to_scale(),
+            output_format: task.output_format,
+            width,
+            height,
+            style_setup_duration,
+            source_setup_duration,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,7 +816,7 @@ impl std::fmt::Display for RendererError {
 impl std::error::Error for RendererError {}
 
 /// Rendered image bytes. Simulator responses use an empty byte vector; real
-/// production renderers fill this with encoded PNG/WebP bytes.
+/// production renderers fill this with encoded PNG/WebP/JPEG bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderOutput {
     pub bytes: Bytes,

@@ -16,7 +16,7 @@ pub fn write_csv<P: AsRef<Path>>(path: P, results: &[(String, Report)]) -> io::R
     writeln!(
         f,
         "label,submitted,completed,rejected,sla_violations,throughput_rps,\
-         cpu_render_util_pct,cpu_render_avg_inflight,cpu_render_peak_inflight,\
+         native_render_util_pct,native_render_avg_inflight,native_render_peak_inflight,\
          latency_p50_ms,latency_p90_ms,latency_p95_ms,latency_p99_ms,latency_max_ms,\
          tier1_pct,tier2_pct,tier3_pct,tier4_overflow_pct,\
          cold_starts,style_swaps,tasks_with_sources,source_loads,source_hits,elapsed_ms"
@@ -44,9 +44,9 @@ pub fn write_csv<P: AsRef<Path>>(path: P, results: &[(String, Report)]) -> io::R
             r.rejected,
             r.sla_violations,
             r.throughput,
-            r.cpu_render_utilization_pct,
-            r.cpu_render_avg_inflight,
-            r.cpu_render_peak_inflight,
+            r.native_render_utilization_pct,
+            r.native_render_avg_inflight,
+            r.native_render_peak_inflight,
             ms(r.latency_p50),
             ms(r.latency_p90),
             ms(r.latency_p95),

@@ -1,6 +1,7 @@
 //! Request-local `addlayer` installation for static renders.
 
 use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::renderer::overlay::{OverlaySlotPool, render_static_with_overlays};
 use crate::types::{AddLayer, AddLayerSource, StaticOverlay, TaskId};
@@ -26,7 +27,7 @@ pub(super) fn render_static_with_overlays_and_addlayer(
     before_layer: Option<&str>,
     addlayer: Option<&AddLayer>,
     task_id: TaskId,
-) -> Result<maplibre_native::Image, maplibre_native::RenderingError> {
+) -> Result<(maplibre_native::Image, Option<Duration>), maplibre_native::RenderingError> {
     let installed_addlayer = if let Some(layer) = addlayer {
         let mut style = renderer.style();
         match install_addlayer(&mut style, addlayer_sources, layer, before_layer, task_id) {
@@ -41,11 +42,15 @@ pub(super) fn render_static_with_overlays_and_addlayer(
         let mut style = renderer.style();
         remove_addlayer(&mut style, installed);
     }
-    result
+    let source_setup_duration = installed_addlayer
+        .as_ref()
+        .and_then(|installed| installed.source_setup_duration);
+    result.map(|image| (image, source_setup_duration))
 }
 
 struct InstalledAddLayer {
     layer_id: String,
+    source_setup_duration: Option<Duration>,
 }
 
 const ADDLAYER_SOURCE_CACHE_CAPACITY: usize = 64;
@@ -128,11 +133,14 @@ fn install_addlayer(
 ) -> Result<InstalledAddLayer, maplibre_native::StyleError> {
     let internal_id = format!("__biei_addlayer_{task_id}");
     let mut newly_added_source_id = None;
+    let mut source_setup_duration = None;
     let source_id = match &addlayer.source {
         Some(source) => {
+            let setup_started_at = Instant::now();
             let (id, newly_added) = addlayer_sources.ensure(style, source)?;
             if newly_added {
                 newly_added_source_id = Some(id.clone());
+                source_setup_duration = Some(setup_started_at.elapsed());
             }
             Some(id)
         }
@@ -169,6 +177,7 @@ fn install_addlayer(
     }
     Ok(InstalledAddLayer {
         layer_id: internal_id,
+        source_setup_duration,
     })
 }
 

@@ -31,20 +31,14 @@ where
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    // Accepted forms, excluding the trailing `preview` segment:
-    //   /{style_id}/preview
-    //   /{user}/{style}/preview
-    let style_segments: &[&str] = match parts.as_slice() {
-        [_style, "preview"] => &parts[..1],
-        [_user, _style, "preview"] => &parts[..2],
-        _ => {
-            return IngressResponse::json(
-                400,
-                "invalid_preview_path",
-                "expected /{user}/{style}/preview",
-            );
-        }
+    // Style ids may be namespaced to arbitrary depth, matching tile/static
+    // ingress. The final segment alone identifies the preview route.
+    let Some((last, style_segments)) = parts.split_last() else {
+        return IngressResponse::json(400, "invalid_preview_path", "expected /{style_id}/preview");
     };
+    if *last != "preview" || style_segments.is_empty() {
+        return IngressResponse::json(400, "invalid_preview_path", "expected /{style_id}/preview");
+    }
     let style_id = match resolve_style_id(style_segments) {
         Ok(id) => id,
         Err(err) => return response_from_ingress_error(err),
@@ -136,6 +130,13 @@ mod tests {
                 1,
             ),
         );
+        catalog.upsert_definition(
+            StyleId("carto/gl/voyager-gl-style".to_string()),
+            StyleDefinition::new(
+                "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+                1,
+            ),
+        );
         catalog
     }
 
@@ -202,6 +203,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_supports_deeply_namespaced_style_id() {
+        let response = build_preview_response(
+            &catalog(),
+            "/carto/gl/voyager-gl-style/preview",
+            style_available,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("html body");
+        assert!(body.contains("carto/gl/voyager-gl-style · biei preview"));
+        assert!(body.contains(r#""carto/gl/voyager-gl-style""#));
+    }
+
+    #[tokio::test]
     async fn preview_returns_404_for_unknown_style() {
         let response =
             build_preview_response(&catalog(), "/unknown/style/preview", style_available).await;
@@ -260,7 +276,6 @@ mod tests {
             "/preview",
             "/carto/voyager-gl-style/0/0/0",
             "/carto/voyager-gl-style",
-            "/carto/voyager-gl-style/foo/preview",
         ] {
             let response = build_preview_response(&catalog(), path, style_available).await;
             assert_eq!(response.status, 400, "expected 400 for {path}");

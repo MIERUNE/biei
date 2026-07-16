@@ -8,6 +8,7 @@ pub(crate) mod overlay;
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::types::{
@@ -23,6 +24,23 @@ pub struct PreparedProfile {
     /// run before worker admission; workers may be warm and skip style setup,
     /// but still need this per-request source for render.
     pub addlayer_source: Option<AddLayerSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RendererOutput {
+    pub output: RenderOutput,
+    /// Time spent constructing and installing a request-local source in the
+    /// renderer. `None` means that no source setup was needed.
+    pub source_setup_duration: Option<Duration>,
+}
+
+impl From<RenderOutput> for RendererOutput {
+    fn from(output: RenderOutput) -> Self {
+        Self {
+            output,
+            source_setup_duration: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +100,7 @@ pub trait Renderer: Send + Sync {
     /// (geometry parse / index build); style application is cheap and is
     /// folded into `render`.
     async fn ensure_source(&mut self, hash: SourceHash) -> Result<(), RendererError>;
-    async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError>;
+    async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError>;
     /// Stop using the current native actor after a caller-side timeout.
     ///
     /// Implementations must not try to kill an in-flight native render. They

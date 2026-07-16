@@ -345,11 +345,12 @@ fn healthz(method: &Method, state: &HttpServerState) -> Response {
     if method != Method::GET {
         return simple_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    // Liveness is stricter than readiness: fail only when in-process recovery
-    // is impossible (all slots dead AND the orphan budget exhausted — wedged
-    // Still renders cannot be cancelled), so the orchestrator restarts the
-    // pod per production-spec §8.4. Mere saturation (`!is_ready`) only drops
-    // readiness; restarting a self-healing node would discard warm state.
+    // Liveness is stricter than readiness: fail only when full in-process
+    // recovery is impossible (some slot unavailable AND the orphan budget
+    // exhausted — wedged Still renders cannot be cancelled), so the
+    // orchestrator restores capacity per production-spec §8.2. Mere saturation
+    // (`!is_ready`) only drops readiness; restarting a self-healing node would
+    // discard warm state.
     if state
         .renderer_supervisor
         .as_ref()
@@ -460,15 +461,15 @@ async fn public_render(
     )
 }
 
-/// Matches only `/{user}/{style}/preview` or `/{style_id}/preview`.
+/// Matches a non-empty, arbitrarily namespaced `/{style_id}/preview` path.
 /// Render routes cannot collide because `preview` must be the final segment.
 fn is_preview_path(path: &str) -> bool {
-    let segments: Vec<_> = path
+    let mut segments = path
         .trim_matches('/')
         .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    matches!(segments.len(), 2 | 3) && segments.last().copied() == Some("preview")
+        .filter(|segment| !segment.is_empty())
+        .rev();
+    segments.next() == Some("preview") && segments.next().is_some()
 }
 
 fn into_axum_response(response: IngressResponse) -> Response {
@@ -538,8 +539,8 @@ mod tests {
         assert!(!is_preview_path("/foo/preview/bar"));
         // Too few segments (no style id).
         assert!(!is_preview_path("/preview"));
-        // Too many segments (more than two style-id components).
-        assert!(!is_preview_path("/foo/bar/baz/preview"));
+        // Deeply namespaced style id.
+        assert!(is_preview_path("/foo/bar/baz/preview"));
         // Empty / root
         assert!(!is_preview_path("/"));
         assert!(!is_preview_path(""));
@@ -648,7 +649,7 @@ mod tests {
 
         // Orphan budget exhausted on top: wedged Still renders cannot be
         // cancelled and no replacement can spawn — only a process restart
-        // recovers, so liveness must fail too (production-spec §8.4).
+        // recovers, so liveness must fail too (production-spec §8.2).
         supervisor.exhaust_orphan_budget_for_test();
         let live = handle(
             State(state),

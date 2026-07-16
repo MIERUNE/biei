@@ -106,20 +106,32 @@ impl ChitchatGossipBus {
             extra_liveness_predicate: None,
         };
         let handle = spawn_chitchat(config, vec![], &self.transport).await?;
-        self.handles.write().await.insert(node_id.clone(), handle);
-        self.addrs.write().await.insert(node_id.clone(), addr);
-        self.members.write().await.push(node_id);
+        // Mutations take locks in the same members -> handles -> addrs order
+        // used by view(). Holding the members write lock makes the three-map
+        // update appear atomic to readers.
+        let mut members = self.members.write().await;
+        let mut handles = self.handles.write().await;
+        let mut addrs = self.addrs.write().await;
+        handles.insert(node_id.clone(), handle);
+        addrs.insert(node_id.clone(), addr);
+        members.push(node_id);
+        drop(addrs);
+        drop(handles);
+        drop(members);
         self.invalidate_view();
         Ok(())
     }
 
     pub async fn remove_node(&self, node_id: &NodeId) -> Result<()> {
-        let handle = self.handles.write().await.remove(node_id);
-        self.addrs.write().await.remove(node_id);
-        self.members
-            .write()
-            .await
-            .retain(|member| member != node_id);
+        let mut members = self.members.write().await;
+        let mut handles = self.handles.write().await;
+        let mut addrs = self.addrs.write().await;
+        let handle = handles.remove(node_id);
+        addrs.remove(node_id);
+        members.retain(|member| member != node_id);
+        drop(addrs);
+        drop(handles);
+        drop(members);
         self.invalidate_view();
         if let Some(handle) = handle {
             handle.shutdown().await?;
@@ -128,9 +140,15 @@ impl ChitchatGossipBus {
     }
 
     pub async fn shutdown_all(&self) {
-        let handles = std::mem::take(&mut *self.handles.write().await);
-        self.members.write().await.clear();
-        self.addrs.write().await.clear();
+        let mut members = self.members.write().await;
+        let mut handles_guard = self.handles.write().await;
+        let mut addrs = self.addrs.write().await;
+        let handles = std::mem::take(&mut *handles_guard);
+        members.clear();
+        addrs.clear();
+        drop(addrs);
+        drop(handles_guard);
+        drop(members);
         self.invalidate_view();
         for (_, h) in handles {
             let _ = h.shutdown().await;
@@ -190,14 +208,14 @@ impl GossipBus for ChitchatGossipBus {
             return cached.view.clone();
         }
 
-        let members = self.members.read().await.clone();
+        let members_guard = self.members.read().await;
         let handles = self.handles.read().await;
         // Always sample from `members[0]`'s chitchat snapshot — never
         // `handles.iter().next()`, which would be HashMap-order-dependent
         // and produce a non-reproducible view across runs.
-        let Some(handle) = members.first().and_then(|nid| handles.get(nid)) else {
+        let Some(handle) = members_guard.first().and_then(|nid| handles.get(nid)) else {
             return ClusterView {
-                members,
+                members: members_guard.clone(),
                 states: HashMap::new(),
                 generated_at: now,
             };
@@ -215,10 +233,12 @@ impl GossipBus for ChitchatGossipBus {
             })
             .await;
         let view = ClusterView {
-            members,
+            members: members_guard.clone(),
             states,
             generated_at: now,
         };
+        drop(handles);
+        drop(members_guard);
         if self.view_epoch.load(Ordering::Acquire) == epoch {
             *self.view_cache.lock().expect("view cache poisoned") = Some(CachedView {
                 epoch,

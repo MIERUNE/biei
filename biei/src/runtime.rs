@@ -256,7 +256,11 @@ fn default_production_costs(sla: Duration) -> CostConfig {
     CostConfig {
         style_setup_cost: CostRange::fixed(Duration::from_millis(250)),
         source_load_cost: CostRange::fixed(Duration::ZERO),
-        render_cost: CostRange::fixed(Duration::from_millis(50)),
+        render_cpu_cost: CostRange::fixed(Duration::from_millis(50)),
+        // Production routing uses a conservative fixed BL until these two
+        // distributions are imported from a bounded calibration profile.
+        render_resource_cost: CostRange::fixed(Duration::ZERO),
+        first_render_resource_cost: CostRange::fixed(Duration::ZERO),
         hop_latency: Duration::from_millis(25),
         sla,
     }

@@ -15,11 +15,14 @@ use crate::renderer::actor::{
 use crate::renderer::http_fetch::{
     BodyReadError, read_bounded_body, redacted_url, redacted_url_str, reqwest_error_label,
 };
-use crate::renderer::{PreparedProfile, ProfilePreparer, Renderer, StyleAvailabilityError};
+use crate::renderer::{
+    PreparedProfile, ProfilePreparer, Renderer, RendererOutput, StyleAvailabilityError,
+};
 use crate::style_catalog::StyleCatalog;
+#[cfg(test)]
+use crate::types::RenderOutput;
 use crate::types::{
-    AddLayerSource, InternalTask, RenderOutput, RenderRequest, RendererError, SourceHash, StyleId,
-    StyleRevision,
+    AddLayerSource, InternalTask, RenderRequest, RendererError, SourceHash, StyleId, StyleRevision,
 };
 
 pub struct MapLibreRenderer {
@@ -85,7 +88,7 @@ const TILESET_JSON_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const TILESET_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const JSON_NEGATIVE_CACHE_MAX_ENTRIES: u64 = 4096;
 // Short on purpose: the negative cache only needs to absorb repeated requests
-// for the same definitively-bad style or TileJSON within a burst (§7.5.1 spray
+// for the same definitively-bad style or TileJSON within a burst (§7.5 spray
 // defense). A longer TTL would delay a freshly-registered/fixed resource from
 // becoming servable. Transient failures (5xx, connection/read errors,
 // timeouts) are not cached here at all — see `ProfileFetchError`.
@@ -518,7 +521,7 @@ async fn wait_for_json_load(
 ///
 /// Permanent/content failures (4xx, parse, oversize, bad encoding, unknown
 /// resource) reproduce on an immediate retry, so caching them briefly is the
-/// §7.5.1 spray defense. Transient failures (5xx, connection/read errors,
+/// §7.5 spray defense. Transient failures (5xx, connection/read errors,
 /// timeouts) may recover at once, so they are never cached — otherwise a
 /// one-second upstream blip becomes `JSON_NEGATIVE_CACHE_TTL` of forced
 /// failures for every request hitting that style.
@@ -638,7 +641,7 @@ impl Renderer for MapLibreRenderer {
         Ok(())
     }
 
-    async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+    async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
         self.actor()?.render(RenderTaskView::from(task)).await
     }
 
@@ -1107,11 +1110,12 @@ mod tests {
             Ok(())
         }
 
-        fn render(&mut self, task: &RenderTaskView) -> Result<RenderOutput, RendererError> {
+        fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
             Ok(RenderOutput {
                 bytes: bytes::Bytes::copy_from_slice(task.style.id.as_bytes()),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -1272,8 +1276,8 @@ mod tests {
         renderer.ensure_source(42).await.expect("source no-op");
         let output = renderer.render(&task).await.expect("render succeeds");
 
-        assert_eq!(output.bytes.as_ref(), b"carto/voyager");
-        assert_eq!(output.format, ImageFormat::Webp);
+        assert_eq!(output.output.bytes.as_ref(), b"carto/voyager");
+        assert_eq!(output.output.format, ImageFormat::Webp);
         assert!(renderer.is_alive());
     }
 

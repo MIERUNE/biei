@@ -1,13 +1,20 @@
 //! Simulator CLI. The legacy no-subcommand mode still runs the existing
 //! scenario suite; `run` produces a reproducible JSON report.
 
+mod legacy_sweeps;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use biei::types::RouteTier;
 use biei_sim::{
-    Simulation, SimulationOptions,
+    Simulation, SimulationOptions, calibrated_costs,
+    calibration::{
+        CalibrationExportOptions, CalibrationProvenance, export_calibration_profile,
+        parse_match_labels, read_bearer_token,
+    },
+    calibration_runner::{CalibrationExerciseOptions, run_calibration_exercise},
     churn::ChurnPlan,
     config::{SimConfig, StyleDist},
     scenarios, visualization,
@@ -23,12 +30,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Export an immutable, provenance-bearing production calibration profile.
+    Calibration {
+        #[command(subcommand)]
+        command: CalibrationCommand,
+    },
     /// Run one simulation and write a reproducible JSON report.
     Run {
         #[arg(long, default_value = "biei-sim-report.json")]
         report: PathBuf,
         #[arg(long)]
         churn_plan: Option<PathBuf>,
+        /// Sampling interval on the post-warmup measured-request clock.
         #[arg(long, default_value_t = 1_000)]
         sample_every_requests: u64,
         #[arg(long)]
@@ -43,6 +56,16 @@ enum Command {
         duration_seconds: Option<u64>,
         #[arg(long)]
         warmup_seconds: Option<u64>,
+        /// Derive provisional global cost ranges from an exported profile;
+        /// measured node/permit provenance is applied, while hop latency and
+        /// SLA stay at their configured values.
+        #[arg(long)]
+        cost_profile: Option<PathBuf>,
+        /// Verified resource-warm reference profile supplying CPU service
+        /// demand (two-window fusion); requires --cost-profile for the
+        /// realistic-traffic walls that become resource waits.
+        #[arg(long, requires = "cost_profile")]
+        cpu_profile: Option<PathBuf>,
         /// Also write a self-contained HTML report.
         #[arg(long)]
         html: Option<PathBuf>,
@@ -55,9 +78,157 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum CalibrationCommand {
+    /// Generate a bounded warmup and measurement window against a running biei.
+    Exercise {
+        /// Full tile/static URL to request; repeat to cover multiple shapes.
+        #[arg(long = "url", required = true)]
+        urls: Vec<String>,
+        #[arg(long, default_value_t = 2)]
+        warmup_requests_per_url: usize,
+        #[arg(long, default_value_t = 100)]
+        requests_per_url: usize,
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        /// Wait before and after measurement so Prometheus scrapes both
+        /// counter boundaries. Use at least the configured scrape interval.
+        #[arg(long, default_value_t = 30)]
+        scrape_settle_seconds: u64,
+    },
+    /// Query time-bounded Prometheus histograms and write an M12a JSON profile.
+    Export {
+        /// Prometheus root URL. `/api/v1/query` is appended when absent.
+        #[arg(long)]
+        prometheus_url: String,
+        /// Collection-window start as Unix seconds.
+        #[arg(long)]
+        start_unix_seconds: u64,
+        /// Collection-window end and Prometheus evaluation time as Unix seconds.
+        #[arg(long)]
+        end_unix_seconds: u64,
+        /// Additional exact Prometheus series matcher (`NAME=VALUE`), repeatable.
+        #[arg(long = "match-label", value_name = "NAME=VALUE")]
+        match_labels: Vec<String>,
+        /// File containing a bearer token; its contents are never serialized.
+        #[arg(long)]
+        bearer_token_file: Option<PathBuf>,
+        #[arg(long)]
+        deployment_revision: String,
+        /// Production node architecture, for example `x86_64` or `aarch64`.
+        #[arg(long)]
+        architecture: String,
+        /// Operator-defined machine/CPU identity, for example `GKE c3-standard-8`.
+        #[arg(long)]
+        hardware_profile: String,
+        #[arg(long)]
+        cpu_cores_per_node: usize,
+        #[arg(long)]
+        renderer_slots_per_node: usize,
+        #[arg(long)]
+        execution_permits_per_node: usize,
+        #[arg(long)]
+        native_render_permits_per_node: usize,
+        /// Free-form provenance note; do not place credentials here.
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        #[arg(short, long, default_value = "biei-calibration-profile.json")]
+        output: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Some(Command::Calibration { command }) => match command {
+            CalibrationCommand::Exercise {
+                urls,
+                warmup_requests_per_url,
+                requests_per_url,
+                concurrency,
+                timeout_seconds,
+                scrape_settle_seconds,
+            } => {
+                let summary = run_calibration_exercise(CalibrationExerciseOptions {
+                    urls,
+                    warmup_requests_per_url,
+                    requests_per_url,
+                    concurrency,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    scrape_settle: Duration::from_secs(scrape_settle_seconds),
+                })
+                .await?;
+                println!(
+                    "measured={} successful={} statuses={:?}",
+                    summary.requests,
+                    summary.successful(),
+                    summary.status_counts,
+                );
+                if summary.successful() != summary.requests {
+                    bail!(
+                        "calibration exercise had non-success responses: {:?}",
+                        summary.status_counts
+                    );
+                }
+                println!(
+                    "collection window: --start-unix-seconds {} --end-unix-seconds {}",
+                    summary.start_unix_seconds, summary.end_unix_seconds,
+                );
+            }
+            CalibrationCommand::Export {
+                prometheus_url,
+                start_unix_seconds,
+                end_unix_seconds,
+                match_labels,
+                bearer_token_file,
+                deployment_revision,
+                architecture,
+                hardware_profile,
+                cpu_cores_per_node,
+                renderer_slots_per_node,
+                execution_permits_per_node,
+                native_render_permits_per_node,
+                notes,
+                timeout_seconds,
+                output,
+            } => {
+                let parsed_match_labels = parse_match_labels(match_labels)?;
+                let bearer_token = bearer_token_file.map(read_bearer_token).transpose()?;
+                let profile = export_calibration_profile(CalibrationExportOptions {
+                    prometheus_url,
+                    start_unix_seconds,
+                    end_unix_seconds,
+                    match_labels: parsed_match_labels,
+                    bearer_token,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    provenance: CalibrationProvenance {
+                        deployment_revision,
+                        architecture,
+                        hardware_profile,
+                        cpu_cores_per_node,
+                        renderer_slots_per_node,
+                        execution_permits_per_node,
+                        native_render_permits_per_node,
+                        notes,
+                    },
+                })
+                .await?;
+                for warning in &profile.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                println!(
+                    "exported {} histogram series across {} metric families",
+                    profile.series_count(),
+                    profile.histograms.len()
+                );
+                profile.write_new_json(&output)?;
+                println!("written: {}", output.display());
+            }
+        },
         Some(Command::Visualize { input, output }) => {
             visualization::write_visualization(input, &output)?;
             println!("written: {}", output.display());
@@ -72,10 +243,40 @@ async fn main() -> Result<()> {
             new_style_rate,
             duration_seconds,
             warmup_seconds,
+            cost_profile,
+            cpu_profile,
             html,
         }) => {
             tokio::time::pause();
             let mut config = SimConfig::default();
+            let cpu_reference = cpu_profile
+                .map(|path| -> Result<_> {
+                    let profile = calibrated_costs::load_calibration_profile(&path)?;
+                    Ok((path, profile))
+                })
+                .transpose()?;
+            let calibration = cost_profile
+                .map(|path| -> Result<_> {
+                    let profile = calibrated_costs::load_calibration_profile(&path)?;
+                    let derived = match &cpu_reference {
+                        Some((_, reference)) => calibrated_costs::derive_costs_with_cpu_reference(
+                            &profile,
+                            reference,
+                            &config.costs,
+                        )?,
+                        None => calibrated_costs::derive_costs(&profile, &config.costs)?,
+                    };
+                    Ok((path, profile, derived))
+                })
+                .transpose()?;
+            if let Some((path, profile, derived)) = &calibration {
+                calibrated_costs::apply_profile_provenance(profile, &mut config)?;
+                config.costs = derived.costs.clone();
+                for note in &derived.notes {
+                    eprintln!("calibration: {note}");
+                }
+                eprintln!("calibrated costs from {}", path.display());
+            }
             if let Some(nodes) = nodes {
                 config.node_count = nodes;
             }
@@ -101,12 +302,44 @@ async fn main() -> Result<()> {
                     .transpose()?
                     .unwrap_or(ChurnPlan { events: Vec::new() }),
             );
-            let run_report = Simulation::new(config)
+            let mut simulation = Simulation::new(config);
+            if let Some((_, _, derived)) = &calibration {
+                simulation = simulation.with_calibration_model(derived.sampling_model.clone());
+            }
+            let mut run_report = simulation
                 .run_report(SimulationOptions {
                     churn_plan,
                     sample_every_requests,
                 })
                 .await?;
+            if let Some((path, profile, derived)) = &calibration {
+                // Reports must say which measured evidence sized their costs.
+                run_report.config["cost_profile"] = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "exported_at_unix_seconds": profile.exported_at_unix_seconds,
+                    "collection": profile.collection,
+                    "provenance": profile.provenance,
+                    "coverage": derived.coverage,
+                    "derivation_notes": derived.notes,
+                });
+                if let Some((cpu_path, cpu_reference)) = &cpu_reference {
+                    run_report.config["cpu_profile"] = serde_json::json!({
+                        "path": cpu_path.display().to_string(),
+                        "exported_at_unix_seconds": cpu_reference.exported_at_unix_seconds,
+                        "collection": cpu_reference.collection,
+                        "provenance": cpu_reference.provenance,
+                    });
+                }
+            }
+            if let Some(churn) = &run_report.churn
+                && !churn.unapplied_events.is_empty()
+            {
+                eprintln!(
+                    "warning: {} churn event(s) were not reached by the {} measured requests; preserving them in the report",
+                    churn.unapplied_events.len(),
+                    churn.submitted_measured,
+                );
+            }
             println!(
                 "completed={} rejected={} p99={:.1}ms",
                 run_report.result.completed,
@@ -129,22 +362,7 @@ async fn run_legacy() {
     tokio::time::pause();
 
     if std::env::var_os("RUN_LARGE_SCALE_ONLY").is_some() {
-        run_large_scale_sweep().await;
-        if std::env::var_os("RUN_STANDBY_SWEEP").is_some() {
-            run_standby_sweep().await;
-        }
-        if std::env::var_os("RUN_EXECUTION_SWEEP").is_some() {
-            run_execution_sweep().await;
-        }
-        if std::env::var_os("RUN_STEADY_SWEEP").is_some() {
-            run_steady_sweep().await;
-        }
-        if std::env::var_os("RUN_MULTIPLIER_SWEEP").is_some() {
-            run_multiplier_sweep().await;
-        }
-        if std::env::var_os("RUN_STYLE_SHIFT").is_some() {
-            run_style_shift_scenario().await;
-        }
+        legacy_sweeps::run_selected().await;
         return;
     }
 
@@ -306,22 +524,7 @@ async fn run_legacy() {
     }
 
     if std::env::var_os("RUN_LARGE_SCALE").is_some() {
-        run_large_scale_sweep().await;
-        if std::env::var_os("RUN_STANDBY_SWEEP").is_some() {
-            run_standby_sweep().await;
-        }
-        if std::env::var_os("RUN_EXECUTION_SWEEP").is_some() {
-            run_execution_sweep().await;
-        }
-        if std::env::var_os("RUN_STEADY_SWEEP").is_some() {
-            run_steady_sweep().await;
-        }
-        if std::env::var_os("RUN_MULTIPLIER_SWEEP").is_some() {
-            run_multiplier_sweep().await;
-        }
-        if std::env::var_os("RUN_STYLE_SHIFT").is_some() {
-            run_style_shift_scenario().await;
-        }
+        legacy_sweeps::run_selected().await;
     } else {
         println!("\n--- Large-scale production sizing skipped ---");
         println!("Set RUN_LARGE_SCALE=1 for a short 25-node smoke sweep.");
@@ -369,278 +572,17 @@ async fn run_legacy() {
     }
 }
 
-async fn run_large_scale_sweep() {
-    let full = std::env::var_os("RUN_LARGE_SCALE_FULL").is_some();
-    println!(
-        "\n--- Large-scale production{}: 25 nodes × 20 slots / 16 permits (500 warm, 400 active) ---",
-        if full { "" } else { " smoke" }
-    );
-    println!("16 styles Zipf 1.2, @2x only, 2 tile-mode styles, JP map sources (20% addlayer)");
-    println!(
-        "{:<32} | submitted | reject | util  | ovrfl% | tier1   | swaps  | src hit  | p50    p90    p99    max",
-        "scenario"
-    );
-    println!("{}", "-".repeat(140));
-    // With render_cost mid ≈ 17.5ms × 400 permits, cluster cap ≈ 23k req/s.
-    let large_scenarios: Vec<(&str, f64, Duration)> = if full {
-        vec![
-            ("5k req/s", 5_000.0, Duration::from_millis(50)),
-            ("10k req/s", 10_000.0, Duration::from_millis(50)),
-            ("15k req/s", 15_000.0, Duration::from_millis(50)),
-            ("20k req/s", 20_000.0, Duration::from_millis(50)),
-        ]
-    } else {
-        vec![
-            ("3k req/s, 1s smoke", 3_000.0, Duration::from_millis(100)),
-            ("8k req/s, 1s smoke", 8_000.0, Duration::from_millis(50)),
-        ]
-    };
-    for (label, rate, pub_iv) in large_scenarios {
-        let mut cfg = scenarios::large_scale_16cores(rate, pub_iv);
-        if !full {
-            cfg.workload.duration = Duration::from_secs(1);
-            cfg.workload.warmup = Duration::ZERO;
-        }
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        let hit = if r.tasks_with_sources > 0 {
-            format!(
-                "{:5.1}%",
-                r.source_hits as f64 / r.tasks_with_sources as f64 * 100.0
-            )
-        } else {
-            String::from("  n/a")
-        };
-        let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        println!(
-            "{:<32} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>8} | {:>5?} {:>5?} {:>6?} {:>6?}",
-            label,
-            r.total,
-            pct(r.rejected),
-            r.cpu_render_utilization_pct,
-            pct_complete(r.overflow_admissions),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            pct(r.style_swaps),
-            hit,
-            r.latency_p50,
-            r.latency_p90,
-            r.latency_p99,
-            r.latency_max,
-        );
-    }
-}
-
-/// Longer steady-state point for methodology checks. This is intentionally
-/// opt-in so the default large-scale smoke remains fast.
-async fn run_steady_sweep() {
-    println!("\n--- Steady large-scale point (10k req/s, 30s duration, 5s warmup) ---");
-    println!(
-        "{:<22} | submitted | reject | util  | ovrfl% | tier1   | swaps  | p50     p99      max",
-        "scenario"
-    );
-    println!("{}", "-".repeat(112));
-    let mut cfg = scenarios::large_scale_16cores(10_000.0, Duration::from_millis(50));
-    cfg.workload.duration = Duration::from_secs(30);
-    cfg.workload.warmup = Duration::from_secs(5);
-    let r = Simulation::new(cfg).run().await;
-    let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-    let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-    let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-    println!(
-        "{:<22} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5?} {:>6?} {:>6?}",
-        "10k req/s",
-        r.total,
-        pct(r.rejected),
-        r.cpu_render_utilization_pct,
-        pct_complete(r.overflow_admissions),
-        pct(tier(RouteTier::Tier1WarmTracking)),
-        pct(r.style_swaps),
-        r.latency_p50,
-        r.latency_p99,
-        r.latency_max,
-    );
-}
-
-/// Sweep warm renderer slot count while keeping render permits fixed. This
-/// isolates whether standby slots improve warm coverage enough to justify
-/// their memory cost.
-async fn run_standby_sweep() {
-    println!("\n--- Standby renderer slot sweep (large-scale 10k req/s) ---");
-    println!("25 nodes, 16 render permits/node fixed. Vary warm renderer slots/node.");
-    println!(
-        "{:<14} | submitted | reject | util  | ovrfl% | tier1   | swaps  | p99      max",
-        "slots/node"
-    );
-    println!("{}", "-".repeat(112));
-
-    let mut results = Vec::new();
-    for &slots in &[16usize, 20, 24, 32] {
-        let cfg =
-            scenarios::large_scale_16cores_with_slots(10_000.0, Duration::from_millis(50), slots);
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        let label = format!("{} ({:.2}x)", slots, slots as f64 / 16.0);
-        println!(
-            "{:<14} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>7?} {:>7?}",
-            label,
-            r.total,
-            pct(r.rejected),
-            r.cpu_render_utilization_pct,
-            pct_complete(r.overflow_admissions),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            pct(r.style_swaps),
-            r.latency_p99,
-            r.latency_max,
-        );
-        results.push((label, r));
-    }
-
-    biei_sim::sweep::write_csv("sweep_standby_slots.csv", &results).expect("csv write");
-    println!(
-        "→ written: sweep_standby_slots.csv ({} rows)",
-        results.len()
-    );
-}
-
-/// Sweep task execution permits above the CPU render bottleneck. This models
-/// I/O overlap: more requests may progress through setup/source loading while
-/// render/encode remains capped at the core-like CPU permit count.
-async fn run_execution_sweep() {
-    println!("\n--- Execution permit sweep (large-scale 10k req/s) ---");
-    println!("25 nodes, 32 warm slots/node, 16 CPU render permits/node fixed.");
-    println!(
-        "{:<14} | submitted | reject | util  | ovrfl% | tier1   | swaps  | p99      max",
-        "exec/node"
-    );
-    println!("{}", "-".repeat(112));
-
-    let mut results = Vec::new();
-    for &execution_permits in &[16usize, 20, 24, 32] {
-        let cfg = scenarios::large_scale_16cores_with_execution_permits(
-            10_000.0,
-            Duration::from_millis(50),
-            32,
-            execution_permits,
-            16,
-        );
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        let label = format!(
-            "{} ({:.2}x)",
-            execution_permits,
-            execution_permits as f64 / 16.0
-        );
-        println!(
-            "{:<14} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>7?} {:>7?}",
-            label,
-            r.total,
-            pct(r.rejected),
-            r.cpu_render_utilization_pct,
-            pct_complete(r.overflow_admissions),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            pct(r.style_swaps),
-            r.latency_p99,
-            r.latency_max,
-        );
-        results.push((label, r));
-    }
-
-    biei_sim::sweep::write_csv("sweep_execution_permits.csv", &results).expect("csv write");
-    println!(
-        "→ written: sweep_execution_permits.csv ({} rows)",
-        results.len()
-    );
-}
-
-/// Inject a mid-sim top-style swap and observe how the cluster re-balances:
-/// the previously-top style stops receiving traffic and a previously mid-rank
-/// style suddenly dominates. Reveals how aggressively the system can
-/// re-warm renderer slots without rejecting.
-async fn run_style_shift_scenario() {
-    println!("\n--- Style-shift scenario (large-scale, mid-sim top-style swap) ---");
-    println!("Pre-shift: style 0 is top (Zipf 1.2). At t=4s, style 0 ↔ style 8 swap.");
-    println!(
-        "{:<22} | submitted | reject | ovrfl% | tier1   | swaps  | p50    p99      max",
-        "rate"
-    );
-    println!("{}", "-".repeat(110));
-    for &rate in &[5_000.0_f64, 10_000.0] {
-        let cfg = scenarios::large_scale_style_shift(
-            rate,
-            Duration::from_millis(50),
-            Duration::from_secs(4),
-            8,
-        );
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        println!(
-            "{:<22} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5?} {:>6?} {:>6?}",
-            format!("{:.0}k req/s", rate / 1_000.0),
-            r.total,
-            pct(r.rejected),
-            pct_complete(r.overflow_admissions),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            pct(r.style_swaps),
-            r.latency_p50,
-            r.latency_p99,
-            r.latency_max,
-        );
-    }
-}
-
-/// Sweep the overflow-band multiplier (hard queue limit / soft queue limit) at a
-/// fixed production scale and rate. Shows the trade-off: tight multipliers
-/// reject early but keep p99 in line; loose multipliers absorb transients
-/// at the cost of tail latency.
-async fn run_multiplier_sweep() {
-    println!("\n--- Overflow multiplier sweep (large-scale 10k req/s) ---");
-    println!(
-        "Trade-off: smaller mult → more reject, tighter SLA. Larger mult → fewer reject, longer tail."
-    );
-    println!(
-        "{:<14} | submitted | reject | ovrfl% | tier1   | p50     p99      max",
-        "multiplier"
-    );
-    println!("{}", "-".repeat(96));
-    for &mult in &[2usize, 4, 6, 8] {
-        let cfg = scenarios::large_scale_16cores_with_multiplier(
-            10_000.0,
-            Duration::from_millis(50),
-            mult,
-        );
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let pct_complete = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        println!(
-            "{:<14} | {:>9} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5?} {:>6?} {:>6?}",
-            format!("{}× (cap={})", mult, mult * 14),
-            r.total,
-            pct(r.rejected),
-            pct_complete(r.overflow_admissions),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            r.latency_p50,
-            r.latency_p99,
-            r.latency_max,
-        );
-    }
-}
-
 fn print_config(config: &SimConfig) {
     let slots_total = config.cluster.renderer_slots_per_node * config.node_count;
     let permits_per_node = config.cluster.resolved_render_permits_per_node();
     let permits_total = permits_per_node * config.node_count;
     let cpu_permits_per_node = config.cluster.resolved_cpu_render_permits_per_node();
     let cpu_permits_total = cpu_permits_per_node * config.node_count;
-    let p_mid = config.costs.render_cost.mid().as_secs_f64();
-    let max_throughput = cpu_permits_total as f64 / p_mid;
+    let warm_residency_mid = config.costs.warm_render_cost().mid().as_secs_f64();
+    let cpu_mid = config.costs.render_cpu_cost.mid().as_secs_f64();
+    let native_capacity = cpu_permits_total as f64 / warm_residency_mid;
+    let cpu_capacity = (config.cpu_cores_per_node * config.node_count) as f64 / cpu_mid;
+    let max_throughput = native_capacity.min(cpu_capacity);
     let queue_limits = config.cluster.resolved_queue_limits(&config.costs);
 
     println!("--- Config ---");
@@ -654,16 +596,29 @@ fn print_config(config: &SimConfig) {
         permits_per_node, permits_total
     );
     println!(
-        "CPU render permits:{} per node ({} total)",
+        "native permits:    {} per node ({} total)",
         cpu_permits_per_node, cpu_permits_total
+    );
+    println!(
+        "CPU cores:         {} per node ({} total)",
+        config.cpu_cores_per_node,
+        config.cpu_cores_per_node * config.node_count
     );
     println!(
         "style setup (S):   {:?}–{:?}",
         config.costs.style_setup_cost.min, config.costs.style_setup_cost.max
     );
     println!(
-        "render cost (P):   {:?}–{:?}",
-        config.costs.render_cost.min, config.costs.render_cost.max
+        "render CPU:        {:?}–{:?}",
+        config.costs.render_cpu_cost.min, config.costs.render_cpu_cost.max
+    );
+    println!(
+        "warm resource I/O: {:?}–{:?}",
+        config.costs.render_resource_cost.min, config.costs.render_resource_cost.max
+    );
+    println!(
+        "first resource I/O:{:?}–{:?}",
+        config.costs.first_render_resource_cost.min, config.costs.first_render_resource_cost.max
     );
     println!("hop latency:       {:?}", config.costs.hop_latency);
     println!("sla (L):           {:?}", config.costs.sla);
@@ -695,8 +650,8 @@ fn print_config(config: &SimConfig) {
     }
     println!("arrival rate:      {:.2} req/s", config.workload.total_rate);
     println!(
-        "max throughput:    {:.2} req/s (= total_cpu_render_permits / E[P])",
-        max_throughput
+        "max throughput:    {:.2} req/s (min(native residency, CPU service))",
+        max_throughput,
     );
     println!("duration:          {:?}", config.workload.duration);
     println!();

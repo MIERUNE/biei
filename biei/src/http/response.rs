@@ -166,6 +166,7 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: None,
                 },
                 output: RenderOutput {
                     bytes: vec![1, 2, 3].into(),

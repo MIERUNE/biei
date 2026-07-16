@@ -1,7 +1,7 @@
 //! Production-shared configuration types. These are useful both in the
 //! simulator and in a real deployment that embeds the routing/worker code.
 //! Simulation-only knobs (workload generation, RNG seed, gossip-backend
-//! selection) live in `sim::config`.
+//! selection) live in `biei-sim/src/config.rs`.
 
 use std::time::Duration;
 
@@ -34,6 +34,13 @@ impl CostRange {
     pub fn mid(&self) -> Duration {
         (self.min + self.max) / 2
     }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            min: self.min.saturating_add(other.min),
+            max: self.max.saturating_add(other.max),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,8 +64,10 @@ pub struct ClusterConfig {
     /// all renderer slots may run at once. Values above `renderer_slots_per_node` are
     /// capped because extra permits cannot be used without slots.
     pub render_permits_per_node: Option<usize>,
-    /// Optional CPU/GPU-heavy render-stage limit per node. `None` means the
-    /// same value as `render_permits_per_node`, preserving the old model.
+    /// Optional native `renderStill` residency limit per node. The historical
+    /// name is retained for compatibility, but the permit includes FileSource
+    /// waits and is not a pure CPU/GPU service limit. `None` means the same
+    /// value as `render_permits_per_node`.
     pub cpu_render_permits_per_node: Option<usize>,
     /// Policy for the per-slot soft queue limit. This is the BL used by
     /// routing to prefer targets likely to stay within SLA.
@@ -88,11 +97,33 @@ pub struct QueueLimits {
 pub struct CostConfig {
     pub style_setup_cost: CostRange,
     /// Cost of loading one source datum (geometry parse / index build).
-    /// Style application is folded into `render_cost`.
+    /// Style application is folded into `render_cpu_cost`.
     pub source_load_cost: CostRange,
-    pub render_cost: CostRange,
+    /// CPU service demand for native render and encode work. This is distinct
+    /// from wall-clock native-render residency: MapLibre can wait for network
+    /// resources without consuming a CPU core.
+    pub render_cpu_cost: CostRange,
+    /// In-render resource critical-path wait for an already-warm profile.
+    pub render_resource_cost: CostRange,
+    /// In-render resource critical-path wait for the first render after a
+    /// profile setup. This replaces, rather than adds to, the warm wait.
+    pub first_render_resource_cost: CostRange,
     pub hop_latency: Duration,
     pub sla: Duration,
+}
+
+impl CostConfig {
+    /// Wall-clock native-render residency for a warm profile.
+    pub fn warm_render_cost(&self) -> CostRange {
+        self.render_cpu_cost
+            .saturating_add(self.render_resource_cost)
+    }
+
+    /// Wall-clock native-render residency for the first render after setup.
+    pub fn first_render_cost(&self) -> CostRange {
+        self.render_cpu_cost
+            .saturating_add(self.first_render_resource_cost)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,7 +185,7 @@ impl ClusterConfig {
             BlCapacityPolicy::Fixed(n) => n,
             BlCapacityPolicy::Auto => compute_bl_capacity(
                 costs.style_setup_cost.mid(),
-                costs.render_cost.mid(),
+                costs.warm_render_cost().mid(),
                 costs.sla,
             ),
         }
@@ -189,7 +220,9 @@ mod tests {
         let costs = CostConfig {
             style_setup_cost: CostRange::fixed(Duration::from_millis(100)),
             source_load_cost: CostRange::fixed(Duration::ZERO),
-            render_cost: CostRange::fixed(Duration::from_millis(10)),
+            render_cpu_cost: CostRange::fixed(Duration::from_millis(10)),
+            render_resource_cost: CostRange::fixed(Duration::ZERO),
+            first_render_resource_cost: CostRange::fixed(Duration::ZERO),
             hop_latency: Duration::ZERO,
             sla: Duration::from_secs(1),
         };
@@ -197,6 +230,36 @@ mod tests {
         assert_eq!(
             cluster.resolved_queue_limits(&costs),
             QueueLimits { soft: 7, hard: 21 }
+        );
+    }
+
+    #[test]
+    fn auto_bl_uses_warm_wall_clock_residency_not_cpu_service_alone() {
+        let cluster = ClusterConfig {
+            renderer_slots_per_node: 1,
+            render_permits_per_node: None,
+            cpu_render_permits_per_node: None,
+            bl_capacity: BlCapacityPolicy::Auto,
+            queue_capacity_multiplier: 2,
+            source_cache_capacity: 1,
+            render_output_cache_capacity_bytes: 0,
+        };
+        let costs = CostConfig {
+            style_setup_cost: CostRange::fixed(Duration::from_millis(250)),
+            source_load_cost: CostRange::fixed(Duration::ZERO),
+            render_cpu_cost: CostRange::fixed(Duration::from_millis(20)),
+            render_resource_cost: CostRange::fixed(Duration::from_millis(165)),
+            first_render_resource_cost: CostRange::fixed(Duration::from_millis(480)),
+            hop_latency: Duration::ZERO,
+            sla: Duration::from_secs(5),
+        };
+
+        // CPU-only P=20 ms would produce BL=12. Including the measured warm
+        // resource critical path yields P_w=185 ms and the safe soft bound 1.
+        assert_eq!(cluster.resolved_bl_capacity(&costs), 1);
+        assert_eq!(
+            cluster.resolved_queue_limits(&costs),
+            QueueLimits { soft: 1, hard: 2 }
         );
     }
 

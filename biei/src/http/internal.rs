@@ -339,7 +339,7 @@ mod tests {
     use crate::config::{CostConfig, CostRange, GossipConfig, RoutingConfig, Tier1Strategy};
     use crate::gossip::GossipBus;
     use crate::node::{Node, NodeSpawn};
-    use crate::renderer::{BoxRenderer, Renderer};
+    use crate::renderer::{BoxRenderer, Renderer, RendererOutput};
     use crate::style_catalog::StyleCatalog;
     use crate::types::{
         ClusterView, ImageFormat, InternalTask, NodeKvs, NodeStateView, PixelRatio,
@@ -513,6 +513,7 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: None,
                 },
             };
             let body = encode_response_body(&outcome, &[137, 80, 78, 71]).expect("encode outcome");
@@ -599,7 +600,7 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             if self.loaded.as_ref() != Some(&task.worker_profile()) {
                 return Err(RendererError::StyleNotReady {
                     style_id: task.style.id.clone(),
@@ -609,7 +610,8 @@ mod tests {
             Ok(RenderOutput {
                 bytes: self.bytes.clone().into(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -638,7 +640,9 @@ mod tests {
         CostConfig {
             style_setup_cost: CostRange::fixed(Duration::from_millis(1)),
             source_load_cost: CostRange::fixed(Duration::ZERO),
-            render_cost: CostRange::fixed(Duration::from_millis(1)),
+            render_cpu_cost: CostRange::fixed(Duration::from_millis(1)),
+            render_resource_cost: CostRange::fixed(Duration::ZERO),
+            first_render_resource_cost: CostRange::fixed(Duration::ZERO),
             hop_latency: Duration::ZERO,
             sla: Duration::from_secs(2),
         }

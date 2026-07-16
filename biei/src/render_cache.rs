@@ -1,6 +1,7 @@
 //! Node-local rendered image cache.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,6 +19,9 @@ use crate::types::{
 // tiles and other referenced resources may change at stable URLs. Keep the
 // cache useful for burst coalescing without serving such output indefinitely.
 const RENDER_OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const RENDER_FLIGHT_SHARDS: usize = 16;
+const _: () = assert!(RENDER_FLIGHT_SHARDS.is_power_of_two());
+type RenderFlightMap = Mutex<HashMap<RenderCacheKey, watch::Sender<u64>>>;
 
 #[derive(Clone, Default)]
 pub struct RenderOutputCache {
@@ -26,7 +30,15 @@ pub struct RenderOutputCache {
 
 struct RenderOutputCacheInner {
     cache: Cache<RenderCacheKey, Arc<RenderOutput>>,
-    in_flight: Mutex<HashMap<RenderCacheKey, watch::Sender<u64>>>,
+    in_flight: Box<[RenderFlightMap]>,
+}
+
+impl RenderOutputCacheInner {
+    fn flight_shard(&self, key: &RenderCacheKey) -> &RenderFlightMap {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.in_flight[(hasher.finish() as usize) & (RENDER_FLIGHT_SHARDS - 1)]
+    }
 }
 
 pub(crate) enum RenderCacheLookup {
@@ -55,14 +67,18 @@ impl RenderOutputCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .time_to_live(ttl)
-            .weigher(|_key: &RenderCacheKey, output: &Arc<RenderOutput>| {
-                output.bytes.len().clamp(1, u32::MAX as usize) as u32
+            .weigher(|key: &RenderCacheKey, output: &Arc<RenderOutput>| {
+                key.estimated_size_bytes()
+                    .saturating_add(output.bytes.len())
+                    .clamp(1, u32::MAX as usize) as u32
             })
             .build();
         Self {
             inner: Some(Arc::new(RenderOutputCacheInner {
                 cache,
-                in_flight: Mutex::new(HashMap::new()),
+                in_flight: (0..RENDER_FLIGHT_SHARDS)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
             })),
         }
     }
@@ -89,7 +105,7 @@ impl RenderOutputCache {
             return RenderCacheLookup::Hit((*output).clone());
         }
 
-        let mut in_flight = lock_unpoisoned(&inner.in_flight);
+        let mut in_flight = lock_unpoisoned(inner.flight_shard(&key));
         // Close the race with a leader that inserted between the first cache
         // lookup and acquiring the flight lock.
         if let Some(output) = inner.cache.get(&key) {
@@ -129,7 +145,7 @@ impl Drop for RenderFlightLeader {
         let Some(key) = self.key.take() else {
             return;
         };
-        let changed = lock_unpoisoned(&self.inner.in_flight).remove(&key);
+        let changed = lock_unpoisoned(self.inner.flight_shard(&key)).remove(&key);
         if let Some(changed) = changed {
             changed.send_modify(|version| *version = version.wrapping_add(1));
         }
@@ -157,11 +173,17 @@ impl RenderCacheKey {
         Self {
             style_id: task.style.id.as_str().to_owned(),
             style_version: task.style.version,
-            request: RenderRequestKey::from(task.request.clone()),
+            request: RenderRequestKey::from(&task.request),
             scale: task.pixel_ratio.to_scale(),
             output_format: task.output_format,
             source_hash: task.source.as_ref().map(|s| s.hash),
         }
+    }
+
+    fn estimated_size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.style_id.len())
+            .saturating_add(self.request.heap_size_bytes())
     }
 }
 
@@ -188,10 +210,37 @@ enum RenderRequestKey {
     },
 }
 
-impl From<RenderRequest> for RenderRequestKey {
-    fn from(request: RenderRequest) -> Self {
+impl RenderRequestKey {
+    fn heap_size_bytes(&self) -> usize {
+        match self {
+            Self::Tile { .. } => 0,
+            Self::StaticImage {
+                overlays,
+                before_layer,
+                ..
+            } => overlays
+                .len()
+                .saturating_mul(std::mem::size_of::<StaticOverlayKey>())
+                .saturating_add(
+                    overlays
+                        .iter()
+                        .map(StaticOverlayKey::heap_size_bytes)
+                        .sum::<usize>(),
+                )
+                .saturating_add(before_layer.as_ref().map_or(0, String::len)),
+        }
+    }
+}
+
+impl From<&RenderRequest> for RenderRequestKey {
+    fn from(request: &RenderRequest) -> Self {
         match request {
-            RenderRequest::Tile { z, x, y, tile_size } => Self::Tile { z, x, y, tile_size },
+            RenderRequest::Tile { z, x, y, tile_size } => Self::Tile {
+                z: *z,
+                x: *x,
+                y: *y,
+                tile_size: *tile_size,
+            },
             RenderRequest::StaticImage {
                 positioning,
                 width,
@@ -202,12 +251,12 @@ impl From<RenderRequest> for RenderRequestKey {
                 addlayer,
             } => Self::StaticImage {
                 positioning: PositioningKey::from(positioning),
-                width,
-                height,
-                overlays: overlays.into_iter().map(StaticOverlayKey::from).collect(),
-                before_layer,
-                padding,
-                addlayer_hash: addlayer.map(|a| a.hash),
+                width: *width,
+                height: *height,
+                overlays: overlays.iter().map(StaticOverlayKey::from).collect(),
+                before_layer: before_layer.clone(),
+                padding: *padding,
+                addlayer_hash: addlayer.as_ref().map(|a| a.hash),
             },
         }
     }
@@ -220,8 +269,27 @@ enum StaticOverlayKey {
     Pin(PinOverlayKey),
 }
 
-impl From<StaticOverlay> for StaticOverlayKey {
-    fn from(overlay: StaticOverlay) -> Self {
+impl StaticOverlayKey {
+    fn heap_size_bytes(&self) -> usize {
+        match self {
+            Self::Path(path) => path
+                .coordinates
+                .len()
+                .saturating_mul(std::mem::size_of::<LngLatKey>())
+                .saturating_add(path.stroke_color.as_ref().map_or(0, String::len))
+                .saturating_add(path.fill_color.as_ref().map_or(0, String::len)),
+            Self::GeoJson(geojson) => geojson.feature_collection.len(),
+            Self::Pin(pin) => pin
+                .label
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(pin.color.len()),
+        }
+    }
+}
+
+impl From<&StaticOverlay> for StaticOverlayKey {
+    fn from(overlay: &StaticOverlay) -> Self {
         match overlay {
             StaticOverlay::Path(path) => Self::Path(PathOverlayKey::from(path)),
             StaticOverlay::GeoJson(geojson) => Self::GeoJson(GeoJsonOverlayKey::from(geojson)),
@@ -242,8 +310,8 @@ struct GeoJsonOverlayKey {
     feature_collection: String,
 }
 
-impl From<GeoJsonOverlay> for GeoJsonOverlayKey {
-    fn from(overlay: GeoJsonOverlay) -> Self {
+impl From<&GeoJsonOverlay> for GeoJsonOverlayKey {
+    fn from(overlay: &GeoJsonOverlay) -> Self {
         Self {
             feature_collection: overlay.feature_collection.to_string(),
         }
@@ -268,26 +336,26 @@ struct PinOverlayKey {
     coordinate: LngLatKey,
 }
 
-impl From<PinOverlay> for PinOverlayKey {
-    fn from(pin: PinOverlay) -> Self {
+impl From<&PinOverlay> for PinOverlayKey {
+    fn from(pin: &PinOverlay) -> Self {
         Self {
             size: pin.size,
-            label: pin.label,
-            color: pin.color,
-            coordinate: LngLatKey::from(pin.coordinate),
+            label: pin.label.clone(),
+            color: pin.color.clone(),
+            coordinate: LngLatKey::from(&pin.coordinate),
         }
     }
 }
 
-impl From<PathOverlay> for PathOverlayKey {
-    fn from(path: PathOverlay) -> Self {
+impl From<&PathOverlay> for PathOverlayKey {
+    fn from(path: &PathOverlay) -> Self {
         Self {
             stroke_width: path.stroke_width.map(f32::to_bits),
-            stroke_color: path.stroke_color,
+            stroke_color: path.stroke_color.clone(),
             stroke_opacity: path.stroke_opacity.map(f32::to_bits),
-            fill_color: path.fill_color,
+            fill_color: path.fill_color.clone(),
             fill_opacity: path.fill_opacity.map(f32::to_bits),
-            coordinates: path.coordinates.into_iter().map(LngLatKey::from).collect(),
+            coordinates: path.coordinates.iter().map(LngLatKey::from).collect(),
         }
     }
 }
@@ -298,8 +366,8 @@ struct LngLatKey {
     lat: u64,
 }
 
-impl From<LngLat> for LngLatKey {
-    fn from(point: LngLat) -> Self {
+impl From<&LngLat> for LngLatKey {
+    fn from(point: &LngLat) -> Self {
         Self {
             lon: point.lon.to_bits(),
             lat: point.lat.to_bits(),
@@ -325,8 +393,8 @@ enum PositioningKey {
     Auto,
 }
 
-impl From<Positioning> for PositioningKey {
-    fn from(positioning: Positioning) -> Self {
+impl From<&Positioning> for PositioningKey {
+    fn from(positioning: &Positioning) -> Self {
         match positioning {
             Positioning::Center {
                 lon,
@@ -367,7 +435,7 @@ pub fn cache_hit_outcome(
         task_id: task.id,
         request_id: task.request_id.clone(),
         arrived_at: task.arrived_at,
-        had_source: task.source.is_some(),
+        had_source: task.has_source(),
         deadline_stage: None,
         result: TaskResult::Completed {
             info: CompletedInfo {
@@ -382,6 +450,7 @@ pub fn cache_hit_outcome(
                 cold_start: false,
                 source_loaded: false,
                 admitted_at_overflow: false,
+                render_observation: None,
             },
             output,
         },
@@ -434,7 +503,7 @@ mod tests {
             task_id: task.id,
             request_id: task.request_id.clone(),
             arrived_at: task.arrived_at,
-            had_source: task.source.is_some(),
+            had_source: task.has_source(),
             deadline_stage: None,
             result: TaskResult::Completed {
                 info: CompletedInfo {
@@ -449,6 +518,7 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: None,
                 },
                 output,
             },
@@ -547,10 +617,10 @@ mod tests {
             addlayer: None,
         };
 
-        assert_ne!(
-            RenderCacheKey::from_task(&base),
-            RenderCacheKey::from_task(&with_path)
-        );
+        let base_key = RenderCacheKey::from_task(&base);
+        let path_key = RenderCacheKey::from_task(&with_path);
+        assert_ne!(base_key, path_key);
+        assert!(path_key.estimated_size_bytes() > base_key.estimated_size_bytes());
     }
 
     #[test]

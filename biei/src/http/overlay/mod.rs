@@ -1,10 +1,10 @@
 /// Hard cap on `,`-separated overlay items per static image request. The
-/// renderer-side slot pool grows lazily up to this same number (§7.3.1), so
+/// renderer-side slot pool grows lazily up to this same number (§7.3), so
 /// raising this requires a memory/CPU review of permanent style state per
 /// renderer. Sized generously for realistic use cases.
 pub const MAX_OVERLAYS: usize = 64;
 pub(crate) const MAX_PATH_POINTS: usize = 500;
-/// Hard cap on `geojson({FeatureCollection})` overlays. §7.5.1 demands a bound
+/// Hard cap on `geojson({FeatureCollection})` overlays. §7.5 demands a bound
 /// at the parser layer so that GeoJSON-driven cardinality attacks (many small
 /// features, or one feature with millions of coordinates) cannot reach the
 /// renderer. Tuned generously for legitimate use; raise only with a matching
@@ -110,7 +110,7 @@ pub(crate) fn parse_static_overlays(overlay: &str) -> Result<Vec<StaticOverlay>,
 
 /// Parse a `geojson(<percent-encoded JSON>)` overlay segment. The inner JSON
 /// is required to be a GeoJSON Feature or FeatureCollection; everything else is
-/// rejected at the ingress to satisfy §7.5.1 (no arbitrary network fetch, no
+/// rejected at the ingress to satisfy §7.5 (no arbitrary network fetch, no
 /// unbounded geometry). Feature count and total coordinate count are capped.
 pub(crate) fn parse_geojson_overlay(overlay: &str) -> Result<GeoJsonOverlay, PolylineError> {
     let Some(body) = overlay.strip_prefix("geojson(") else {
@@ -182,7 +182,7 @@ fn validate_feature(
     // Whitelist the six geometry types simplestyle covers. `GeometryCollection`
     // is rejected explicitly because its nested-geometries shape would skip
     // the `coordinates` array entirely and bypass our coordinate-count cap
-    // (§7.5.1). Unknown geometry types are also rejected at ingress so they
+    // (§7.5). Unknown geometry types are also rejected at ingress so they
     // never reach the renderer's mbgl validation path.
     if !matches!(
         g_type,

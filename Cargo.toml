@@ -16,7 +16,7 @@ futures-util = "0.3"
 humantime = "2"
 httpdate = "1"
 image = "0.25"
-maplibre_native = { version = "0.8.5", default-features = false, features = ["json", "geojson", "log", "tokio"] }
+maplibre_native = { version = "0.8.7", default-features = false, features = ["json", "geojson", "log", "tokio"] }
 moka = { version = "0.12", features = ["sync"] }
 rand = "0.10.2"
 rand_distr = "0.6"

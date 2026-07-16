@@ -9,8 +9,8 @@ use tokio::time::Instant;
 use crate::renderer::{BoxRenderer, PreparedProfile};
 use crate::types::{
     CachePolicy, CompletedInfo, DeadlineStage, InternalTask, NodeId, RejectionReason,
-    RenderRequest, RendererError, RouteTier, SourceHash, TaskOutcome, TaskResult, WorkerId,
-    WorkerProfile,
+    RenderObservation, RenderRequest, RendererError, RouteTier, SourceHash, TaskOutcome,
+    TaskResult, WorkerId, WorkerProfile,
 };
 
 #[derive(Debug)]
@@ -46,6 +46,8 @@ struct StageSuccess {
     style_swap: bool,
     cold_start: bool,
     source_loaded: bool,
+    style_setup_duration: Option<std::time::Duration>,
+    source_setup_duration: Option<std::time::Duration>,
 }
 
 /// LRU source cache per renderer slot. Keyed by `SourceHash` — same source
@@ -105,7 +107,7 @@ pub async fn worker_loop(
                 admitted_at_overflow,
                 respond_to,
             } => {
-                let had_source = task.source.is_some();
+                let had_source = task.has_source();
                 let outcome = match run_stages(
                     &mut renderer,
                     &mut current_profile,
@@ -136,6 +138,11 @@ pub async fn worker_loop(
                                 cold_start: success.cold_start,
                                 source_loaded: success.source_loaded,
                                 admitted_at_overflow,
+                                render_observation: Some(RenderObservation::from_task(
+                                    &task,
+                                    success.style_setup_duration,
+                                    success.source_setup_duration,
+                                )),
                             },
                             output: success.output,
                         },
@@ -193,9 +200,11 @@ async fn run_stages(
 
     let permit = acquire_permit(render_permits, task, DeadlineStage::AcquireRenderPermit).await?;
     let started_at = Instant::now();
+    let mut style_setup_duration = None;
 
     if style_swap {
         check_deadline_at(task, DeadlineStage::StyleSwap)?;
+        let setup_started_at = Instant::now();
         renderer
             .setup_profile(task, prepared_profile)
             .await
@@ -203,15 +212,18 @@ async fn run_stages(
                 at: DeadlineStage::StyleSwap,
                 err,
             })?;
+        style_setup_duration = Some(Instant::now().duration_since(setup_started_at));
         *current_profile = Some(task_profile);
         cache.clear();
     }
 
     check_deadline_at(task, DeadlineStage::EnsureSource)?;
     let mut source_loaded = false;
+    let mut source_setup_duration = None;
     if let Some(src) = &task.source {
         let cached = cache.contains(src.hash);
         if !cached {
+            let source_started_at = Instant::now();
             renderer
                 .ensure_source(src.hash)
                 .await
@@ -219,6 +231,7 @@ async fn run_stages(
                     at: DeadlineStage::EnsureSource,
                     err,
                 })?;
+            source_setup_duration = Some(Instant::now().duration_since(source_started_at));
             source_loaded = true;
         }
         if src.policy == CachePolicy::Cacheable {
@@ -238,7 +251,7 @@ async fn run_stages(
     } else {
         task
     };
-    let output =
+    let rendered =
         renderer
             .render(task_for_render)
             .await
@@ -246,6 +259,12 @@ async fn run_stages(
                 at: DeadlineStage::Render,
                 err,
             })?;
+    source_loaded |= rendered.source_setup_duration.is_some();
+    source_setup_duration = match (source_setup_duration, rendered.source_setup_duration) {
+        (Some(before_render), Some(during_render)) => Some(before_render + during_render),
+        (duration @ Some(_), None) | (None, duration @ Some(_)) => duration,
+        (None, None) => None,
+    };
     let cpu_completed_at = Instant::now();
     drop(cpu_permit);
     drop(permit);
@@ -258,13 +277,15 @@ async fn run_stages(
     }
 
     Ok(StageSuccess {
-        output,
+        output: rendered.output,
         started_at,
         cpu_started_at,
         cpu_completed_at,
         style_swap,
         cold_start,
         source_loaded,
+        style_setup_duration,
+        source_setup_duration,
     })
 }
 

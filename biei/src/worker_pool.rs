@@ -50,7 +50,6 @@ struct PickScore {
 
 struct PickContext<'a> {
     loaded: &'a [Option<WorkerProfile>],
-    queue_depths: &'a [usize],
     addlayer_source_ids: &'a [HashSet<String>],
     incoming_addlayer_source_id: Option<&'a str>,
     incoming_profile: &'a WorkerProfile,
@@ -91,6 +90,7 @@ impl Drop for QueueSlot<'_> {
 /// after its queue drains — not necessarily right now.
 pub struct PoolState {
     pub loaded: Vec<Option<WorkerProfile>>,
+    profile_counts: HashMap<WorkerProfile, usize>,
     addlayer_source_ids: Vec<HashSet<String>>,
     addlayer_source_lru: Vec<VecDeque<String>>,
 }
@@ -99,15 +99,22 @@ impl PoolState {
     fn new(n: usize) -> Self {
         Self {
             loaded: vec![None; n],
+            profile_counts: HashMap::new(),
             addlayer_source_ids: vec![HashSet::new(); n],
             addlayer_source_lru: vec![VecDeque::new(); n],
         }
     }
 
     fn mark_loaded(&mut self, idx: usize, profile: WorkerProfile) {
-        if self.loaded[idx].as_ref() != Some(&profile) {
-            self.clear_addlayer_sources(idx);
+        if self.loaded[idx].as_ref() == Some(&profile) {
+            return;
         }
+
+        if let Some(previous) = self.loaded[idx].take() {
+            self.decrement_profile_count(&previous);
+        }
+        self.clear_addlayer_sources(idx);
+        *self.profile_counts.entry(profile.clone()).or_insert(0) += 1;
         self.loaded[idx] = Some(profile);
     }
 
@@ -130,8 +137,22 @@ impl PoolState {
     }
 
     fn clear_loaded(&mut self, idx: usize) {
-        self.loaded[idx] = None;
+        if let Some(previous) = self.loaded[idx].take() {
+            self.decrement_profile_count(&previous);
+        }
         self.clear_addlayer_sources(idx);
+    }
+
+    fn decrement_profile_count(&mut self, profile: &WorkerProfile) {
+        let remove = if let Some(count) = self.profile_counts.get_mut(profile) {
+            *count -= 1;
+            *count == 0
+        } else {
+            false
+        };
+        if remove {
+            self.profile_counts.remove(profile);
+        }
     }
 
     fn clear_addlayer_sources(&mut self, idx: usize) {
@@ -185,6 +206,10 @@ pub struct WorkerPool {
     pub bl_capacity: usize,
     /// Hard admission/backpressure limit per renderer slot.
     pub queue_capacity: usize,
+    /// Node-wide render execution permits (held across a task's whole
+    /// worker-side execution: setup → source → render).
+    pub render_permits: usize,
+    render_permit_sem: Arc<Semaphore>,
     /// Node-wide CPU/GPU-heavy render-stage permits. Defaults to
     /// `render_permits` at config resolution time, but may be lower to model
     /// I/O overlap with a fixed render bottleneck.
@@ -259,9 +284,20 @@ impl WorkerPool {
             activity,
             bl_capacity,
             queue_capacity: queue_capacity.max(bl_capacity),
+            render_permits,
+            render_permit_sem: permit_sem,
             cpu_render_permits,
             cpu_permit_sem,
         }
+    }
+
+    /// Tasks currently executing on a worker (holding the render permit across
+    /// any stage: setup, source load, or render). Used by the simulator to
+    /// tell when a draining node has finished all of its *local* work,
+    /// independent of tasks it forwarded to peers.
+    pub fn render_permits_inuse(&self) -> usize {
+        self.render_permits
+            .saturating_sub(self.render_permit_sem.available_permits())
     }
 
     pub fn cpu_permits_inuse(&self) -> usize {
@@ -294,26 +330,23 @@ impl WorkerPool {
     ///   6. Fallback: saturated warm-for-profile → reject path.
     fn pick_local(&self, task: &InternalTask, prepared_profile: Option<&PreparedProfile>) -> usize {
         let s = lock_unpoisoned(&self.state);
-        let queue_depths: Vec<usize> = (0..self.workers.len()).map(|i| self.queue_at(i)).collect();
         let task_profile = task.worker_profile();
-        let profile_counts = profile_counts(&s.loaded);
         let addlayer_source_id = prepared_profile
             .and_then(|prepared| prepared.addlayer_source.as_ref())
             .map(|source| source.stable_source_id());
         let ctx = PickContext {
             loaded: &s.loaded,
-            queue_depths: &queue_depths,
             addlayer_source_ids: &s.addlayer_source_ids,
             incoming_addlayer_source_id: addlayer_source_id.as_deref(),
             incoming_profile: &task_profile,
             bl_capacity: self.bl_capacity,
             queue_capacity: self.queue_capacity,
-            profile_counts: &profile_counts,
+            profile_counts: &s.profile_counts,
             activity: &self.activity,
         };
 
         (0..self.workers.len())
-            .min_by_key(|i| pick_score(&ctx, *i))
+            .min_by_key(|i| pick_score(&ctx, *i, self.queue_at(*i)))
             .expect("worker pool is empty")
     }
 
@@ -417,6 +450,7 @@ impl WorkerPool {
     }
 }
 
+#[cfg(test)]
 fn profile_counts(loaded: &[Option<WorkerProfile>]) -> HashMap<WorkerProfile, usize> {
     let mut counts = HashMap::new();
     for profile in loaded.iter().flatten() {
@@ -425,8 +459,7 @@ fn profile_counts(loaded: &[Option<WorkerProfile>]) -> HashMap<WorkerProfile, us
     counts
 }
 
-fn pick_score(ctx: &PickContext<'_>, idx: usize) -> PickScore {
-    let queue_depth = ctx.queue_depths[idx];
+fn pick_score(ctx: &PickContext<'_>, idx: usize, queue_depth: usize) -> PickScore {
     let loaded_profile = ctx.loaded[idx].as_ref();
     let warm = loaded_profile == Some(ctx.incoming_profile);
     let expand_threshold = (ctx.bl_capacity * 2 / 3).max(1);
@@ -478,10 +511,11 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use crate::renderer::{PreparedProfile, Renderer};
+    use crate::renderer::{PreparedProfile, Renderer, RendererOutput};
     use crate::types::{
-        ImageFormat, InternalTask, PixelRatio, RenderMode, RenderOutput, RenderRequest,
-        RendererError, Scale, SourceHash, StyleId, StyleRevision, TaskId,
+        AddLayer, AddLayerSource, ImageFormat, InternalTask, Padding, PixelRatio, Positioning,
+        RenderMode, RenderOutput, RenderRequest, RendererError, Scale, SourceHash, StyleId,
+        StyleRevision, TaskId, TaskResult,
     };
 
     use super::*;
@@ -505,6 +539,8 @@ mod tests {
         setup_count: Arc<AtomicUsize>,
     }
 
+    struct SourceSetupRenderer;
+
     #[async_trait::async_trait]
     impl Renderer for NoopRenderer {
         async fn setup_profile(
@@ -519,11 +555,12 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             Ok(RenderOutput {
                 bytes: bytes::Bytes::new(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -544,11 +581,12 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             Ok(RenderOutput {
                 bytes: bytes::Bytes::new(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -566,12 +604,13 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             tokio::time::sleep(self.delay).await;
             Ok(RenderOutput {
                 bytes: bytes::Bytes::new(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
 
         fn retire_after_current(&mut self) {
@@ -593,7 +632,7 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
             let current = self.inflight.fetch_add(1, Ordering::AcqRel) + 1;
             self.max_seen.fetch_max(current, Ordering::AcqRel);
             tokio::time::sleep(self.delay).await;
@@ -601,7 +640,8 @@ mod tests {
             Ok(RenderOutput {
                 bytes: bytes::Bytes::new(),
                 format: task.output_format,
-            })
+            }
+            .into())
         }
     }
 
@@ -620,11 +660,124 @@ mod tests {
             Ok(())
         }
 
-        async fn render(&mut self, _task: &InternalTask) -> Result<RenderOutput, RendererError> {
+        async fn render(&mut self, _task: &InternalTask) -> Result<RendererOutput, RendererError> {
             Err(RendererError::RenderFailed(
                 "test render failure".to_string(),
             ))
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Renderer for SourceSetupRenderer {
+        async fn setup_profile(
+            &mut self,
+            _task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            Ok(RendererOutput {
+                output: RenderOutput {
+                    bytes: bytes::Bytes::new(),
+                    format: task.output_format,
+                },
+                source_setup_duration: Some(Duration::from_millis(3)),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_task_carries_calibration_observation() {
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(NoopRenderer)],
+            activity: Arc::new(ProfileActivityTracker::new()),
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            cpu_render_permits: 1,
+            source_cache_capacity: 1,
+        });
+
+        let outcome = pool
+            .process(make_task(1, 1), None, RouteTier::Tier2HrwBl, Some(0))
+            .await
+            .expect("task processes");
+        let TaskResult::Completed { info, .. } = outcome.result else {
+            panic!("expected completion");
+        };
+        let observation = info.render_observation.expect("render observation");
+        assert_eq!(observation.render_mode, RenderMode::Tile);
+        assert_eq!(observation.scale, Scale::X1);
+        assert_eq!(observation.output_format, ImageFormat::Png);
+        assert_eq!((observation.width, observation.height), (256, 256));
+        assert!(observation.style_setup_duration.is_some());
+        assert_eq!(observation.source_setup_duration, None);
+
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn addlayer_source_setup_is_reported_from_the_renderer() {
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(SourceSetupRenderer)],
+            activity: Arc::new(ProfileActivityTracker::new()),
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            cpu_render_permits: 1,
+            source_cache_capacity: 1,
+        });
+        let mut task = make_task(1, 1);
+        task.request = RenderRequest::StaticImage {
+            positioning: Positioning::Center {
+                lon: 0.0,
+                lat: 0.0,
+                zoom: 1.0,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+            width: 256,
+            height: 256,
+            overlays: Vec::new(),
+            before_layer: None,
+            padding: Padding::default(),
+            addlayer: Some(AddLayer {
+                json: r#"{"id":"test","type":"fill","source":{"type":"vector","url":"tiles"}}"#
+                    .to_string(),
+                hash: 1,
+                source: Some(AddLayerSource {
+                    tileset_id: "tiles".to_string(),
+                    json: r#"{"type":"vector","tiles":["https://tiles.test/{z}/{x}/{y}.pbf"]}"#
+                        .to_string(),
+                }),
+            }),
+        };
+
+        let outcome = pool
+            .process(task, None, RouteTier::Tier2HrwBl, Some(0))
+            .await
+            .expect("task processes");
+        assert!(outcome.had_source);
+        let TaskResult::Completed { info, .. } = outcome.result else {
+            panic!("expected completion");
+        };
+        assert!(info.source_loaded);
+        assert_eq!(
+            info.render_observation
+                .expect("render observation")
+                .source_setup_duration,
+            Some(Duration::from_millis(3))
+        );
+
+        pool.shutdown().await;
     }
 
     fn rev(id: u32) -> StyleRevision {
@@ -677,7 +830,6 @@ mod tests {
         let addlayer_source_ids = vec![HashSet::new(); loaded.len()];
         let ctx = PickContext {
             loaded,
-            queue_depths,
             addlayer_source_ids: &addlayer_source_ids,
             incoming_addlayer_source_id: None,
             incoming_profile,
@@ -688,7 +840,7 @@ mod tests {
         };
         (0..loaded.len())
             .filter_map(|idx| {
-                let score = pick_score(&ctx, idx);
+                let score = pick_score(&ctx, idx, queue_depths[idx]);
                 (score.tier == PickTier::AllocSwapIdle).then_some((idx, score))
             })
             .min_by_key(|(_, score)| *score)
@@ -697,10 +849,19 @@ mod tests {
 
     #[test]
     fn profile_counts_ignores_unassigned_workers() {
-        let counts = profile_counts(&[Some(lp(1)), None, Some(lp(1)), Some(lp(2))]);
-        assert_eq!(counts.get(&lp(1)), Some(&2));
-        assert_eq!(counts.get(&lp(2)), Some(&1));
-        assert_eq!(counts.get(&lp(3)), None);
+        let mut state = PoolState::new(4);
+        state.mark_loaded(0, lp(1));
+        state.mark_loaded(2, lp(1));
+        state.mark_loaded(3, lp(2));
+
+        assert_eq!(state.profile_counts.get(&lp(1)), Some(&2));
+        assert_eq!(state.profile_counts.get(&lp(2)), Some(&1));
+        assert_eq!(state.profile_counts.get(&lp(3)), None);
+
+        state.mark_loaded(2, lp(2));
+        state.clear_loaded(0);
+        assert_eq!(state.profile_counts.get(&lp(1)), None);
+        assert_eq!(state.profile_counts.get(&lp(2)), Some(&2));
     }
 
     #[test]
@@ -806,13 +967,12 @@ mod tests {
     fn local_pick_prefers_cached_addlayer_source_within_same_tier() {
         let activity = ProfileActivityTracker::new();
         let loaded = vec![Some(lp(1)), Some(lp(1))];
-        let queue_depths = vec![0, 0];
+        let queue_depths = [0, 0];
         let mut addlayer_source_ids = vec![HashSet::new(), HashSet::new()];
         addlayer_source_ids[1].insert("__biei_addlayer_source_cached".to_string());
         let profile_counts = profile_counts(&loaded);
         let ctx = PickContext {
             loaded: &loaded,
-            queue_depths: &queue_depths,
             addlayer_source_ids: &addlayer_source_ids,
             incoming_addlayer_source_id: Some("__biei_addlayer_source_cached"),
             incoming_profile: &lp(1),
@@ -823,7 +983,7 @@ mod tests {
         };
 
         let picked = (0..loaded.len())
-            .min_by_key(|idx| pick_score(&ctx, *idx))
+            .min_by_key(|idx| pick_score(&ctx, *idx, queue_depths[*idx]))
             .unwrap();
 
         assert_eq!(picked, 1);

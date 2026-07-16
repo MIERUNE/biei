@@ -1,0 +1,47 @@
+# Autoscale the render pool on standard Kubernetes CPU metrics so this portable
+# example needs no Prometheus/custom-metrics adapter. A 50% target keeps roughly
+# one of the two requested cores available for a new render. This is a baseline,
+# not a sufficient production signal: provider-latency-bound workloads need
+# queue/admission-wait scaling because queues can grow while CPU stays low.
+#
+# The GKE overlay drops the Deployment's fixed `spec.replicas` (see
+# kustomization.yaml) so repeated `kubectl apply` does not fight the HPA.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: biei
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: biei
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      # Renders are short; drain + preStop make scale-down safe, but avoid
+      # flapping on bursty traffic.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      # From the two-pod minimum, allow 2 -> 4 -> 6 without waiting a minute
+      # between steps. `Max` chooses the more responsive policy as the pool grows.
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 2
+          periodSeconds: 15

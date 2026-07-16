@@ -8,7 +8,21 @@ use prometheus::{
     proto::MetricFamily,
 };
 
-use crate::types::{DeadlineStage, RejectionReason, RouteTier, TaskOutcome, TaskResult};
+use crate::types::{
+    DeadlineStage, ImageFormat, RejectionReason, RenderMode, RenderObservation, RouteTier, Scale,
+    TaskOutcome, TaskResult,
+};
+
+type BoxedCollector = Box<dyn prometheus::core::Collector>;
+
+/// Register a fixed metric family set consistently. Metric construction and
+/// registration are startup invariants; a duplicate or invalid descriptor is
+/// a programming error, not a recoverable runtime condition.
+fn register_collectors<const N: usize>(registry: &Registry, collectors: [BoxedCollector; N]) {
+    for collector in collectors {
+        registry.register(collector).expect("register biei metric");
+    }
+}
 
 /// One renderer worker's gauge sample. Primitives only, so the dynamic gauge
 /// schema can live here in `metrics` without depending on the worker/profile
@@ -85,7 +99,13 @@ pub struct NodeMetrics {
     rejected: IntCounterVec,
     failed: IntCounterVec,
     request_duration: HistogramVec,
+    native_render_duration: HistogramVec,
+    /// Deprecated metric-name compatibility alias for native render residency.
     cpu_render_duration: HistogramVec,
+    render_duration: HistogramVec,
+    style_setup_duration: HistogramVec,
+    source_setup_duration: HistogramVec,
+    profile_prepare_duration: HistogramVec,
     style_swaps: IntCounterVec,
     cold_starts: IntCounterVec,
     source_cache: IntCounterVec,
@@ -128,15 +148,60 @@ impl NodeMetrics {
             &["scope", "route_tier"],
         )
         .expect("valid request duration histogram");
+        let native_render_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "biei_native_render_duration_seconds",
+                "Native renderStill wall time, including in-render FileSource waits.",
+            )
+            .buckets(CPU_RENDER_BUCKETS.to_vec()),
+            &["scope"],
+        )
+        .expect("valid native render duration histogram");
         let cpu_render_duration = HistogramVec::new(
             HistogramOpts::new(
                 "biei_cpu_render_duration_seconds",
-                "CPU/GPU-heavy render-stage duration.",
+                "Deprecated alias of biei_native_render_duration_seconds; includes FileSource waits and is not CPU service time.",
             )
             .buckets(CPU_RENDER_BUCKETS.to_vec()),
             &["scope"],
         )
         .expect("valid cpu render duration histogram");
+        let render_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "biei_render_duration_seconds",
+                "Native render and output encoding duration by bounded render shape and worker state.",
+            )
+            .buckets(CPU_RENDER_BUCKETS.to_vec()),
+            &["scope", "render_mode", "scale", "format", "size", "state"],
+        )
+        .expect("valid detailed render duration histogram");
+        let style_setup_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "biei_style_setup_duration_seconds",
+                "Worker profile/style setup duration for cold starts and style swaps.",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+            &["scope", "render_mode", "scale", "state"],
+        )
+        .expect("valid style setup duration histogram");
+        let source_setup_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "biei_source_setup_duration_seconds",
+                "Worker source setup duration on modeled or addlayer source-cache misses.",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+            &["scope", "render_mode", "scale"],
+        )
+        .expect("valid source setup duration histogram");
+        let profile_prepare_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "biei_profile_prepare_duration_seconds",
+                "Pre-worker style and addlayer profile preparation duration.",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+            &["outcome"],
+        )
+        .expect("valid profile preparation duration histogram");
         let style_swaps = IntCounterVec::new(
             prometheus::Opts::new(
                 "biei_style_swaps_total",
@@ -194,24 +259,28 @@ impl NodeMetrics {
         )
         .expect("valid deadline stage counter");
 
-        for collector in [
-            Box::new(completed.clone()) as Box<dyn prometheus::core::Collector>,
-            Box::new(rejected.clone()),
-            Box::new(failed.clone()),
-            Box::new(request_duration.clone()),
-            Box::new(cpu_render_duration.clone()),
-            Box::new(style_swaps.clone()),
-            Box::new(cold_starts.clone()),
-            Box::new(source_cache.clone()),
-            Box::new(render_output_cache.clone()),
-            Box::new(forwards.clone()),
-            Box::new(admission_overflow.clone()),
-            Box::new(deadline_exceeded.clone()),
-        ] {
-            registry
-                .register(collector)
-                .expect("register static biei metric");
-        }
+        register_collectors(
+            &registry,
+            [
+                Box::new(completed.clone()) as BoxedCollector,
+                Box::new(rejected.clone()),
+                Box::new(failed.clone()),
+                Box::new(request_duration.clone()),
+                Box::new(native_render_duration.clone()),
+                Box::new(cpu_render_duration.clone()),
+                Box::new(render_duration.clone()),
+                Box::new(style_setup_duration.clone()),
+                Box::new(source_setup_duration.clone()),
+                Box::new(profile_prepare_duration.clone()),
+                Box::new(style_swaps.clone()),
+                Box::new(cold_starts.clone()),
+                Box::new(source_cache.clone()),
+                Box::new(render_output_cache.clone()),
+                Box::new(forwards.clone()),
+                Box::new(admission_overflow.clone()),
+                Box::new(deadline_exceeded.clone()),
+            ],
+        );
 
         let metrics = Self {
             registry,
@@ -219,7 +288,12 @@ impl NodeMetrics {
             rejected,
             failed,
             request_duration,
+            native_render_duration,
             cpu_render_duration,
+            render_duration,
+            style_setup_duration,
+            source_setup_duration,
+            profile_prepare_duration,
             style_swaps,
             cold_starts,
             source_cache,
@@ -270,6 +344,12 @@ impl NodeMetrics {
         self.render_output_cache
             .with_label_values(&["insert"])
             .inc();
+    }
+
+    pub fn record_profile_prepare(&self, duration: Duration, succeeded: bool) {
+        self.profile_prepare_duration
+            .with_label_values(&[if succeeded { "success" } else { "failure" }])
+            .observe(seconds(duration));
     }
 
     pub fn gather(&self) -> Vec<MetricFamily> {
@@ -351,20 +431,19 @@ impl NodeMetrics {
         )
         .expect("valid renderer-replacements counter");
 
-        for collector in [
-            Box::new(queue_depth.clone()) as Box<dyn prometheus::core::Collector>,
-            Box::new(worker_loaded.clone()),
-            Box::new(membership_size.clone()),
-            Box::new(cpu_permits_inuse.clone()),
-            Box::new(drain_state.clone()),
-            Box::new(renderer_slots.clone()),
-            Box::new(renderer_orphaned.clone()),
-            Box::new(renderer_replacements.clone()),
-        ] {
-            registry
-                .register(collector)
-                .expect("register dynamic biei metric");
-        }
+        register_collectors(
+            &registry,
+            [
+                Box::new(queue_depth.clone()) as BoxedCollector,
+                Box::new(worker_loaded.clone()),
+                Box::new(membership_size.clone()),
+                Box::new(cpu_permits_inuse.clone()),
+                Box::new(drain_state.clone()),
+                Box::new(renderer_slots.clone()),
+                Box::new(renderer_orphaned.clone()),
+                Box::new(renderer_replacements.clone()),
+            ],
+        );
 
         for worker in &runtime.workers {
             queue_depth
@@ -418,11 +497,46 @@ impl NodeMetrics {
                         info.completed_at.duration_since(outcome.arrived_at),
                     ));
                 if info.route_tier != RouteTier::RenderCacheHit {
+                    let render_seconds =
+                        seconds(info.cpu_completed_at.duration_since(info.cpu_started_at));
+                    self.native_render_duration
+                        .with_label_values(&[scope])
+                        .observe(render_seconds);
                     self.cpu_render_duration
                         .with_label_values(&[scope])
-                        .observe(seconds(
-                            info.cpu_completed_at.duration_since(info.cpu_started_at),
-                        ));
+                        .observe(render_seconds);
+                    if let Some(observation) = &info.render_observation {
+                        let state = render_state_label(info.cold_start, info.style_swap);
+                        self.render_duration
+                            .with_label_values(&[
+                                scope,
+                                render_mode_label(observation.render_mode),
+                                observation.scale.as_gossip_value(),
+                                image_format_label(observation.output_format),
+                                render_size_label(observation),
+                                state,
+                            ])
+                            .observe(render_seconds);
+                        if let Some(duration) = observation.style_setup_duration {
+                            self.style_setup_duration
+                                .with_label_values(&[
+                                    scope,
+                                    render_mode_label(observation.render_mode),
+                                    observation.scale.as_gossip_value(),
+                                    state,
+                                ])
+                                .observe(seconds(duration));
+                        }
+                        if let Some(duration) = observation.source_setup_duration {
+                            self.source_setup_duration
+                                .with_label_values(&[
+                                    scope,
+                                    render_mode_label(observation.render_mode),
+                                    observation.scale.as_gossip_value(),
+                                ])
+                                .observe(seconds(duration));
+                        }
+                    }
                 }
                 if info.style_swap {
                     self.style_swaps.with_label_values(&[scope]).inc();
@@ -464,6 +578,7 @@ impl NodeMetrics {
             self.admission_overflow
                 .with_label_values(&[scope])
                 .inc_by(0);
+            self.native_render_duration.with_label_values(&[scope]);
             self.cpu_render_duration.with_label_values(&[scope]);
             for tier in ROUTE_TIERS {
                 let tier = route_tier_label(tier);
@@ -478,6 +593,9 @@ impl NodeMetrics {
         }
         for outcome in ["hit", "miss"] {
             self.source_cache.with_label_values(&[outcome]).inc_by(0);
+        }
+        for outcome in ["success", "failure"] {
+            self.profile_prepare_duration.with_label_values(&[outcome]);
         }
         for outcome in ["hit", "miss", "coalesced", "insert"] {
             self.render_output_cache
@@ -498,6 +616,42 @@ impl NodeMetrics {
 impl Default for NodeMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn render_mode_label(mode: RenderMode) -> &'static str {
+    mode.as_gossip_value()
+}
+
+fn image_format_label(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Jpeg => "jpeg",
+    }
+}
+
+fn render_state_label(cold_start: bool, style_swap: bool) -> &'static str {
+    if cold_start {
+        "cold"
+    } else if style_swap {
+        "swap"
+    } else {
+        "warm"
+    }
+}
+
+fn render_size_label(observation: &RenderObservation) -> &'static str {
+    let scale = match observation.scale {
+        Scale::X1 => 1_u32,
+        Scale::X2 => 2_u32,
+    };
+    match u32::from(observation.width.max(observation.height)).saturating_mul(scale) {
+        0..=256 => "le_256px",
+        257..=512 => "le_512px",
+        513..=1_024 => "le_1024px",
+        1_025..=2_048 => "le_2048px",
+        _ => "gt_2048px",
     }
 }
 
@@ -544,7 +698,10 @@ fn seconds(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CompletedInfo, ImageFormat, NodeId, RenderOutput, RequestId, TaskOutcome};
+    use crate::types::{
+        CompletedInfo, ImageFormat, NodeId, RenderMode, RenderObservation, RenderOutput, RequestId,
+        Scale, TaskOutcome,
+    };
     use tokio::time::Instant;
 
     fn completed_outcome(route_tier: RouteTier) -> TaskOutcome {
@@ -568,6 +725,15 @@ mod tests {
                     cold_start: false,
                     source_loaded: false,
                     admitted_at_overflow: false,
+                    render_observation: Some(RenderObservation {
+                        render_mode: RenderMode::Static,
+                        scale: Scale::X2,
+                        output_format: ImageFormat::Webp,
+                        width: 512,
+                        height: 512,
+                        style_setup_duration: None,
+                        source_setup_duration: None,
+                    }),
                 },
                 output: RenderOutput {
                     bytes: bytes::Bytes::new(),
@@ -602,6 +768,23 @@ mod tests {
         );
         assert!(rendered.contains("biei_request_duration_seconds_bucket"));
         assert!(rendered.contains("biei_cpu_render_duration_seconds_bucket"));
+        assert!(rendered.contains("biei_native_render_duration_seconds_bucket"));
+    }
+
+    #[test]
+    fn detailed_render_histograms_keep_ingress_and_forwarded_scopes_separate() {
+        let metrics = NodeMetrics::default();
+        let outcome = completed_outcome(RouteTier::Tier2HrwBl);
+        metrics.record_ingress(&outcome);
+        metrics.record_forwarded(&outcome);
+
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains(
+            "biei_render_duration_seconds_count{format=\"webp\",render_mode=\"static\",scale=\"2x\",scope=\"ingress\",size=\"le_1024px\",state=\"warm\"} 1"
+        ));
+        assert!(rendered.contains(
+            "biei_render_duration_seconds_count{format=\"webp\",render_mode=\"static\",scale=\"2x\",scope=\"forwarded\",size=\"le_1024px\",state=\"warm\"} 1"
+        ));
     }
 
     #[test]
@@ -614,6 +797,12 @@ mod tests {
             info.cold_start = true;
             info.source_loaded = true;
             info.admitted_at_overflow = true;
+            let observation = info
+                .render_observation
+                .as_mut()
+                .expect("render observation");
+            observation.style_setup_duration = Some(Duration::from_millis(4));
+            observation.source_setup_duration = Some(Duration::from_millis(3));
         }
         metrics.record_ingress(&outcome);
         metrics.record_ingress(&TaskOutcome {
@@ -629,6 +818,8 @@ mod tests {
         metrics.record_forward_success();
         metrics.record_forward_retryable();
         metrics.record_forward_fatal();
+        metrics.record_profile_prepare(Duration::from_millis(2), true);
+        metrics.record_profile_prepare(Duration::from_millis(5), false);
 
         let rendered = metrics.render_prometheus();
         assert!(rendered.contains("biei_style_swaps_total{scope=\"ingress\"} 1"));
@@ -639,6 +830,21 @@ mod tests {
         assert!(rendered.contains("biei_forwards_total{outcome=\"success\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"retryable\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"fatal\"} 1"));
+        assert!(rendered.contains(
+            "biei_render_duration_seconds_count{format=\"webp\",render_mode=\"static\",scale=\"2x\",scope=\"ingress\",size=\"le_1024px\",state=\"cold\"} 1"
+        ));
+        assert!(rendered.contains(
+            "biei_style_setup_duration_seconds_count{render_mode=\"static\",scale=\"2x\",scope=\"ingress\",state=\"cold\"} 1"
+        ));
+        assert!(rendered.contains(
+            "biei_source_setup_duration_seconds_count{render_mode=\"static\",scale=\"2x\",scope=\"ingress\"} 1"
+        ));
+        assert!(
+            rendered.contains("biei_profile_prepare_duration_seconds_count{outcome=\"success\"} 1")
+        );
+        assert!(
+            rendered.contains("biei_profile_prepare_duration_seconds_count{outcome=\"failure\"} 1")
+        );
     }
 
     #[test]
@@ -651,6 +857,9 @@ mod tests {
             "biei_request_duration_seconds_count{route_tier=\"render_cache_hit\",scope=\"ingress\"} 1"
         ));
         assert!(rendered.contains("biei_cpu_render_duration_seconds_count{scope=\"ingress\"} 0"));
+        assert!(
+            rendered.contains("biei_native_render_duration_seconds_count{scope=\"ingress\"} 0")
+        );
     }
 
     #[test]

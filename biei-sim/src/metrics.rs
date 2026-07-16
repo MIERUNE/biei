@@ -21,8 +21,8 @@ const LATENCY_HISTOGRAM_BOUNDS_MS: &[u64] = &[
 struct TaskRecord {
     arrived_at: Instant,
     completed_at: Option<Instant>,
-    cpu_started_at: Option<Instant>,
-    cpu_completed_at: Option<Instant>,
+    native_render_started_at: Option<Instant>,
+    native_render_completed_at: Option<Instant>,
     route_tier: Option<RouteTier>,
     style_swap: bool,
     cold_start: bool,
@@ -49,7 +49,7 @@ pub struct MetricsCollector {
 struct MetricsState {
     records: Vec<TaskRecord>,
     observation: MetricsObservation,
-    cpu_capacity_events: Vec<(Instant, usize)>,
+    native_capacity_events: Vec<(Instant, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,13 +68,13 @@ pub(crate) struct MetricsObservation {
 
 impl MetricsCollector {
     pub fn new() -> Self {
-        Self::with_cpu_render_permits(0)
+        Self::with_native_render_permits(0)
     }
 
-    pub fn with_cpu_render_permits(cpu_render_permits_total: usize) -> Self {
+    pub fn with_native_render_permits(native_render_permits_total: usize) -> Self {
         Self {
             state: Mutex::new(MetricsState {
-                cpu_capacity_events: vec![(Instant::now(), cpu_render_permits_total)],
+                native_capacity_events: vec![(Instant::now(), native_render_permits_total)],
                 ..MetricsState::default()
             }),
         }
@@ -91,8 +91,10 @@ impl MetricsCollector {
             TaskResult::Completed { info: c, .. } => TaskRecord {
                 arrived_at,
                 completed_at: Some(c.completed_at),
-                cpu_started_at: Some(c.cpu_started_at),
-                cpu_completed_at: Some(c.cpu_completed_at),
+                // Production retains historical `cpu_*` field names, but the
+                // interval covers the whole native render call, including I/O.
+                native_render_started_at: Some(c.cpu_started_at),
+                native_render_completed_at: Some(c.cpu_completed_at),
                 route_tier: Some(c.route_tier),
                 style_swap: c.style_swap,
                 cold_start: c.cold_start,
@@ -105,8 +107,8 @@ impl MetricsCollector {
             TaskResult::Rejected { reason } => TaskRecord {
                 arrived_at,
                 completed_at: None,
-                cpu_started_at: None,
-                cpu_completed_at: None,
+                native_render_started_at: None,
+                native_render_completed_at: None,
                 route_tier: None,
                 style_swap: false,
                 cold_start: false,
@@ -119,8 +121,8 @@ impl MetricsCollector {
             TaskResult::Failed { error, .. } => TaskRecord {
                 arrived_at,
                 completed_at: None,
-                cpu_started_at: None,
-                cpu_completed_at: None,
+                native_render_started_at: None,
+                native_render_completed_at: None,
                 route_tier: None,
                 style_swap: false,
                 cold_start: false,
@@ -158,14 +160,30 @@ impl MetricsCollector {
             .clone()
     }
 
-    pub(crate) fn set_cpu_render_permits_total(&self, total: usize) {
+    pub(crate) fn completed_latencies_between(&self, start: usize, end: usize) -> Vec<Duration> {
+        let state = self.state.lock().expect("metrics poisoned");
+        let end = end.min(state.records.len());
+        if start >= end {
+            return Vec::new();
+        }
+        state.records[start..end]
+            .iter()
+            .filter_map(|record| {
+                record
+                    .completed_at
+                    .map(|completed_at| completed_at.saturating_duration_since(record.arrived_at))
+            })
+            .collect()
+    }
+
+    pub(crate) fn set_native_render_permits_total(&self, total: usize) {
         let mut state = self.state.lock().expect("metrics poisoned");
         if state
-            .cpu_capacity_events
+            .native_capacity_events
             .last()
             .is_none_or(|(_, current)| *current != total)
         {
-            state.cpu_capacity_events.push((Instant::now(), total));
+            state.native_capacity_events.push((Instant::now(), total));
         }
     }
 
@@ -242,26 +260,29 @@ impl MetricsCollector {
         }
 
         let sla_violations = latencies.iter().filter(|&&d| d > sla).count();
-        let cpu_render_busy = completed.iter().fold(Duration::ZERO, |acc, r| {
-            match (r.cpu_started_at, r.cpu_completed_at) {
+        let native_render_busy = completed.iter().fold(Duration::ZERO, |acc, r| {
+            match (r.native_render_started_at, r.native_render_completed_at) {
                 (Some(start), Some(end)) if end >= start => acc + end.duration_since(start),
                 _ => acc,
             }
         });
-        let cpu_render_avg_inflight = if elapsed.as_secs_f64() > 0.0 {
-            cpu_render_busy.as_secs_f64() / elapsed.as_secs_f64()
+        let native_render_avg_inflight = if elapsed.as_secs_f64() > 0.0 {
+            native_render_busy.as_secs_f64() / elapsed.as_secs_f64()
         } else {
             0.0
         };
-        let cpu_render_peak_inflight = peak_inflight(&completed);
-        let cpu_render_permits_total = state
-            .cpu_capacity_events
+        let native_render_peak_inflight = peak_inflight(&completed);
+        let native_render_permits_total = state
+            .native_capacity_events
             .last()
             .map_or(0, |(_, permits)| *permits);
-        let avg_cpu_capacity =
-            average_capacity(&state.cpu_capacity_events, first_arrival, last_completion);
-        let cpu_render_utilization_pct = if avg_cpu_capacity > 0.0 {
-            cpu_render_avg_inflight / avg_cpu_capacity * 100.0
+        let avg_native_capacity = average_capacity(
+            &state.native_capacity_events,
+            first_arrival,
+            last_completion,
+        );
+        let native_render_utilization_pct = if avg_native_capacity > 0.0 {
+            native_render_avg_inflight / avg_native_capacity * 100.0
         } else {
             0.0
         };
@@ -290,11 +311,11 @@ impl MetricsCollector {
             source_hits,
             tier_counts,
             elapsed,
-            cpu_render_permits_total,
-            cpu_render_busy,
-            cpu_render_avg_inflight,
-            cpu_render_peak_inflight,
-            cpu_render_utilization_pct,
+            native_render_permits_total,
+            native_render_busy,
+            native_render_avg_inflight,
+            native_render_peak_inflight,
+            native_render_utilization_pct,
         }
     }
 }
@@ -351,7 +372,7 @@ fn average_capacity(
 fn peak_inflight(records: &[&TaskRecord]) -> usize {
     let mut events = Vec::new();
     for r in records {
-        if let (Some(start), Some(end)) = (r.cpu_started_at, r.cpu_completed_at)
+        if let (Some(start), Some(end)) = (r.native_render_started_at, r.native_render_completed_at)
             && end >= start
         {
             events.push((start, 0_u8, 1_i32));
@@ -408,11 +429,11 @@ pub struct Report {
     pub source_hits: usize,
     pub tier_counts: HashMap<RouteTier, usize>,
     pub elapsed: Duration,
-    pub cpu_render_permits_total: usize,
-    pub cpu_render_busy: Duration,
-    pub cpu_render_avg_inflight: f64,
-    pub cpu_render_peak_inflight: usize,
-    pub cpu_render_utilization_pct: f64,
+    pub native_render_permits_total: usize,
+    pub native_render_busy: Duration,
+    pub native_render_avg_inflight: f64,
+    pub native_render_peak_inflight: usize,
+    pub native_render_utilization_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,7 +490,7 @@ impl Report {
              SLA ({:?}):         {} violations ({:.2}% of completed)\n\
              Elapsed (sim):     {:?}\n\
              Throughput:        {:.2} req/s\n\
-             CPU render util:   {:.1}% avg={:.2} peak={} permits={} busy={:?}\n\
+             Native render util:   {:.1}% avg={:.2} peak={} permits={} busy={:?}\n\
              Latency p50:       {:?}\n\
              Latency p90:       {:?}\n\
              Latency p95:       {:?}\n\
@@ -498,11 +519,11 @@ impl Report {
             pct_complete(self.sla_violations),
             self.elapsed,
             self.throughput,
-            self.cpu_render_utilization_pct,
-            self.cpu_render_avg_inflight,
-            self.cpu_render_peak_inflight,
-            self.cpu_render_permits_total,
-            self.cpu_render_busy,
+            self.native_render_utilization_pct,
+            self.native_render_avg_inflight,
+            self.native_render_peak_inflight,
+            self.native_render_permits_total,
+            self.native_render_busy,
             self.latency_p50,
             self.latency_p90,
             self.latency_p95,

@@ -59,6 +59,11 @@ pub struct Options {
     pub source_cache_capacity: usize,
     pub render_output_cache_capacity_bytes: u64,
     pub mln_resource_cache_capacity_bytes: u64,
+    /// Concurrent response-body downloads in the Rust network FileSource —
+    /// the node's effective in-render I/O parallelism.
+    pub mln_body_permits: usize,
+    /// Concurrent regular-priority upstream fetches (admission lane).
+    pub mln_regular_permits: usize,
     /// Hosts that may resolve to private, loopback, or link-local addresses.
     /// Other resource hosts must resolve to public addresses.
     pub mln_resource_private_hosts: Vec<String>,
@@ -131,8 +136,18 @@ struct Cli {
         default_value_t = DEFAULT_MLN_RESOURCE_CACHE_BYTES
     )]
     mln_resource_cache_bytes: u64,
+    /// Concurrent response-body downloads in the Rust network FileSource.
+    /// Defaults to `max(24, 4 × render permits)`; each slot reserves one
+    /// worst-case body buffer (16 MiB for tiles/images).
+    #[arg(long, env = "BIEI_MLN_BODY_PERMITS")]
+    mln_body_permits: Option<usize>,
+    /// Concurrent regular-priority upstream fetches. Defaults to
+    /// `max(64, 2 × body permits)`; clamped to at least the body permits.
+    #[arg(long, hide = true, env = "BIEI_MLN_REGULAR_PERMITS")]
+    mln_regular_permits: Option<usize>,
     /// Resource hosts allowed to resolve to non-public addresses. Exact hosts
-    /// and leading-wildcard domains (`*.svc.cluster.local`) are accepted.
+    /// and leading-wildcard domains (`*.svc.cluster.local`) are accepted; use
+    /// the narrowest exact hosts possible when resource URLs are not trusted.
     #[arg(long, env = "BIEI_MLN_RESOURCE_PRIVATE_HOSTS", value_delimiter = ',')]
     mln_resource_private_hosts: Vec<String>,
     #[arg(
@@ -165,16 +180,32 @@ impl Options {
         let mln_resource_private_hosts =
             normalize_private_resource_hosts(cli.mln_resource_private_hosts)?;
         let cores = cli.cores.unwrap_or_else(default_cores).max(1);
-        let render_permits = cli.debug_render_permits.unwrap_or(cores).max(1);
+        let render_permits = cli
+            .debug_render_permits
+            .unwrap_or_else(|| execution_permits_for_cores(cores))
+            .max(1);
         let cpu_render_permits = cli
             .debug_cpu_render_permits
-            .unwrap_or(render_permits)
+            .unwrap_or_else(|| cpu_render_permits_for_cores(cores))
             .max(1)
             .min(render_permits);
+        // Standby headroom is defined over concurrently-executing tasks
+        // (render permits), not raw cores, so warm-slot coverage keeps its
+        // ratio during explicit calibration sweeps.
         let renderer_slots = cli
             .debug_renderer_slots
-            .unwrap_or_else(|| standby_slots_for_cores(cores))
+            .unwrap_or_else(|| standby_slots_for(render_permits))
             .max(render_permits);
+        let default_io_permits =
+            crate::renderer::file_source::FileSourceIoPermits::for_render_permits(render_permits);
+        let mln_body_permits = cli
+            .mln_body_permits
+            .unwrap_or(default_io_permits.body)
+            .max(1);
+        let mln_regular_permits = cli
+            .mln_regular_permits
+            .unwrap_or(default_io_permits.regular)
+            .max(mln_body_permits);
 
         let gossip_seeds: Vec<_> = cli
             .gossip_seeds
@@ -215,6 +246,8 @@ impl Options {
             source_cache_capacity: cli.source_cache_capacity,
             render_output_cache_capacity_bytes: cli.render_output_cache_bytes,
             mln_resource_cache_capacity_bytes: cli.mln_resource_cache_bytes,
+            mln_body_permits,
+            mln_regular_permits,
             mln_resource_private_hosts,
             disable_mln_file_sources: cli.disable_mln_file_sources,
         })
@@ -240,7 +273,11 @@ impl Options {
             renderer_slots_per_node: self.renderer_slots_per_node,
             render_permits_per_node: Some(self.render_permits_per_node),
             cpu_render_permits_per_node: Some(self.cpu_render_permits_per_node),
-            bl_capacity: BlCapacityPolicy::Auto,
+            // Until a provenance-bearing production profile calibrates
+            // setup/render residency distributions, keep the SLA-oriented
+            // soft queue at one task per slot. The previous Auto value used a
+            // CPU-only render estimate and over-admitted I/O-bound renders.
+            bl_capacity: BlCapacityPolicy::Fixed(1),
             queue_capacity_multiplier: 2,
             source_cache_capacity: self.source_cache_capacity,
             render_output_cache_capacity_bytes: self.render_output_cache_capacity_bytes,
@@ -248,16 +285,30 @@ impl Options {
     }
 }
 
-fn standby_slots_for_cores(cores: usize) -> usize {
-    let slots = cores
+/// Warm standby slots (1.25×) over the given execution-permit count.
+fn standby_slots_for(render_permits: usize) -> usize {
+    let slots = render_permits
         .saturating_mul(STANDBY_RATIO_NUMERATOR)
         .div_ceil(STANDBY_RATIO_DENOMINATOR)
         .max(1);
-    if slots as f64 / cores.max(1) as f64 > ClusterConfig::STANDBY_RATIO_ERROR {
-        cores.max(1)
+    if slots as f64 / render_permits.max(1) as f64 > ClusterConfig::STANDBY_RATIO_ERROR {
+        render_permits.max(1)
     } else {
         slots
     }
+}
+
+/// Conservative uncalibrated baseline: one executing task per declared core.
+/// Operators can use the hidden override for controlled calibration sweeps.
+fn execution_permits_for_cores(cores: usize) -> usize {
+    cores.max(1)
+}
+
+/// Native-render residency baseline. Despite the historical field name, this
+/// permit is held across all of `renderStill`, including FileSource I/O waits;
+/// it is not a measurement of pure CPU concurrency.
+fn cpu_render_permits_for_cores(cores: usize) -> usize {
+    cores.max(1)
 }
 
 fn default_cores() -> usize {
@@ -532,12 +583,64 @@ mod tests {
         .expect("options parse");
 
         assert_eq!(opts.cores, 16);
-        assert_eq!(opts.renderer_slots_per_node, 20);
+        // Uncalibrated production defaults do not oversubscribe cores. Warm
+        // standby slots remain separate from concurrently executing tasks.
         assert_eq!(opts.render_permits_per_node, 16);
         assert_eq!(opts.cpu_render_permits_per_node, 16);
+        assert_eq!(opts.renderer_slots_per_node, 20);
+        // FileSource I/O follows the execution permits: body = 4× render
+        // permits, regular = 2× body.
+        assert_eq!(opts.mln_body_permits, 64);
+        assert_eq!(opts.mln_regular_permits, 128);
+        assert!(matches!(
+            opts.cluster_config().bl_capacity,
+            BlCapacityPolicy::Fixed(1)
+        ));
         assert_eq!(opts.node_id, NodeId::from("biei-0"));
         assert_eq!(opts.maplibre_cache_path, default_maplibre_cache_path());
         assert!(!opts.cluster);
+    }
+
+    #[test]
+    fn small_nodes_keep_io_permit_floors() {
+        let opts = Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "http://style-api.test/styles/{style_id}/style.json",
+            "--cores",
+            "2",
+        ])
+        .expect("options parse");
+
+        // One execution/native-render permit per core; warm slots retain 1.25×
+        // headroom independently.
+        assert_eq!(opts.render_permits_per_node, 2);
+        assert_eq!(opts.cpu_render_permits_per_node, 2);
+        assert_eq!(opts.renderer_slots_per_node, 3);
+        // Floors dominate: body max(24, 4×3), regular max(64, 2×24).
+        assert_eq!(opts.mln_body_permits, 24);
+        assert_eq!(opts.mln_regular_permits, 64);
+    }
+
+    #[test]
+    fn io_permit_flags_override_defaults_and_clamp() {
+        let opts = Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "http://style-api.test/styles/{style_id}/style.json",
+            "--cores",
+            "4",
+            "--mln-body-permits",
+            "128",
+            "--mln-regular-permits",
+            "32",
+        ])
+        .expect("options parse");
+
+        assert_eq!(opts.mln_body_permits, 128);
+        // Regular is clamped up to the body permits so it can never become
+        // the tighter cap by accident.
+        assert_eq!(opts.mln_regular_permits, 128);
     }
 
     #[test]
@@ -594,11 +697,17 @@ mod tests {
             "1048576",
             "--mln-resource-private-hosts",
             "resource-api.default.svc.cluster.local,*.tiles.svc.cluster.local",
+            "--mln-body-permits",
+            "7",
+            "--mln-regular-permits",
+            "5",
             "--disable-mln-file-sources",
         ])
         .expect("options parse");
 
         assert_eq!(opts.mln_resource_cache_capacity_bytes, 1_048_576);
+        assert_eq!(opts.mln_body_permits, 7);
+        assert_eq!(opts.mln_regular_permits, 7);
         assert_eq!(
             opts.mln_resource_private_hosts,
             [

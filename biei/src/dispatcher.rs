@@ -3,11 +3,9 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use rand::SeedableRng;
-use rand::distr::{Distribution, weighted::WeightedIndex};
+use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use tokio::time::Instant;
 
@@ -36,7 +34,7 @@ pub struct Dispatcher {
     pub bl_capacity: usize,
     pub queue_capacity: usize,
     pub activity: Arc<ProfileActivityTracker>,
-    rng: Mutex<Xoshiro256PlusPlus>,
+    seed: u64,
 }
 
 pub struct DispatcherSpawn {
@@ -68,72 +66,117 @@ impl Dispatcher {
             bl_capacity,
             queue_capacity: queue_capacity.max(bl_capacity),
             activity,
-            rng: Mutex::new(Xoshiro256PlusPlus::seed_from_u64(seed)),
+            seed,
         }
     }
 
     /// Estimate drain ETA at this worker for a task with given target profile.
     /// Pessimistic: assumes each queued task ahead pays a profile swap + render.
     fn estimate_drain_eta(&self, w: &WorkerView, task_profile: &WorkerProfile) -> Duration {
-        let p = self.costs.render_cost.mid();
+        let warm_p = self.costs.warm_render_cost().mid();
+        let first_p = self.costs.first_render_cost().mid();
         let s = self.costs.style_setup_cost.mid();
-        let per_ahead = p + s;
+        let per_ahead = first_p + s;
         let queue_wait = per_ahead
             .checked_mul(w.queue_depth as u32)
             .unwrap_or(Duration::MAX);
         let own = if w.loaded_profile.as_ref() == Some(task_profile) {
-            p
+            warm_p
         } else {
-            s + p
+            s + first_p
         };
         queue_wait.saturating_add(own)
+    }
+
+    fn select_warm_target(
+        &self,
+        task: &InternalTask,
+        view: &ClusterView,
+        profile: &WorkerProfile,
+    ) -> Option<NodeId> {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(routing_seed(self.seed, task.id));
+        match self.config.tier1_strategy {
+            Tier1Strategy::WeightedRandom => {
+                let total_weight: u64 = view
+                    .states
+                    .values()
+                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                    .map(|candidate| u64::from(candidate.warm_count))
+                    .sum();
+                if total_weight == 0 {
+                    return None;
+                }
+
+                let mut ticket = rng.random_range(0..total_weight);
+                for candidate in view
+                    .states
+                    .values()
+                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                {
+                    let weight = u64::from(candidate.warm_count);
+                    if ticket < weight {
+                        return Some(candidate.node.id.clone());
+                    }
+                    ticket -= weight;
+                }
+                unreachable!("positive warm weight must select a node")
+            }
+            Tier1Strategy::PowerOfTwo => {
+                let candidate_count = view
+                    .states
+                    .values()
+                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                    .count();
+                if candidate_count == 0 {
+                    return None;
+                }
+                if candidate_count == 1 {
+                    return view
+                        .states
+                        .values()
+                        .find_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                        .map(|candidate| candidate.node.id.clone());
+                }
+
+                let first_idx = rng.random_range(0..candidate_count);
+                let mut second_idx = rng.random_range(0..candidate_count - 1);
+                if second_idx >= first_idx {
+                    second_idx += 1;
+                }
+                let mut first = None;
+                let mut second = None;
+                for (idx, candidate) in view
+                    .states
+                    .values()
+                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                    .enumerate()
+                {
+                    if idx == first_idx {
+                        first = Some(candidate);
+                    } else if idx == second_idx {
+                        second = Some(candidate);
+                    }
+                }
+                let first = first.expect("sampled warm candidate exists");
+                let second = second.expect("sampled warm candidate exists");
+                Some(
+                    if first.style_spare_bl >= second.style_spare_bl {
+                        first.node
+                    } else {
+                        second.node
+                    }
+                    .id
+                    .clone(),
+                )
+            }
+        }
     }
 
     pub fn decide(&self, task: &InternalTask, view: &ClusterView) -> Decision {
         let profile = task.worker_profile();
 
         // ---- Tier 1: warm tracking (over propagated states only) ----
-        let warm: Vec<WarmCandidate<'_>> = view
-            .states
-            .values()
-            .filter_map(|n| warm_candidate(n, &profile, self.bl_capacity))
-            .collect();
-
-        if !warm.is_empty() {
-            let target_id = match self.config.tier1_strategy {
-                Tier1Strategy::WeightedRandom => {
-                    let weights: Vec<u32> = warm.iter().map(|n| n.warm_count).collect();
-                    let mut rng = self
-                        .rng
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
-                    warm[dist.sample(&mut *rng)].node.id.clone()
-                }
-                Tier1Strategy::PowerOfTwo => {
-                    let mut rng = self
-                        .rng
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if warm.len() == 1 {
-                        warm[0].node.id.clone()
-                    } else {
-                        use rand::RngExt as _;
-                        let a = rng.random_range(0..warm.len());
-                        let mut b = rng.random_range(0..warm.len());
-                        while b == a {
-                            b = rng.random_range(0..warm.len());
-                        }
-                        // Prefer the node with more spare BL for this style.
-                        let pick = if warm[a].style_spare_bl >= warm[b].style_spare_bl {
-                            a
-                        } else {
-                            b
-                        };
-                        warm[pick].node.id.clone()
-                    }
-                }
-            };
+        if let Some(target_id) = self.select_warm_target(task, view, &profile) {
             return self.materialize_route(task, target_id, RouteTier::Tier1WarmTracking, None);
         }
 
@@ -328,6 +371,13 @@ impl Dispatcher {
     }
 }
 
+fn routing_seed(seed: u64, task_id: u64) -> u64 {
+    let mut value = seed ^ task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 fn warm_candidate<'a>(
     node: &'a NodeStateView,
     profile: &WorkerProfile,
@@ -439,7 +489,9 @@ mod tests {
             costs: CostConfig {
                 style_setup_cost: CostRange::fixed(Duration::from_millis(100)),
                 source_load_cost: CostRange::fixed(Duration::ZERO),
-                render_cost: CostRange::fixed(Duration::from_millis(10)),
+                render_cpu_cost: CostRange::fixed(Duration::from_millis(10)),
+                render_resource_cost: CostRange::fixed(Duration::ZERO),
+                first_render_resource_cost: CostRange::fixed(Duration::ZERO),
                 hop_latency: Duration::ZERO,
                 sla: Duration::from_secs(10),
             },
