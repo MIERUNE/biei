@@ -3,13 +3,14 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
 
 use crate::server::{
-    AppState, HttpError, bytes_response, cache, provider::path_percent_encode,
-    upstream::fetch_limited_bytes_with_content_type,
+    AppState, HttpError, bytes_response,
+    provider::path_percent_encode,
+    upstream::{ProviderResource, fetch_limited_bytes_with_content_type},
 };
 
 const MAX_FONTSTACK_LEN: usize = 256;
@@ -24,17 +25,18 @@ const GLYPH_CONTENT_TYPES: &[&str] = &[
 pub(crate) async fn glyph_handler(
     State(state): State<AppState>,
     Path((fontstack, range)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     validate_fontstack(&fontstack)?;
     let range = validate_range(&range)?;
     let upstream = resolve_glyph_url(&state, &fontstack, &range)?;
-    let body = route_glyph_bytes(&state, &fontstack, &range, &upstream).await?;
-
-    Ok(bytes_response(
-        body,
-        "application/x-protobuf",
-        Some(cache::GLYPH_SPRITE),
-    ))
+    let resource = route_glyph_bytes(&state, &fontstack, &range, &upstream).await?;
+    if resource.not_modified(&headers) {
+        return Ok(resource.not_modified_response());
+    }
+    let mut response = bytes_response(resource.bytes().clone(), "application/x-protobuf", None);
+    resource.apply_public_headers(response.headers_mut());
+    Ok(response)
 }
 
 pub(crate) async fn internal_glyph_handler(
@@ -44,9 +46,13 @@ pub(crate) async fn internal_glyph_handler(
     validate_fontstack(&fontstack)?;
     let range = validate_range(&range)?;
     let upstream = resolve_glyph_url(&state, &fontstack, &range)?;
-    let body = fetch_glyph_bytes_local(&state, upstream).await?;
-    state.metrics.add_internal_bytes(body.len() as u64);
-    Ok(bytes_response(body, "application/x-protobuf", None))
+    let resource = fetch_glyph_bytes_local(&state, upstream).await?;
+    state
+        .metrics
+        .add_internal_bytes(resource.bytes().len() as u64);
+    let mut response = bytes_response(resource.bytes().clone(), "application/x-protobuf", None);
+    resource.apply_internal_headers(response.headers_mut());
+    Ok(response)
 }
 
 fn resolve_glyph_url(state: &AppState, fontstack: &str, range: &str) -> Result<String, HttpError> {
@@ -66,14 +72,14 @@ async fn route_glyph_bytes(
     fontstack: &str,
     range: &str,
     upstream: &str,
-) -> Result<bytes::Bytes, HttpError> {
+) -> Result<ProviderResource, HttpError> {
     let key = format!("glyph:{upstream}");
     let path = format!(
         "/_internal/provider/fonts/{}/{}.pbf",
         path_percent_encode(fontstack),
         range
     );
-    if let Some(bytes) = state
+    if let Some(response) = state
         .resource_resolver
         .route_provider_resource(&key, &path, "glyph")
         .await
@@ -84,7 +90,7 @@ async fn route_glyph_bytes(
             )
         })?
     {
-        return Ok(bytes);
+        return Ok(ProviderResource::from_peer(response));
     }
     fetch_glyph_bytes_local(state, upstream.to_string()).await
 }
@@ -92,7 +98,7 @@ async fn route_glyph_bytes(
 async fn fetch_glyph_bytes_local(
     state: &AppState,
     upstream: String,
-) -> Result<bytes::Bytes, HttpError> {
+) -> Result<ProviderResource, HttpError> {
     fetch_limited_bytes_with_content_type(
         state,
         upstream,

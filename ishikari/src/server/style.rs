@@ -1,7 +1,6 @@
 //! MapLibre style JSON provider endpoint.
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -19,15 +18,18 @@ pub(crate) struct StyleQuery {
 use crate::{
     interned::TilesetId,
     server::{
-        AppState, HttpError, bytes_response, cache, get_origin,
+        AppState, HttpError, apply_origin_vary, bytes_response, cache,
+        conditional::Validators,
+        get_origin,
         provider::{ProviderConfig, path_percent_encode_segments},
         sprite,
         tileset::render_preview_html,
-        upstream::fetch_limited_bytes,
+        upstream::{ProviderResource, fetch_limited_json},
     },
 };
 
 const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
+const STYLE_CONTENT_TYPES: &[&str] = &["application/json", "text/json", "application/octet-stream"];
 
 pub(crate) async fn style_handler(
     State(state): State<AppState>,
@@ -48,7 +50,7 @@ pub(crate) async fn style_handler(
         return serve_style_preview(style_key);
     }
     if let Some((style_key, suffix)) = sprite::parse_sprite_path(&style_path) {
-        return sprite::serve_sprite(state, style_key, suffix).await;
+        return sprite::serve_sprite(state, style_key, suffix, &headers).await;
     }
     Err((StatusCode::NOT_FOUND, "not found".to_string()))
 }
@@ -60,9 +62,13 @@ pub(crate) async fn internal_style_handler(
     if let Some(style_key) = style_path.strip_suffix("/style.json") {
         validate_style_key(style_key)?;
         let upstream = resolve_style_url(&state, style_key)?;
-        let body = fetch_style_bytes_local(&state, upstream).await?;
-        state.metrics.add_internal_bytes(body.len() as u64);
-        return Ok(bytes_response(body, "application/json", None));
+        let resource = fetch_style_bytes_local(&state, upstream).await?;
+        state
+            .metrics
+            .add_internal_bytes(resource.bytes().len() as u64);
+        let mut response = bytes_response(resource.bytes().clone(), "application/json", None);
+        resource.apply_internal_headers(response.headers_mut());
+        return Ok(response);
     }
     if let Some((style_key, suffix)) = sprite::parse_sprite_path(&style_path) {
         return sprite::serve_sprite_local(state, style_key, suffix).await;
@@ -93,8 +99,9 @@ async fn serve_style(
 ) -> Result<Response, HttpError> {
     validate_style_key(&style_key)?;
     let upstream = resolve_style_url(&state, &style_key)?;
-    let body = route_style_bytes(&state, &style_key, &upstream).await?;
-    let mut style: Value = serde_json::from_slice(&body).map_err(|error| {
+    let resource = route_style_bytes(&state, &style_key, &upstream).await?;
+    let decoded = resource.decoded_bytes(MAX_STYLE_BYTES, "style")?;
+    let mut style: Value = serde_json::from_slice(&decoded).map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
             format!("style JSON invalid: {error}"),
@@ -107,7 +114,25 @@ async fn serve_style(
         &state.provider,
         encoding,
     );
-    Ok(([(header::CACHE_CONTROL, cache::STYLE)], Json(style)).into_response())
+    let body = serde_json::to_vec(&style).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("style JSON serialization failed: {error}"),
+        )
+    })?;
+    // The body is a derived representation (origin/encoding-dependent rewrite),
+    // so the upstream `ETag` does not identify it. Hash the exact bytes served
+    // instead; this also changes whenever the rewrite logic itself changes.
+    let resource = resource.with_derived_validators(Validators::for_derived_body(&body));
+    if resource.not_modified(&headers) {
+        let mut response = resource.not_modified_response();
+        apply_origin_vary(response.headers_mut());
+        return Ok(response);
+    }
+    let mut response = bytes_response(body, "application/json", None);
+    resource.apply_public_headers(response.headers_mut());
+    apply_origin_vary(response.headers_mut());
+    Ok(response)
 }
 
 fn resolve_style_url(state: &AppState, style_key: &str) -> Result<String, HttpError> {
@@ -123,13 +148,13 @@ async fn route_style_bytes(
     state: &AppState,
     style_key: &str,
     upstream: &str,
-) -> Result<bytes::Bytes, HttpError> {
+) -> Result<ProviderResource, HttpError> {
     let key = format!("style:{upstream}");
     let path = format!(
         "/_internal/provider/styles/{}/style.json",
         path_percent_encode_segments(style_key)
     );
-    if let Some(bytes) = state
+    if let Some(response) = state
         .resource_resolver
         .route_provider_resource(&key, &path, "style")
         .await
@@ -140,7 +165,7 @@ async fn route_style_bytes(
             )
         })?
     {
-        return Ok(bytes);
+        return Ok(ProviderResource::from_peer(response));
     }
     fetch_style_bytes_local(state, upstream.to_string()).await
 }
@@ -148,8 +173,15 @@ async fn route_style_bytes(
 async fn fetch_style_bytes_local(
     state: &AppState,
     upstream: String,
-) -> Result<bytes::Bytes, HttpError> {
-    fetch_limited_bytes(state, upstream, MAX_STYLE_BYTES, "style").await
+) -> Result<ProviderResource, HttpError> {
+    fetch_limited_json(
+        state,
+        upstream,
+        MAX_STYLE_BYTES,
+        "style",
+        STYLE_CONTENT_TYPES,
+    )
+    .await
 }
 
 fn rewrite_style(

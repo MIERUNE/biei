@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use thiserror::Error;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -39,6 +39,10 @@ pub struct PeerBackend {
 
 const PEER_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Provider owners may spend the full 15-second upstream deadline before
+/// returning metadata and bytes. Leave transport overhead so the requester
+/// does not retry another owner while the first is still completing.
+const PROVIDER_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DERIVED_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type PeerFuture<'a> = Pin<Box<dyn Future<Output = Arc<[Peer]>> + Send + 'a>>;
@@ -46,6 +50,10 @@ pub type FetchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<InternalFetchResponse, PeerFetchError>> + Send + 'a>>;
 
 pub(crate) const TILE_SOURCE_HEADER: &str = "x-ishikari-tile-source";
+pub(crate) const PROVIDER_CACHE_CONTROL_HEADER: &str = "x-ishikari-provider-cache-control";
+pub(crate) const PROVIDER_AGE_HEADER: &str = "x-ishikari-provider-age";
+pub(crate) const PROVIDER_ETAG_HEADER: &str = "x-ishikari-provider-etag";
+pub(crate) const PROVIDER_LAST_MODIFIED_HEADER: &str = "x-ishikari-provider-last-modified";
 
 /// Tile provenance reported by the node that resolved an internal request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +83,14 @@ impl InternalTileSource {
 pub struct InternalFetchResponse {
     pub bytes: Bytes,
     pub tile_source: Option<InternalTileSource>,
+    pub provider_cache_control: Option<String>,
+    pub provider_age_seconds: Option<u64>,
+    pub provider_etag: Option<String>,
+    /// HTTP-date, exactly as forwarded on the internal wire.
+    pub provider_last_modified: Option<String>,
+    /// Standard representation metadata; unlike cache policy this does not use
+    /// an Ishikari-private header.
+    pub content_encoding: Option<String>,
 }
 
 impl InternalFetchResponse {
@@ -83,6 +99,11 @@ impl InternalFetchResponse {
         Self {
             bytes,
             tile_source: None,
+            provider_cache_control: None,
+            provider_age_seconds: None,
+            provider_etag: None,
+            provider_last_modified: None,
+            content_encoding: None,
         }
     }
 
@@ -91,6 +112,11 @@ impl InternalFetchResponse {
         Self {
             bytes,
             tile_source: Some(source),
+            provider_cache_control: None,
+            provider_age_seconds: None,
+            provider_etag: None,
+            provider_last_modified: None,
+            content_encoding: None,
         }
     }
 }
@@ -161,11 +187,44 @@ impl InternalTransport for HttpInternalTransport {
                 .get(TILE_SOURCE_HEADER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(InternalTileSource::parse);
+            let provider_cache_control = response
+                .headers()
+                .get(PROVIDER_CACHE_CONTROL_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let provider_age_seconds = response
+                .headers()
+                .get(PROVIDER_AGE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok());
+            let provider_etag = response
+                .headers()
+                .get(PROVIDER_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let provider_last_modified = response
+                .headers()
+                .get(PROVIDER_LAST_MODIFIED_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let content_encoding = response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|error| PeerFetchError::Fatal(error.to_string()))?;
-            Ok(InternalFetchResponse { bytes, tile_source })
+            Ok(InternalFetchResponse {
+                bytes,
+                tile_source,
+                provider_cache_control,
+                provider_age_seconds,
+                provider_etag,
+                provider_last_modified,
+                content_encoding,
+            })
         })
     }
 }
@@ -173,6 +232,8 @@ impl InternalTransport for HttpInternalTransport {
 fn peer_request_timeout(path: &str) -> Duration {
     if path.starts_with("/_internal/derived/") {
         DERIVED_PEER_REQUEST_TIMEOUT
+    } else if path.starts_with("/_internal/provider/") {
+        PROVIDER_PEER_REQUEST_TIMEOUT
     } else {
         PEER_REQUEST_TIMEOUT
     }
@@ -327,9 +388,9 @@ impl PeerBackend {
         key: &str,
         path: &str,
         kind: &str,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<InternalFetchResponse>> {
         let candidates = self.route_key_for(key, kind).await;
-        self.route_fetch_optional_candidates(candidates, key, path, kind)
+        self.route_fetch_optional_response_candidates(candidates, key, path, kind)
             .await
     }
 
@@ -344,17 +405,19 @@ impl PeerBackend {
         kind: &str,
     ) -> Result<Option<Bytes>> {
         let candidates = self.route_tile_for(routing_id, tile_id, kind).await;
-        self.route_fetch_optional_candidates(candidates, routing_id.as_ref(), path, kind)
-            .await
+        Ok(self
+            .route_fetch_optional_response_candidates(candidates, routing_id.as_ref(), path, kind)
+            .await?
+            .map(|response| response.bytes))
     }
 
-    async fn route_fetch_optional_candidates(
+    async fn route_fetch_optional_response_candidates(
         &self,
         candidates: Vec<ScoredPeer>,
         routing_key: &str,
         path: &str,
         kind: &str,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<InternalFetchResponse>> {
         if candidates.is_empty()
             || candidates
                 .first()
@@ -390,7 +453,7 @@ impl PeerBackend {
                         body_len = response.bytes.len(),
                         "received resource bytes from peer"
                     );
-                    return Ok(Some(response.bytes));
+                    return Ok(Some(response));
                 }
                 Err(PeerFetchError::NotFound) => {
                     debug!(
@@ -440,8 +503,10 @@ impl PeerBackend {
         kind: &str,
     ) -> Result<Option<Bytes>> {
         let candidates = self.route_tileset_for(tileset_id, kind).await;
-        self.route_fetch_optional_candidates(candidates, tileset_id.as_ref(), path, kind)
-            .await
+        Ok(self
+            .route_fetch_optional_response_candidates(candidates, tileset_id.as_ref(), path, kind)
+            .await?
+            .map(|response| response.bytes))
     }
 
     async fn fetch_from_peer(
@@ -678,8 +743,9 @@ mod tests {
 
     use super::{
         DERIVED_PEER_REQUEST_TIMEOUT, FetchFuture, InternalFetchResponse, InternalTileSource,
-        InternalTransport, PEER_REQUEST_TIMEOUT, PEER_RETRY_BACKOFF, PeerBackend, PeerDirectory,
-        PeerFetchError, PeerFuture, internal_resource_kind, peer_request_timeout,
+        InternalTransport, PEER_REQUEST_TIMEOUT, PEER_RETRY_BACKOFF, PROVIDER_PEER_REQUEST_TIMEOUT,
+        PeerBackend, PeerDirectory, PeerFetchError, PeerFuture, internal_resource_kind,
+        peer_request_timeout,
     };
     use crate::{
         interned::TilesetId, membership::Peer, metrics::NodeMetrics, storage::routing::HrwRouter,
@@ -770,6 +836,10 @@ mod tests {
         assert_eq!(
             peer_request_timeout("/_internal/tiles/mierune%2Fomt/700"),
             PEER_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            peer_request_timeout("/_internal/provider/fonts/Test/0-255.pbf"),
+            PROVIDER_PEER_REQUEST_TIMEOUT
         );
     }
 

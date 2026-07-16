@@ -2,10 +2,12 @@
 
 mod churn;
 mod cluster;
+mod http_replay;
 mod latency;
 mod membership;
 mod modeled;
 mod report;
+mod sweep;
 mod timed;
 mod trace;
 mod visualization;
@@ -16,9 +18,13 @@ pub use churn::{
     run_modeled_churn_trace,
 };
 pub use cluster::{ClusterConfig, SimCluster};
+pub use http_replay::{
+    HttpExecutionMode, HttpReplayConfig, HttpReplayReport, HttpReplayTarget, run_http_replay,
+};
 pub use latency::{BackendLatencyConfig, BackendLatencyProfile};
 pub use modeled::{ModeledCluster, TileCatalog};
 pub use report::{ClusterObservation, SimReport};
+pub use sweep::run_sweep;
 pub use timed::{LatencySummary, TimedConfig, TimedReport, run_timed_trace};
 pub use trace::{read_trace, viewport_batch_ranges, write_trace_entry};
 pub use visualization::{render_visualization, write_visualization};

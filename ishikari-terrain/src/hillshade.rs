@@ -200,7 +200,7 @@ fn solve_compression_mu(span: f64, levels: u8, first_level_delta: f64) -> f64 {
     high
 }
 
-pub(super) fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result<Vec<u8>> {
+pub fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result<Vec<u8>> {
     let started = std::time::Instant::now();
     let mut grid = illumination_labels(neighborhood, zoom, tile_y);
     let labels_elapsed = started.elapsed();
@@ -254,7 +254,7 @@ pub(super) fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) ->
 /// (`color-relief`'s custom encoding does not evaluate in the GPU shader);
 /// because the pixel is gray, Terrarium's high-byte sensitivity is harmless
 /// even under lossy codecs — a small byte error is a small, sub-level error.
-pub(super) const SHADE_CODE_SCALE: f64 = 5.0;
+pub const SHADE_CODE_SCALE: f64 = 5.0;
 
 fn shade_byte(code: f64) -> u8 {
     (128.0 + code * SHADE_CODE_SCALE).round().clamp(0.0, 255.0) as u8
@@ -289,11 +289,7 @@ fn shade_raster_rgb(grid: &ShadeGrid, continuous: bool) -> Vec<u8> {
 /// compressing a few dozen discrete values is compact and exact; recolor is
 /// deferred to a style-side `color-relief` ramp. Trade vs vector: fixed
 /// resolution (blurs when overzoomed) for far fewer bytes on rough terrain.
-pub(super) fn generate_raster(
-    neighborhood: &DemNeighborhood,
-    zoom: u8,
-    tile_y: u32,
-) -> Result<Vec<u8>> {
+pub fn generate_raster(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result<Vec<u8>> {
     let grid = illumination_labels(neighborhood, zoom, tile_y);
     let rgb = shade_raster_rgb(&grid, false);
     let mut buffer = Vec::new();
@@ -312,7 +308,7 @@ pub(super) fn generate_raster(
 /// carries the full un-banded shade at a fraction of the bytes; its errors are
 /// sub-JND tone deviations, not artifacts, because a continuous ramp — not
 /// exact codes — drives the coloring. WebP keeps edges cleaner than JPEG.
-pub(super) fn generate_raster_webp_lossy(
+pub fn generate_raster_webp_lossy(
     neighborhood: &DemNeighborhood,
     zoom: u8,
     tile_y: u32,
@@ -328,7 +324,7 @@ pub(super) fn generate_raster_webp_lossy(
 /// Neutral shade raster as lossy JPEG over the continuous field: the size floor
 /// proxy (WebP/AVIF lossy beat it, and JPEG has no alpha). Same continuous,
 /// un-banded shade as [`generate_raster_webp_lossy`].
-pub(super) fn generate_raster_jpeg(
+pub fn generate_raster_jpeg(
     neighborhood: &DemNeighborhood,
     zoom: u8,
     tile_y: u32,
@@ -520,7 +516,7 @@ fn opacity_for_lightness(profile: ToneProfile, shadow: bool, target: f64) -> f64
     (low + high) * 0.5
 }
 
-pub(super) fn opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
+pub fn opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
     let profile = ToneProfile::new();
     let direction = if shadow { -1.0 } else { 1.0 };
     (1..=profile.levels(shadow))

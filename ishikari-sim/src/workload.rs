@@ -1,14 +1,14 @@
 use std::{collections::HashSet, io::Read, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
 const MESH_DEGREES: f64 = 1.0 / 80.0;
 const HALF_MESH_DEGREES: f64 = MESH_DEGREES / 2.0;
 const MAX_WEB_MERCATOR_LAT: f64 = 85.051_128_78;
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryAffinity {
     #[default]
@@ -25,6 +25,7 @@ pub struct WorkloadConfig {
     pub focus_zoom: f64,
     pub zoom_sigma: f64,
     pub session_reset_probability: f64,
+    pub zoom_walk_probability: f64,
     pub move_step_tiles: f64,
     pub seed: u64,
     pub node_count: usize,
@@ -41,6 +42,7 @@ impl Default for WorkloadConfig {
             focus_zoom: 13.0,
             zoom_sigma: 1.8,
             session_reset_probability: 0.07,
+            zoom_walk_probability: 0.0,
             move_step_tiles: 1.0,
             seed: 1,
             node_count: 0,
@@ -62,6 +64,15 @@ impl WorkloadConfig {
         ensure!(
             (0.0..=1.0).contains(&self.session_reset_probability),
             "session_reset_probability must be between 0 and 1"
+        );
+        ensure!(
+            self.zoom_walk_probability.is_finite()
+                && (0.0..=1.0).contains(&self.zoom_walk_probability),
+            "zoom_walk_probability must be finite and between 0 and 1"
+        );
+        ensure!(
+            self.zoom_walk_probability == 0.0 || self.min_zoom < self.max_zoom,
+            "positive zoom_walk_probability requires min_zoom < max_zoom"
         );
         ensure!(
             self.move_step_tiles.is_finite() && self.move_step_tiles >= 0.0,
@@ -252,12 +263,27 @@ impl Workload {
             (lng, lat, zoom)
         } else {
             let (lng, lat, zoom) = state.position.expect("position checked above");
-            let (mercator_x, mercator_y) = lng_lat_to_web_mercator(lng, lat);
-            let move_step = self.config.move_step_tiles / f64::from(1_u32 << zoom);
-            let moved_x = wrap_unit(mercator_x + random_signed(&mut state.rng) * move_step);
-            let moved_y = (mercator_y + random_signed(&mut state.rng) * move_step).clamp(0.0, 1.0);
-            let (lng, lat) = web_mercator_to_lng_lat(moved_x, moved_y);
-            (lng, lat, zoom)
+            // Always consume the legacy pan draws so enabling zoom walks does not
+            // perturb later reset locations, reset zooms, or the underlying pan
+            // stream. The zoom decision itself is stateless and domain-separated.
+            let pan_x = random_signed(&mut state.rng);
+            let pan_y = random_signed(&mut state.rng);
+            if should_zoom_walk(seed, user, step, self.config.zoom_walk_probability) {
+                let zoom = adjacent_zoom(
+                    zoom,
+                    self.config.min_zoom,
+                    self.config.max_zoom,
+                    zoom_walks_in(seed, user, step),
+                );
+                (lng, lat, zoom)
+            } else {
+                let (mercator_x, mercator_y) = lng_lat_to_web_mercator(lng, lat);
+                let move_step = self.config.move_step_tiles / f64::from(1_u32 << zoom);
+                let moved_x = wrap_unit(mercator_x + pan_x * move_step);
+                let moved_y = (mercator_y + pan_y * move_step).clamp(0.0, 1.0);
+                let (lng, lat) = web_mercator_to_lng_lat(moved_x, moved_y);
+                (lng, lat, zoom)
+            }
         };
         state.position = Some((lng, lat, zoom));
 
@@ -309,6 +335,35 @@ fn select_entry_node(
         EntryAffinity::PerSession => user as u64,
     };
     Some((splitmix64(seed ^ discriminator) % node_count as u64) as usize)
+}
+
+fn should_zoom_walk(seed: u64, user: usize, step: u64, probability: f64) -> bool {
+    if probability == 0.0 {
+        return false;
+    }
+    deterministic_unit(
+        seed ^ (user as u64).rotate_left(17) ^ step.rotate_left(31) ^ 0x6a09_e667_f3bc_c909,
+    ) < probability
+}
+
+fn zoom_walks_in(seed: u64, user: usize, step: u64) -> bool {
+    splitmix64(seed ^ (user as u64).rotate_left(29) ^ step.rotate_left(43) ^ 0xbb67_ae85_84ca_a73b)
+        & 1
+        == 0
+}
+
+fn adjacent_zoom(zoom: u8, min_zoom: u8, max_zoom: u8, zoom_in: bool) -> u8 {
+    if zoom == min_zoom {
+        zoom + 1
+    } else if zoom == max_zoom || !zoom_in {
+        zoom - 1
+    } else {
+        zoom + 1
+    }
+}
+
+fn deterministic_unit(value: u64) -> f64 {
+    (splitmix64(value) >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
 }
 
 fn sample_zoom(cdf: &[(u8, f64)], total: f64, rng: &mut StdRng) -> u8 {
@@ -414,11 +469,100 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_zoom_walk_probability() {
+        for probability in [f64::NAN, -0.1, 1.1] {
+            let config = WorkloadConfig {
+                zoom_walk_probability: probability,
+                ..WorkloadConfig::default()
+            };
+            assert!(Workload::new(config, population()).is_err());
+        }
+
+        let fixed_zoom_walk = WorkloadConfig {
+            min_zoom: 10,
+            max_zoom: 10,
+            zoom_walk_probability: 0.1,
+            ..WorkloadConfig::default()
+        };
+        assert!(Workload::new(fixed_zoom_walk, population()).is_err());
+
+        let fixed_zoom_without_walk = WorkloadConfig {
+            min_zoom: 10,
+            max_zoom: 10,
+            zoom_walk_probability: 0.0,
+            ..WorkloadConfig::default()
+        };
+        assert!(Workload::new(fixed_zoom_without_walk, population()).is_ok());
+    }
+
+    #[test]
+    fn zoom_walk_keeps_center_and_reflects_at_bounds() {
+        let config = WorkloadConfig {
+            users: 1,
+            min_zoom: 10,
+            max_zoom: 11,
+            session_reset_probability: 0.0,
+            zoom_walk_probability: 1.0,
+            move_step_tiles: 1_000.0,
+            ..WorkloadConfig::default()
+        };
+        let mut workload = Workload::new(config, population()).expect("workload");
+        let initial = workload.step(0, 0).expect("initial step");
+        let initial_position = workload.users[0].position.expect("initial position");
+
+        let first_zoom = workload.step(1, 0).expect("first zoom");
+        let first_position = workload.users[0].position.expect("first zoom position");
+        let second_zoom = workload.step(2, 0).expect("second zoom");
+        let second_position = workload.users[0].position.expect("second zoom position");
+
+        assert_eq!(initial.len(), 9);
+        assert_eq!(first_zoom.len(), 9);
+        assert_eq!(second_zoom.len(), 9);
+        assert_eq!(first_position.0, initial_position.0);
+        assert_eq!(first_position.1, initial_position.1);
+        assert_eq!(second_position.0, initial_position.0);
+        assert_eq!(second_position.1, initial_position.1);
+        assert_ne!(first_position.2, initial_position.2);
+        assert_eq!(second_position.2, initial_position.2);
+        assert!(first_zoom.iter().all(|entry| entry.z == first_position.2));
+        assert!(second_zoom.iter().all(|entry| entry.z == second_position.2));
+    }
+
+    #[test]
+    fn session_reset_takes_precedence_over_zoom_walk() {
+        let base = WorkloadConfig {
+            users: 1,
+            min_zoom: 10,
+            max_zoom: 11,
+            session_reset_probability: 1.0,
+            ..WorkloadConfig::default()
+        };
+        let mut without_walk =
+            Workload::new(base.clone(), population()).expect("reset-only workload");
+        let mut with_walk = Workload::new(
+            WorkloadConfig {
+                zoom_walk_probability: 1.0,
+                ..base
+            },
+            population(),
+        )
+        .expect("reset and zoom workload");
+
+        for step in 0..5 {
+            assert_eq!(
+                without_walk.step(step, 0).expect("reset-only step"),
+                with_walk.step(step, 0).expect("reset and zoom step")
+            );
+        }
+    }
+
+    #[test]
     fn workload_is_reproducible_and_first_viewport_has_nine_tiles() {
         let config = WorkloadConfig {
             users: 2,
             node_count: 3,
             entry_affinity: EntryAffinity::PerRequest,
+            zoom_walk_probability: 0.2,
             ..WorkloadConfig::default()
         };
         let mut first = Workload::new(config.clone(), population()).expect("first workload");
@@ -434,6 +578,18 @@ mod tests {
                 .iter()
                 .all(|entry| entry.entry_node.is_some_and(|node| node < 3))
         );
+        assert_eq!(
+            first.step(0, 1).expect("first user-1 step"),
+            second.step(0, 1).expect("second user-1 step")
+        );
+        for step in 1..10 {
+            for user in 0..2 {
+                assert_eq!(
+                    first.step(step, user).expect("first workload step"),
+                    second.step(step, user).expect("second workload step")
+                );
+            }
+        }
     }
 
     #[test]

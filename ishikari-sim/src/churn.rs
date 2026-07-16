@@ -14,6 +14,11 @@ pub struct ChurnPlan {
 }
 
 impl ChurnPlan {
+    /// Creates an event-free plan for steady-state replay with dynamic ingress assignment.
+    pub fn empty() -> Self {
+        Self { events: Vec::new() }
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file =

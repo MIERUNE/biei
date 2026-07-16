@@ -476,6 +476,15 @@ pub(crate) fn bytes_response(
     out
 }
 
+/// Marks a generated document whose absolute URLs depend on request origin
+/// metadata supplied by the client or trusted reverse proxy.
+pub(crate) fn apply_origin_vary(headers: &mut HeaderMap) {
+    headers.insert(
+        header::VARY,
+        HeaderValue::from_static("Origin, X-Forwarded-Proto"),
+    );
+}
+
 /// Serves the public router on `public_addr` (Gateway-fronted) and the internal
 /// router on `internal_addr` (cluster-internal: metrics, peer forwarding). Both
 /// shut down gracefully on the shared `shutdown` signal.
@@ -853,9 +862,14 @@ mod tests {
 }
 
 pub(crate) mod cache;
+pub(crate) mod conditional;
+#[cfg(test)]
+mod contract_tests;
 pub(crate) mod glyph;
 pub mod internal;
 pub mod provider;
+mod provider_body;
+mod provider_cache_policy;
 pub(crate) mod sprite;
 pub(crate) mod style;
 pub mod tileset;

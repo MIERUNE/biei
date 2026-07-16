@@ -50,7 +50,9 @@ cargo run -- --tileset-sources data
 The style endpoint rewrites provider-relative `/{tileset_key}` sources to
 Ishikari TileJSON URLs and points `glyphs` and `sprite` back to Ishikari.
 Style, glyph, and sprite upstream fetches use bounded in-process caching and
-single-flight coordination to absorb cold concurrent renders.
+single-flight coordination to absorb cold concurrent renders. Stale provider
+entries revalidate conditionally, so an unchanged HTTP or object-store origin
+can refresh freshness without sending the body again.
 
 `ISKR_TILESET_SOURCES` (the PMTiles tile source) accepts the same `namespace=url;…;default=url`
 form, so tilesets can be backed by multiple object-store roots. A namespaced key
@@ -95,7 +97,10 @@ reports end-to-end HTTP latency by route and status class, object-store range
 fetch duration, size, admission queue delay, and concurrency saturation; chunk
 batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes.
 `ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a
-process and defaults to 32. CPU-heavy DEM decode, terrain generation, and MLT
+process and defaults to 32. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long
+nearby missing chunks are collected before dispatch (10 ms by default; 0 removes
+the intentional wait while preserving pending/inflight sharing). CPU-heavy DEM
+decode, terrain generation, and MLT
 transcoding expose admission, queue delay, current saturation, and shed counts.
 Derived terrain cold-generation metrics separate source fetch/decode time from
 product generation time and record compressed output size per fixed product.
@@ -123,10 +128,18 @@ cargo run -p ishikari-sim -- \
   --report report.json
 ```
 
+Add `--zoom-walk-probability 0.1` when generating a trace to replace 10% of
+non-reset pan steps with a one-level `z±1` transition at the same geographic
+center. The default is `0`, preserving the pan/reset-only workload. Generate a
+separate trace for each probability before running replay-only sweeps so every
+cache configuration in one sweep still receives exactly the same requests.
+
 Without `--viewport-batches`, requests run serially for deterministic cache and
 placement studies. With it, each viewport is polled concurrently under paused
-Tokio time, exercising the production 10 ms chunk merge window without adding
-wall-clock delay.
+Tokio time, exercising the configured production chunk merge window (10 ms by
+default) without adding wall-clock delay. Use
+`--chunk-fetch-merge-window-ms 0` for the no-delay baseline; the value is
+recorded in `cluster.chunk_fetch_merge_window_ms`.
 
 Replay the exact same trace against another cache or batching configuration:
 
@@ -146,6 +159,84 @@ The simulator can compare the production entry-node hot-cache policy with
 owner-only positive tile caching using `--peer-tile-cache entry` (default) or
 `--peer-tile-cache owner-only`. Both modes execute the production resolver;
 the selected policy is recorded in the report as `cluster.cache_peer_tiles`.
+
+Run replay-only modeled-cache parameter sweeps from a versioned JSON spec:
+
+```json
+{
+  "schema_version": 1,
+  "trace": "trace.jsonl",
+  "viewport_batches": true,
+  "entry_seeds": [1, 2, 3],
+  "base_cluster": {
+    "tileset_sources": "data"
+  },
+  "grid": {
+    "node_count": [2, 3, 5],
+    "tile_group_size": [128, 512, 2048],
+    "tile_cache_max_bytes": [67108864, 268435456],
+    "chunk_cache_max_bytes": [67108864, 268435456],
+    "cache_peer_tiles": [true, false]
+  }
+}
+```
+
+Paths are relative to the sweep spec. The runner builds the PMTiles catalog
+once, expands the Cartesian grid in a stable order, creates a fresh modeled
+cluster per run, and flushes one self-contained versioned document per JSONL
+line. Each line includes effective configuration, aggregate/per-node results,
+churn-style periodic samples, and FNV-1a fingerprints of the spec and trace:
+
+```bash
+cargo run -p ishikari-sim --release -- \
+  sweep sweep.json \
+  --output sweep-results.jsonl
+```
+
+Version 1 sweeps only modeled-cache parameters that affect request-order and
+capacity results. Timed controls such as merge-window duration and backend
+concurrency remain real-cache/Phase 2 experiments; modeled reports record those
+settings but do not execute their timing behavior.
+
+Replay the same trace over real HTTP for simulator calibration. Repeated
+`--node-url` values are ordered: trace `entry_node: 0` selects the first URL,
+`entry_node: 1` the second, and so on. When metrics URLs are supplied, the runner
+scrapes each node before and after replay and reports restart-checked deltas for
+tile sources, client/peer/backend bytes, backend fetches, and chunk-cache work:
+
+```bash
+# Start `bash demo.sh` in another terminal, then run:
+cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
+  --node-url http://[::1]:8080 \
+  --node-url http://[::1]:8081 \
+  --node-url http://[::1]:8082 \
+  --metrics-url http://[::1]:9090/_internal/metrics \
+  --metrics-url http://[::1]:9091/_internal/metrics \
+  --metrics-url http://[::1]:9092/_internal/metrics \
+  --viewport-batches \
+  --output direct-http-report.json
+```
+
+Gateway mode deliberately ignores recorded entry-node assignments while still
+aggregating per-pod internal metrics:
+
+```bash
+cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
+  --gateway-url https://ishikari.example.com \
+  --metrics-url http://127.0.0.1:9090/_internal/metrics \
+  --metrics-url http://127.0.0.1:9091/_internal/metrics \
+  --metrics-url http://127.0.0.1:9092/_internal/metrics \
+  --viewport-batches \
+  --output gateway-http-report.json
+```
+
+HTTP replay sends `Cache-Control: no-cache`, follows no redirects, performs no
+retries, fully consumes response bodies, and writes bounded failure samples plus
+client-observed latency percentiles. `200` and `404` are normal outcomes; any
+transport error, other status, counter reset, or incomplete metrics capture
+makes the command exit nonzero after preserving the report. Run calibration on
+an otherwise idle deployment because the Prometheus counters are process-wide.
+The public target and internal metrics endpoints are intentionally separate.
 
 Reports identify their trace source as `generated` or `replay` and include the
 full cluster configuration and aggregate/per-node metrics.
@@ -265,7 +356,7 @@ chunk-cache cap also applies in modeled mode.
 
 For latency and queueing experiments, replay a trace with concurrent virtual
 users under Tokio's paused clock. This runs the production resolver, caches,
-single-flight, 10 ms merge window, and 32 concurrent range-fetch limit while
+single-flight, configured merge window, and 32 concurrent range-fetch limit while
 adding deterministic backend and peer latency. The repository includes a GCS
 profile measured from the demo cluster in `asia-northeast1`:
 

@@ -5,24 +5,21 @@
 //! tile/chunk caches, object-store range batching, and negative caches are
 //! shared with ordinary Mapterhorn serving.
 
-mod contours;
-pub(crate) mod dem;
-mod hillshade;
-mod topology;
+pub(crate) use ishikari_terrain::dem;
+use ishikari_terrain::{contours, hillshade};
 
 use std::io::Write;
 
 use axum::{
-    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use flate2::{Compression as GzLevel, write::GzEncoder};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -30,7 +27,8 @@ use crate::{
     interned::TilesetId,
     pmtiles::{MLT_CONTENT_TYPE, TileCoord, TileData, TileId, TileType},
     server::{
-        AppState, HttpError, bytes_response, cache, get_origin, provider::path_percent_encode,
+        AppState, HttpError, apply_origin_vary, bytes_response, cache, conditional::Validators,
+        get_origin, provider::path_percent_encode,
     },
 };
 
@@ -149,7 +147,7 @@ pub(crate) async fn derived_tilejson_handler(
     Path((tileset_id, product)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<DerivedTileJsonQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_tilejson(state, tileset_id, product, headers, query).await
 }
 
@@ -158,7 +156,7 @@ pub(crate) async fn namespaced_derived_tilejson_handler(
     Path((namespace, tileset_id, product)): Path<(String, String, String)>,
     headers: HeaderMap,
     Query(query): Query<DerivedTileJsonQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_tilejson(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
@@ -175,7 +173,7 @@ async fn serve_tilejson(
     product: String,
     headers: HeaderMap,
     query: DerivedTileJsonQuery,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     let tileset_id = validated_mapterhorn(&state, tileset_id)?;
     let product = DerivedProduct::parse(&product)?;
     let info = state
@@ -232,7 +230,30 @@ async fn serve_tilejson(
         "format": "pbf",
         "encoding": if wants_mlt { "mlt" } else { "mvt" }
     });
-    Ok(([(header::CACHE_CONTROL, cache::TILEJSON)], Json(document)))
+    // Origin-derived like the base TileJSON: validate by a strong ETag over the
+    // exact bytes served so conditional requests can 304.
+    let body = serde_json::to_vec(&document).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("derived tilejson serialization failed: {error}"),
+        )
+    })?;
+    let validators = Validators::for_derived_body(&body);
+    if validators.not_modified(&headers) {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache::TILEJSON),
+        );
+        validators.apply(response.headers_mut());
+        apply_origin_vary(response.headers_mut());
+        return Ok(response);
+    }
+    let mut response = bytes_response(body, "application/json", Some(cache::TILEJSON));
+    validators.apply(response.headers_mut());
+    apply_origin_vary(response.headers_mut());
+    Ok(response)
 }
 
 pub(crate) async fn derived_tile_handler(
@@ -869,13 +890,22 @@ async fn load_decoded_dem(
             let Some(raw) = fetch_source_tile(&state, tileset_id, z, x, y).await? else {
                 return Ok::<Option<std::sync::Arc<dem::DemTile>>, HttpError>(None);
             };
+            if raw.content_encoding.is_some() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "compressed Mapterhorn image payload is not supported: {:?}",
+                        raw.content_encoding
+                    ),
+                ));
+            }
             // Fetch first, then admit CPU work only for WebP decoding. This uses
             // the same bounded CPU pool (and shed) as product generation without
             // ever holding a slot across object-store or peer I/O.
             let decode_permit = state.admit_cpu_work("dem_decode").await?;
             let decoded = tokio::task::spawn_blocking(move || {
                 let _decode_permit = decode_permit;
-                dem::decode_terrarium(raw)
+                dem::decode_terrarium(raw.bytes.as_ref())
             })
             .await
             .map_err(|error| {

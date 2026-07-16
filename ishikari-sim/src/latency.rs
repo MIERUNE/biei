@@ -11,11 +11,16 @@ use serde::{Deserialize, Serialize};
 /// Serializable object-store latency parameters used by the simulator.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct BackendLatencyConfig {
-    #[serde(rename = "artificial_backend_delay_ms", alias = "median_ms")]
+    #[serde(default, rename = "artificial_backend_delay_ms", alias = "median_ms")]
     pub median_ms: u64,
-    #[serde(rename = "artificial_backend_delay_sigma", alias = "lognormal_sigma")]
+    #[serde(
+        default,
+        rename = "artificial_backend_delay_sigma",
+        alias = "lognormal_sigma"
+    )]
     pub lognormal_sigma: f64,
     #[serde(
+        default,
         rename = "artificial_backend_transfer_ms_per_mib",
         alias = "transfer_ms_per_mib"
     )]

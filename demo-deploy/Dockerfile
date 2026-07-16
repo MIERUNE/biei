@@ -20,8 +20,10 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY ishikari/Cargo.toml ishikari/Cargo.toml
 COPY ishikari-sim/Cargo.toml ishikari-sim/Cargo.toml
+COPY ishikari-terrain/Cargo.toml ishikari-terrain/Cargo.toml
 COPY ishikari/src ishikari/src
 COPY ishikari-sim/src ishikari-sim/src
+COPY ishikari-terrain/src ishikari-terrain/src
 RUN cargo build --release --locked -p ishikari \
     && cp target/release/ishikari /ishikari
 

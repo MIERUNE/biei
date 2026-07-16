@@ -1495,11 +1495,11 @@ dependencies = [
  "bytes",
  "chitchat",
  "clap",
- "fast-mvt 0.5.0",
  "fast_hilbert",
  "flate2",
- "image",
+ "httpdate",
  "internment",
+ "ishikari-terrain",
  "mlt-core",
  "moka",
  "object_store",
@@ -1509,11 +1509,11 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "twox-hash",
  "url",
- "webp",
  "zstd",
 ]
 
@@ -1523,15 +1523,28 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "chitchat",
  "clap",
  "ishikari",
  "moka",
  "rand 0.10.2",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "ishikari-terrain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fast-mvt 0.5.0",
+ "image",
+ "tracing",
+ "webp",
 ]
 
 [[package]]

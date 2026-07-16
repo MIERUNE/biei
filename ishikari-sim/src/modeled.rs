@@ -263,7 +263,7 @@ struct PlannedRange {
 /// Metadata-only cluster model with production HRW and Moka eviction policies.
 pub struct ModeledCluster {
     config: ClusterConfig,
-    catalog: TileCatalog,
+    catalog: Arc<TileCatalog>,
     peers: Vec<Peer>,
     router: HrwRouter,
     nodes: Vec<ModelNode>,
@@ -273,7 +273,7 @@ pub struct ModeledCluster {
 }
 
 impl ModeledCluster {
-    pub fn new(config: ClusterConfig, catalog: TileCatalog) -> Result<Self> {
+    pub fn new(config: ClusterConfig, catalog: impl Into<Arc<TileCatalog>>) -> Result<Self> {
         config.validate()?;
         let next_node_index = config.node_count;
         let peers = simulated_peers(config.node_count);
@@ -284,7 +284,7 @@ impl ModeledCluster {
         Ok(Self {
             router: HrwRouter::new(config.candidate_count, config.tile_group_size),
             config,
-            catalog,
+            catalog: catalog.into(),
             peers,
             nodes,
             retired_nodes: Vec::new(),

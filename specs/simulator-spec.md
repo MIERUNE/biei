@@ -53,8 +53,9 @@ cluster ("one config per load-test run").
   `chunk_size_bytes` / `max_fetch_chunks` (with `MAX_CHUNK_GAP = 1` gap
   prefetch) cut backend GET count under a viewport workload, and where does
   read amplification (bytes fetched / bytes used) start to hurt? Under Phase 2,
-  also sweep `backend_fetch_concurrency` and inspect backend admission queue
-  p95 rather than assuming every planned range starts immediately.
+  also sweep `chunk_fetch_merge_window_ms` and `backend_fetch_concurrency`, then
+  inspect end-user latency and backend admission queue p95 rather than assuming
+  every planned range starts immediately.
 - **Q5 — Derived-tile generation queueing** (Phase 2 only). How does
   contour/hillshade generation (~100–500 ms/tile) behave under the
   shared `ISKR_CPU_WORK_CONCURRENCY` and `ISKR_CPU_WORK_MAX_INFLIGHT` admission
@@ -77,8 +78,9 @@ rebalance are functions of *request order*, not of latency.
 **Phase 1B (Q4 only): deterministic viewport batches with paused Tokio time.**
 All newly visible tiles from one viewport step are polled together, preserving
 their deterministic `(dy, dx)` order. `tokio::time` starts paused so the real
-10 ms fetch merge window advances without wall-clock delay after every ready
-request has had a chance to enqueue its missing chunks. This exercises the
+configured fetch merge window (10 ms by default) advances without wall-clock
+delay after every ready request has had a chance to enqueue its missing chunks.
+This exercises the
 production single-flight, gap merge, and `max_fetch_chunks` behavior in
 real-cache mode without introducing a latency distribution. Modeled-cache mode
 uses its metadata-only range planner instead.
@@ -115,6 +117,7 @@ The workload contract uses these parameters and defaults:
 | `focus_zoom` | 13 | Gaussian zoom-weight center |
 | `zoom_sigma` | 1.8 | Gaussian zoom-weight sigma |
 | `session_reset_probability` | 0.07 | per-step chance to teleport & re-roll zoom |
+| `zoom_walk_probability` | 0.0 | per non-reset step chance to replace pan with `z±1` at the same center |
 | `move_step_tiles` | 1.0 | pan step, in tiles at current zoom |
 | `viewport` | 3×3 | tiles fetched around the center tile |
 | `users` | scenario-defined | number of concurrent session walkers |
@@ -125,16 +128,23 @@ Per step:
    mesh centroid from the population CDF by binary search, jitter uniformly
    within the 1/80° mesh cell, sample zoom `z` from the Gaussian weights over
    `[min_zoom, max_zoom]`. Reset the previous-viewport set.
-2. Otherwise: random-walk the position in Web Mercator unit space by
-   `±move_step_tiles / 2^z` per axis (zoom stays fixed for the session).
-3. Emit the 3×3 viewport around the center tile (x wrapped, y clamped),
+2. Otherwise, with probability `zoom_walk_probability`: keep longitude/latitude
+   fixed and move exactly one level to `z-1` or `z+1`. Interior directions are
+   equiprobable; bounds reflect toward the only valid adjacent level. Zoom
+   replaces pan for that step and requires `min_zoom < max_zoom`.
+3. Otherwise: random-walk the position in Web Mercator unit space by
+   `±move_step_tiles / 2^z` per axis.
+4. Emit the 3×3 viewport around the center tile (x wrapped, y clamped),
    **deduplicated against the previous step's viewport set** — only newly
    visible tiles become requests, exactly like a map client.
 
-Zoom-out/zoom-in is represented by session resets that re-roll zoom. An
-explicit within-session zoom ladder (z → z±1 keeping the center, which produces
-parent/child tile requests) is not implemented yet; it is tracked in the TODO
-because parent/child tiles are far apart in tile-id space and matter for Q4.
+Zoom-walk event and direction decisions are deterministic, domain-separated
+functions of `(seed, user, step)`. Non-reset steps always consume the legacy pan
+RNG draws even when zooming, so enabling the knob does not shift later reset
+locations, reset zooms, or the underlying pan stream. Parent/child requests are
+therefore introduced without confounding unrelated randomness. The immediately
+previous viewport remains the only deduplication set; a changed zoom naturally
+emits the new level's viewport.
 
 ### 3.3 Interleaving and traces
 
@@ -146,8 +156,8 @@ because parent/child tiles are far apart in tile-id space and matter for Q4.
   (`jsonl: {step, user, ordinal, tileset, z, x, y}`) so that:
   - the exact same trace can be replayed across config sweeps
     (variance-free A/B), and
-  - the trace can be exported for replay against a **real** cluster
-    (a thin HTTP JSONL replay tool) for cross-validation (§8).
+  - the trace can be exported for replay against a **real** cluster through the
+    versioned `replay-http` runner for cross-validation (§8).
 - Entry-node choice: each request is assigned an entry node, modeling the
   Gateway LB. Knob `entry_affinity = per_request | per_session`
   (default `per_request` uniform; Google Cloud Application Load Balancing
@@ -216,7 +226,10 @@ The current implementation uses three narrow boundaries:
 
 No production `Clock` seam is needed. Phase 1A does not claim to model
 cross-request merging. Phase 1B uses Tokio's paused clock to exercise the real
-`FETCH_MERGE_WINDOW` without sleeping in wall-clock time.
+configured merge window without sleeping in wall-clock time. Production reads
+it from `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS`; simulator real-cache runs use
+`ClusterConfig::chunk_fetch_merge_window_ms`. Zero removes the intentional wait
+without disabling pending/inflight sharing or immediate bootstrap dispatch.
 
 ### 4.3 Per-request flow
 
@@ -259,19 +272,35 @@ Per run, per node, harvested from each node's Prometheus registry
   pending chunks at dispatch, and waiters released per fetch group. Structured
   histogram snapshots are merged without parsing Prometheus text.
 
-Current output is one versioned (`schema_version`) self-contained JSON document
-containing execution mode, tagged trace source (`generated` with workload
-config, or `replay` with input path), cluster config, aggregate metrics, and
-per-node summaries. Generated request traces are written separately as JSONL
-and can be replayed in-process with either serial or viewport-batch execution.
+A single run outputs one versioned (`schema_version`) self-contained JSON
+document containing execution mode, tagged trace source (`generated` with
+workload config, or `replay` with input path), cluster config, aggregate metrics,
+and per-node summaries. Generated request traces are written separately as
+JSONL and can be replayed in-process with either serial or viewport-batch
+execution.
 
 Churn replay emits configurable counter snapshots (default every 1,000
 requests), plus paired pre/post-event snapshots. Samples include active cache
 occupancy, per-node request counters, virtual elapsed time, and each node's
 agreement with the active membership set, so hit-rate, backend-fetch,
-load-skew, gossip-convergence, and recovery curves can be derived. The future
-sweep runner will append one run document (config + summary + bucketed series)
-per line to a sweep JSONL file.
+load-skew, gossip-convergence, and recovery curves can be derived.
+
+The version-1 `sweep` runner accepts a versioned JSON specification, one replay
+trace, entry-assignment seeds, a base cluster configuration, and Cartesian axes
+for node count, candidate count, tile-group size, chunk size/range cap, tile and
+chunk cache capacity, and entry-node peer caching. It builds one shared modeled
+PMTiles catalog, executes each cell in a fresh modeled cluster, and flushes one
+self-contained run document per JSONL line. Every line records the run index and
+count, effective configuration, periodic samples, simulator version, and FNV-1a
+spec/trace fingerprints. Paths are resolved relative to the spec. Duplicate
+axis values, invalid cluster dimensions, unsupported schema versions, and grids
+larger than `max_runs` are rejected before output is created.
+
+Version 1 is intentionally replay-only, sequential, and modeled-cache-only.
+Timed controls (`chunk_fetch_merge_window_ms`, backend latency/concurrency),
+workload-generation axes, real-cache lifecycle, and sweep-level visualization
+are not claimed by this runner. Modeled reports retain timed configuration for
+provenance but do not treat it as an effective sweep axis.
 
 ## 6. Scenario catalog
 
@@ -295,11 +324,15 @@ Each scenario = a config grid × the workload of §3, run on the same seed(s).
   re-routed (compare with analytic ~1/N), hit-rate dip depth, requests to
   recover within 1 pt of steady state, backend egress spike. Sweep
   `tile_group_size` — bigger groups mean fewer, bigger invalidations.
-- **S3 — Chunk batching (Q4).** Grid: `chunk_size_bytes ∈ {256K,1M,4M}` ×
-  `max_fetch_chunks ∈ {1,4,8,16}` × zoom mix (`focus_zoom ∈ {11,13,15}`).
-  Outputs: backend GETs per 1k tiles, read amplification, chunk-cache hit
-  rate. Also run with `zoom_walk_probability > 0` to see how cross-zoom
-  requests break Hilbert locality.
+- **S3 — Chunk batching (Q4).** Modeled grid: `chunk_size_bytes ∈
+  {256K,1M,4M}` × `max_fetch_chunks ∈ {1,4,8,16}` × zoom mix (`focus_zoom ∈
+  {11,13,15}`). Real-cache/Phase 2 grid additionally varies
+  `chunk_fetch_merge_window_ms ∈ {0,1,5,10,25}` and backend concurrency.
+  Outputs: end-user latency, backend GETs per 1k tiles, read amplification,
+  chunk-cache hit rate, backend queue p95, and waiter fan-in. Generate separate
+  otherwise-identical traces for `zoom_walk_probability ∈ {0,0.05,0.1,0.2}` to
+  see how cross-zoom requests break Hilbert locality; sweep version 1 is
+  replay-only and intentionally does not vary workload-generation parameters.
 - **S4 — Skew under population workload (Q1).** No failures: quantify how
   uneven HRW + tile groups + a Tokyo-heavy CDF make per-node load, and confirm
   `candidate_count` does *not* spread load (it's failover-only). Then repeat
@@ -328,15 +361,41 @@ Each scenario = a config grid × the workload of §3, run on the same seed(s).
 
 ## 8. Validation against the real cluster
 
-Before trusting sweep output, calibrate once:
+Before trusting sweep output, calibrate once. The `replay-http` subcommand reads
+an existing trace and supports two explicit target contracts:
 
-1. Run the local 3-node cluster (existing local test loop) with a fixed
-   config.
-2. Replay an exported sim trace (§3.3) directly against the recorded entry
-   nodes for an exact placement comparison. A second replay through the
-   Gateway validates the `entry_affinity` model using aggregate counters.
-3. Compare Prometheus counters (tiles by source, chunk hit rate, backend
-   GETs/bytes) with the sim run on the same trace and config.
+- repeated ordered `--node-url` values use each request's recorded `entry_node`
+  as an exact index, preserving direct-node placement;
+- one `--gateway-url` sends every request through the load balancer and ignores
+  recorded entry assignments, measuring the real affinity distribution.
+
+Serial mode preserves request order. `--viewport-batches` starts one validated
+`(step,user)` batch concurrently and waits for it before the next. Requests send
+`Cache-Control: no-cache`, follow no redirects, retry nothing, and fully consume
+response bodies. The versioned report contains status/body totals, bounded
+failure samples, client-observed latency percentiles, target configuration, and
+a trace fingerprint.
+
+Optional ordered `--metrics-url` endpoints are scraped immediately before and
+after replay. Counter deltas are derived per node before aggregation and fail on
+a reset or disappearing series. The comparable output covers normalized tile
+sources, external/internal/backend bytes, positive L1 hits, peer attempts,
+backend fetch outcomes/chunks, and chunk-cache/coordinator counters. Production
+collapses all negative result sources into `miss`, so comparison must normalize
+simulator `negative_cache`, `self_miss`, `peer_miss`, and `miss`. The production
+positive L1 metric cannot distinguish every negative-cache case, and
+client-observed Gateway latency is not equivalent to Axum's server histogram.
+Metrics are process-wide, so calibration requires an otherwise idle deployment
+and stable pod identities/restart counts outside the report.
+
+Calibration procedure:
+
+1. Run the local 3-node cluster with a fixed configuration and distinct public,
+   internal, and gossip ports.
+2. Replay an exported trace (§3.3) directly against the recorded entry nodes.
+   Restart cold and replay it again through the Gateway.
+3. Compare the replay report's Prometheus aggregate (and direct per-node values)
+   with the in-process simulator report for the same trace and configuration.
 4. Acceptance: Phase 1A hit rates within ~2 points; Phase 1B backend GET count
    within ~10%. Report direct-node and Gateway validation separately.
 
@@ -362,9 +421,11 @@ binary. Normal `ishikari` builds therefore carry no simulator dependencies.
 
 Implemented: the transport/directory seam, workload generator, Phase 1A
 in-process cluster, structured metrics report, Phase 1B viewport runner,
-validated in-process JSONL replay, and scripted node add/remove replay are
-implemented. Metadata-only per-node modeled tile/chunk caches and PMTiles
-access catalogs are also implemented for large logical-capacity sweeps. A
+validated in-process JSONL replay, scripted node add/remove replay, versioned
+modeled-cache sweep orchestration, and external direct-node/Gateway HTTP replay
+with optional Prometheus calibration deltas. Metadata-only per-node modeled
+tile/chunk caches and PMTiles access catalogs are also implemented for large
+logical-capacity sweeps. A
 self-contained HTML report visualizer renders request-indexed churn charts,
 interval rates, peer failover/backoff activity, cache occupancy, and active-node
 load.
@@ -441,7 +502,6 @@ measured inputs.
 - Should the trace include tileset diversity (e.g. `japan` + a second
   tileset) to exercise per-tileset chunk coordinators and cache competition?
   Phase 1 starts single-tileset.
-- Zoom-walk model (§3.2): keep the current reset-only default, but decide
-  parameters worth sweeping once S3 baseline exists.
+
 - Whether S2's "requests to recover" should also be reported in wall-clock
   terms using a simple requests/sec assumption, for communicating results.

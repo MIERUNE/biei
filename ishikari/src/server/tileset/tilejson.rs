@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
 };
 use serde::Deserialize;
 use tracing::debug;
@@ -13,7 +13,10 @@ use tracing::debug;
 use crate::{
     interned::TilesetId,
     pmtiles::{TileType, Tilestats, VectorLayer},
-    server::{AppState, HttpError, cache, get_origin},
+    server::{
+        AppState, HttpError, apply_origin_vary, bytes_response, cache, conditional::Validators,
+        get_origin,
+    },
     storage::TilesetInfo,
 };
 
@@ -62,7 +65,7 @@ pub(crate) async fn tilejson_handler(
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<TileJsonQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<TileJson>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_tilejson(state, tileset_id, headers, query).await
 }
 
@@ -72,7 +75,7 @@ pub(crate) async fn namespaced_tilejson_handler(
     Path((namespace, tileset_id)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<TileJsonQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<TileJson>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_tilejson(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
@@ -88,7 +91,7 @@ async fn serve_tilejson(
     tileset_id: String,
     headers: HeaderMap,
     query: TileJsonQuery,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<TileJson>), HttpError> {
+) -> Result<Response, HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let base_url = get_origin(&headers);
@@ -111,8 +114,32 @@ async fn serve_tilejson(
         query.encoding.as_deref(),
         maxzoom_override,
     );
+    // TileJSON embeds the request origin in its tile URLs, so it is a derived
+    // representation: validate by a strong ETag over the exact bytes served
+    // (like rewritten style JSON), not the immutable archive's own identity.
+    let body = serde_json::to_vec(&document).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("tilejson serialization failed: {error}"),
+        )
+    })?;
+    let validators = Validators::for_derived_body(&body);
     debug!(endpoint = "tilejson", tileset_id = %tileset_id, "served external response");
-    Ok(([(header::CACHE_CONTROL, cache::TILEJSON)], Json(document)))
+    if validators.not_modified(&headers) {
+        let mut response = Response::new(axum::body::Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache::TILEJSON),
+        );
+        validators.apply(response.headers_mut());
+        apply_origin_vary(response.headers_mut());
+        return Ok(response);
+    }
+    let mut response = bytes_response(body, "application/json", Some(cache::TILEJSON));
+    validators.apply(response.headers_mut());
+    apply_origin_vary(response.headers_mut());
+    Ok(response)
 }
 
 /// Converts PMTiles header and metadata into a TileJSON document.

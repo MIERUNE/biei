@@ -20,7 +20,7 @@ use ishikari::{
         ResourceResolverStorageConfig, TileSource, TilesetId, internal_resource_kind,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     BackendLatencyConfig, TraceEntry,
@@ -32,7 +32,8 @@ use crate::{
 
 const SIM_NODE_BASE_PORT: u16 = 10_000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ClusterConfig {
     pub node_count: usize,
     pub tileset_sources: String,
@@ -40,8 +41,9 @@ pub struct ClusterConfig {
     pub tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub chunk_fetch_merge_window_ms: u64,
     pub backend_fetch_concurrency: usize,
-    #[serde(flatten)]
+    #[serde(flatten, default)]
     pub backend_latency: BackendLatencyConfig,
     pub peer_latency_ms: u64,
     pub gossip_interval_ms: u64,
@@ -60,6 +62,7 @@ impl Default for ClusterConfig {
             tile_group_size: 512,
             chunk_size_bytes: 1024 * 1024,
             max_fetch_chunks: 4,
+            chunk_fetch_merge_window_ms: 10,
             backend_fetch_concurrency: 32,
             backend_latency: BackendLatencyConfig::default(),
             peer_latency_ms: 0,
@@ -699,6 +702,7 @@ fn build_node(
             tileset_sources: config.tileset_sources.clone(),
             chunk_size_bytes: config.chunk_size_bytes,
             max_fetch_chunks: config.max_fetch_chunks,
+            chunk_fetch_merge_window: Duration::from_millis(config.chunk_fetch_merge_window_ms),
             backend_fetch_concurrency: config.backend_fetch_concurrency,
             backend_latency,
             tile_cache_max_bytes: config.tile_cache_max_bytes,
@@ -835,6 +839,25 @@ mod tests {
         for config in invalid {
             assert!(config.validate().is_err(), "accepted {config:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configurable_merge_window_reaches_node_metrics() {
+        let cluster = SimCluster::new(ClusterConfig {
+            node_count: 1,
+            tileset_sources: env!("CARGO_MANIFEST_DIR").to_string(),
+            chunk_fetch_merge_window_ms: 25,
+            ..ClusterConfig::default()
+        })
+        .await
+        .expect("cluster");
+
+        assert!(
+            cluster.nodes[0]
+                .metrics
+                .encode()
+                .contains("ishikari_chunk_fetch_merge_window_seconds 0.025")
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -6,7 +6,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::Html,
+    response::{Html, IntoResponse, Response},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +16,7 @@ use twox_hash::XxHash64;
 use crate::{
     interned::TilesetId,
     pmtiles::TileType,
-    server::{AppState, HttpError, cache, get_origin},
+    server::{AppState, HttpError, apply_origin_vary, cache, get_origin},
     storage::TilesetInfo,
 };
 
@@ -117,7 +117,7 @@ pub(crate) async fn preview_style_handler(
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<PreviewQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_preview_style(state, tileset_id, headers, query).await
 }
 
@@ -127,7 +127,7 @@ pub(crate) async fn namespaced_preview_style_handler(
     Path((namespace, tileset_id)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<PreviewQuery>,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     serve_preview_style(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
@@ -143,7 +143,7 @@ async fn serve_preview_style(
     tileset_id: String,
     headers: HeaderMap,
     query: PreviewQuery,
-) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), HttpError> {
+) -> Result<Response, HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let base_url = get_origin(&headers);
@@ -171,7 +171,9 @@ async fn serve_preview_style(
         tileset_id = %tileset_id,
         "served external response"
     );
-    Ok(([(header::CACHE_CONTROL, cache::PREVIEW)], Json(style)))
+    let mut response = ([(header::CACHE_CONTROL, cache::PREVIEW)], Json(style)).into_response();
+    apply_origin_vary(response.headers_mut());
+    Ok(response)
 }
 
 /// Renders the shared MapLibre preview page for any style URL.

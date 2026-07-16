@@ -9,11 +9,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ishikari_sim::{
     BackendLatencyConfig, BackendLatencyProfile, ChurnConfig, ChurnPlan, ChurnReport,
-    ClusterConfig, EntryAffinity, ModeledCluster, PopulationCdf, SimCluster, TileCatalog,
-    TimedConfig, TimedReport, TraceEntry, Workload, WorkloadConfig, read_trace, run_churn_trace,
-    run_modeled_churn_trace, run_timed_trace, viewport_batch_ranges, write_trace_entry,
+    ClusterConfig, EntryAffinity, HttpExecutionMode, HttpReplayConfig, HttpReplayTarget,
+    ModeledCluster, PopulationCdf, SimCluster, TileCatalog, TimedConfig, TimedReport, TraceEntry,
+    Workload, WorkloadConfig, read_trace, run_churn_trace, run_http_replay,
+    run_modeled_churn_trace, run_sweep, run_timed_trace, viewport_batch_ranges, write_trace_entry,
     write_visualization,
 };
+use reqwest::Url;
 use serde::Serialize;
 
 const REPORT_SCHEMA_VERSION: u32 = 1;
@@ -66,6 +68,10 @@ struct Cli {
 enum Command {
     /// Generate a self-contained HTML visualization from a simulation report.
     Visualize(VisualizeArgs),
+    /// Run a versioned, replay-only modeled-cache parameter sweep.
+    Sweep(SweepArgs),
+    /// Replay a trace through direct nodes or a Gateway and capture calibration metrics.
+    ReplayHttp(ReplayHttpArgs),
 }
 
 #[derive(clap::Args)]
@@ -75,6 +81,69 @@ struct VisualizeArgs {
     /// Destination HTML path; defaults to the input path with an .html extension.
     #[arg(short, long)]
     output: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct SweepArgs {
+    /// Versioned JSON sweep specification.
+    spec: PathBuf,
+    /// Destination JSONL file containing one self-contained document per run.
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct ReplayHttpArgs {
+    /// Existing simulator JSONL trace to replay.
+    trace: PathBuf,
+    /// Ordered direct-node public URL; entry_node indexes this repeated option.
+    #[arg(long = "node-url", conflicts_with = "gateway_url")]
+    node_urls: Vec<Url>,
+    /// Single public Gateway URL; recorded entry_node values are ignored.
+    #[arg(long, conflicts_with = "node_urls")]
+    gateway_url: Option<Url>,
+    /// Per-node internal Prometheus endpoint scraped before and after replay.
+    #[arg(long = "metrics-url")]
+    metrics_urls: Vec<Url>,
+    /// Execute each viewport batch concurrently while preserving batch boundaries.
+    #[arg(long)]
+    viewport_batches: bool,
+    /// Per-request timeout in milliseconds. Requests are never retried.
+    #[arg(long, default_value_t = 30_000)]
+    request_timeout_ms: u64,
+    /// Destination versioned JSON report.
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+impl ReplayHttpArgs {
+    fn into_config(self) -> Result<(HttpReplayConfig, PathBuf)> {
+        let target = match (self.gateway_url, self.node_urls.is_empty()) {
+            (Some(gateway_url), true) => HttpReplayTarget::Gateway { gateway_url },
+            (None, false) => HttpReplayTarget::DirectNodes {
+                node_urls: self.node_urls,
+            },
+            (Some(_), false) => bail!("--gateway-url conflicts with --node-url"),
+            (None, true) => bail!("provide --gateway-url or at least one --node-url"),
+        };
+        if self.output == self.trace {
+            bail!("HTTP replay output must not overwrite the input trace");
+        }
+        Ok((
+            HttpReplayConfig {
+                trace_path: self.trace,
+                target,
+                mode: if self.viewport_batches {
+                    HttpExecutionMode::ViewportBatches
+                } else {
+                    HttpExecutionMode::Serial
+                },
+                metrics_urls: self.metrics_urls,
+                request_timeout: std::time::Duration::from_millis(self.request_timeout_ms),
+            },
+            self.output,
+        ))
+    }
 }
 
 #[derive(clap::Args)]
@@ -108,6 +177,9 @@ struct SimulationArgs {
     zoom_sigma: f64,
     #[arg(long, default_value_t = 0.07)]
     session_reset_probability: f64,
+    /// Per non-reset step, replace panning with a one-level zoom at the same center.
+    #[arg(long, default_value_t = 0.0)]
+    zoom_walk_probability: f64,
     #[arg(long, default_value_t = 1.0)]
     move_step_tiles: f64,
     #[arg(long, default_value_t = 3)]
@@ -146,6 +218,10 @@ struct SimulationArgs {
     chunk_size_bytes: u64,
     #[arg(long, default_value_t = 4)]
     max_fetch_chunks: u64,
+    /// Scheduler delay used by each real-cache node to merge nearby chunk fetches.
+    /// Zero removes the intentional delay. Modeled-cache execution only records it.
+    #[arg(long, default_value_t = 10)]
+    chunk_fetch_merge_window_ms: u64,
     /// Process-wide object-storage range-fetch limit per simulated node.
     #[arg(long, default_value_t = 32)]
     backend_fetch_concurrency: usize,
@@ -235,6 +311,7 @@ impl SimulationArgs {
             tile_group_size: self.tile_group_size,
             chunk_size_bytes: self.chunk_size_bytes,
             max_fetch_chunks: self.max_fetch_chunks,
+            chunk_fetch_merge_window_ms: self.chunk_fetch_merge_window_ms,
             backend_fetch_concurrency: self.backend_fetch_concurrency,
             backend_latency,
             peer_latency_ms: self.peer_latency_ms,
@@ -310,12 +387,35 @@ impl CacheModeArg {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Visualize(args)) = cli.command {
-        let output = args
-            .output
-            .unwrap_or_else(|| args.input.with_extension("html"));
-        write_visualization(&args.input, &output)?;
-        eprintln!("wrote visualization to {}", output.display());
+    if let Some(command) = cli.command {
+        match command {
+            Command::Visualize(args) => {
+                let output = args
+                    .output
+                    .unwrap_or_else(|| args.input.with_extension("html"));
+                write_visualization(&args.input, &output)?;
+                eprintln!("wrote visualization to {}", output.display());
+            }
+            Command::Sweep(args) => {
+                run_sweep(&args.spec, &args.output).await?;
+                eprintln!("wrote sweep results to {}", args.output.display());
+            }
+            Command::ReplayHttp(args) => {
+                let (config, output) = args.into_config()?;
+                let report = run_http_replay(config).await?;
+                let successful = report.is_success();
+                let file = File::create(&output)
+                    .with_context(|| format!("create HTTP replay report {}", output.display()))?;
+                let mut writer = BufWriter::new(file);
+                serde_json::to_writer_pretty(&mut writer, &report)
+                    .context("serialize HTTP replay report")?;
+                writer.flush().context("flush HTTP replay report")?;
+                eprintln!("wrote HTTP replay report to {}", output.display());
+                if !successful {
+                    bail!("HTTP replay completed with failures; inspect the report");
+                }
+            }
+        }
         return Ok(());
     }
     let args = cli.simulation;
@@ -464,6 +564,7 @@ async fn generate_trace(
         focus_zoom: args.focus_zoom,
         zoom_sigma: args.zoom_sigma,
         session_reset_probability: args.session_reset_probability,
+        zoom_walk_probability: args.zoom_walk_probability,
         move_step_tiles: args.move_step_tiles,
         node_count: args.nodes,
         entry_affinity: match args.entry_affinity {

@@ -22,7 +22,6 @@ use super::{
     store::ChunkedStore,
 };
 
-const FETCH_MERGE_WINDOW: Duration = Duration::from_millis(10);
 const IMMEDIATE_CHUNK_INDEX: u64 = 0;
 const MAX_CHUNK_GAP: u64 = 1;
 const MAX_CONCURRENT_FETCHES_PER_TILESET: usize = 32;
@@ -33,6 +32,7 @@ pub struct ChunkFetchCoordinator {
     fetcher: ChunkFetcher,
     metrics: NodeMetrics,
     max_fetch_chunks: u64,
+    merge_window: Duration,
     /// Per-tileset fetch state keyed by tileset id.
     tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
 }
@@ -229,12 +229,18 @@ impl TilesetFetchState {
 }
 
 impl ChunkFetchCoordinator {
-    pub fn new(fetcher: ChunkFetcher, max_fetch_chunks: u64, metrics: NodeMetrics) -> Self {
-        metrics.set_chunk_fetch_merge_window(FETCH_MERGE_WINDOW);
+    pub fn new(
+        fetcher: ChunkFetcher,
+        max_fetch_chunks: u64,
+        merge_window: Duration,
+        metrics: NodeMetrics,
+    ) -> Self {
+        metrics.set_chunk_fetch_merge_window(merge_window);
         Self {
             fetcher,
             metrics,
             max_fetch_chunks,
+            merge_window,
             tileset_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -313,7 +319,7 @@ impl ChunkFetchCoordinator {
             if flush_immediately {
                 flush_immediately = false;
             } else {
-                time::sleep(FETCH_MERGE_WINDOW).await;
+                time::sleep(self.merge_window).await;
             }
 
             let (dispatch, capacity_available) = {

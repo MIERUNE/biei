@@ -34,10 +34,10 @@ in `../specs/ishikari-spec.md`.
   the measured concentration does not justify sharding leaf ownership. The
   simulator report now includes per-node inbound and outbound counts; repeat
   with multi-tileset production traces before reconsidering.
-- Benchmark the fixed 10 ms chunk merge window against isolated and viewport
-  workloads. Compare end-user latency, backend operation count, fetched bytes,
-  and waiter fan-in; prefer an adaptive rule only if it improves the measured
-  Pareto frontier.
+- Benchmark the configurable chunk merge window against isolated and viewport
+  workloads, including the 0 ms no-delay baseline and 10 ms default. Compare
+  end-user latency, backend operation count, fetched bytes, and waiter fan-in;
+  prefer an adaptive rule only if it improves the measured Pareto frontier.
 
 ### Derived Terrain Products (experimental)
 
@@ -72,12 +72,13 @@ in `../specs/isoline-and-hillshade-spec.md`.
 The implemented model and its fidelity boundaries are documented in
 `../specs/simulator-spec.md`.
 
-- Add sweep orchestration with versioned multi-run output.
-- Add HTTP trace replay and calibrate direct-node and Gateway runs against the
-  in-process simulator.
+
+- Run controlled cold-cluster `replay-http` calibrations for direct-node and
+  Gateway targets, compare their Prometheus deltas with the in-process simulator,
+  and record the measured hit-rate/backend-GET error against the acceptance
+  bounds in `../specs/simulator-spec.md`.
 - Model terrain generation and the shared CPU-admission queue in Phase 2.
-- Add the within-session zoom-walk workload needed for cross-zoom chunk-locality
-  experiments.
+
 - Add gossip packet-loss or partition injection only after selecting measured
   failure inputs.
 
@@ -89,14 +90,19 @@ The implemented model and its fidelity boundaries are documented in
 - Add cold/warm latency checks when performance tuning resumes.
 - Add a local multi-node dev-cluster script only if single-process tests stop
   catching cluster regressions.
-- Add router-level HTTP contract tests around the existing unit-tested style
-  namespace/rewrite, glyph validation, sprite suffix, and MVT/MLT negotiation
-  behavior, plus Gateway internal-path non-exposure.
+- Keep the router-level HTTP contract tests (`server/contract_tests.rs`) current.
+  They cover stored MVT and negotiated MLT tile responses through a generated
+  single-tile PMTiles fixture; namespaced styles; provider cache metadata (public
+  `Cache-Control` / `Age`, default and upstream-derived, repeated field lines,
+  compressed style bodies, and internal `x-ishikari-provider-*` headers); glyph
+  and sprite defaults; client conditional requests including derived TileJSON
+  ETags; conditional origin revalidation that extends stale provider entries on
+  `304`; and public-router internal-path non-exposure over a real local HTTP
+  upstream.
 
 ## Optional Hardening
 
-- Add ETag / Last-Modified support for style, glyph, sprite, and TileJSON where
-  upstream or object metadata is available.
+
 - Add a style catalog admin/update endpoint only if dynamic style registration
   becomes necessary.
 - Define an explicit cache-invalidation contract before supporting mutable or
@@ -108,8 +114,6 @@ The implemented model and its fidelity boundaries are documented in
   retention beyond its current failure-detection grace period.
 - Persist a monotonic membership incarnation only if wall-clock rollback becomes
   an operational concern.
-- Either key shared style caches on `Host` or add an expected-hostname allowlist
-  before deploying a shared cache that ignores `Host`.
 
 ## Open Questions
 

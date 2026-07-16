@@ -269,7 +269,40 @@ impl IntoResponse for TilesetResponse {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(cache_control),
             );
+            // Public tile paths can negotiate MLT from `Accept` when the
+            // canonical `.mlt` suffix is absent. Prevent a shared cache from
+            // serving that representation to an MVT client (or vice versa).
+            response
+                .headers_mut()
+                .insert(header::VARY, HeaderValue::from_static("Accept"));
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile() -> TileData {
+        TileData {
+            bytes: bytes::Bytes::from_static(b"tile"),
+            content_type: "application/x-protobuf",
+            content_encoding: None,
+        }
+    }
+
+    #[test]
+    fn public_tile_responses_vary_on_accept() {
+        let response = tile_data_response(tile());
+        assert_eq!(response.headers()[header::CACHE_CONTROL], cache::TILE);
+        assert_eq!(response.headers()[header::VARY], "Accept");
+    }
+
+    #[test]
+    fn internal_tile_responses_do_not_advertise_negotiation() {
+        let response = TilesetResponse::from(tile()).into_response();
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+        assert!(response.headers().get(header::VARY).is_none());
     }
 }

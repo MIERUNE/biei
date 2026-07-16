@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "simulator-support")]
 use super::peer::InternalFetchResponse;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -54,6 +53,7 @@ pub struct ResourceResolverConfig {
     pub tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub chunk_fetch_merge_window: Duration,
     pub backend_fetch_concurrency: usize,
     pub artificial_backend_delay_ms: u64,
     pub tile_cache_max_bytes: u64,
@@ -69,6 +69,7 @@ pub struct ResourceResolverStorageConfig {
     pub tileset_sources: String,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    pub chunk_fetch_merge_window: Duration,
     pub backend_fetch_concurrency: usize,
     pub backend_latency: BackendLatencyModel,
     pub tile_cache_max_bytes: u64,
@@ -156,6 +157,7 @@ impl ResourceResolver {
             tile_group_size,
             chunk_size_bytes,
             max_fetch_chunks,
+            chunk_fetch_merge_window,
             backend_fetch_concurrency,
             artificial_backend_delay_ms,
             tile_cache_max_bytes,
@@ -164,6 +166,10 @@ impl ResourceResolver {
             object_store_registry,
             metrics,
         } = config;
+        // Relies on `reqwest` being built without transfer-decompression
+        // features (see the workspace dependency): a peer forwards provider
+        // bodies with their `Content-Encoding` intact as representation
+        // metadata, so transparent decompression here would corrupt them.
         let http_client = Client::builder()
             .connect_timeout(INTERNAL_HTTP_CONNECT_TIMEOUT)
             .use_rustls_tls()
@@ -182,6 +188,7 @@ impl ResourceResolver {
                 tileset_sources,
                 chunk_size_bytes,
                 max_fetch_chunks,
+                chunk_fetch_merge_window,
                 backend_fetch_concurrency,
                 backend_latency: BackendLatencyModel::fixed(artificial_backend_delay_ms),
                 tile_cache_max_bytes,
@@ -213,6 +220,7 @@ impl ResourceResolver {
                 tileset_sources: config.tileset_sources,
                 chunk_size: config.chunk_size_bytes,
                 max_fetch_chunks: config.max_fetch_chunks,
+                chunk_fetch_merge_window: config.chunk_fetch_merge_window,
                 backend_fetch_concurrency: config.backend_fetch_concurrency,
                 backend_latency: config.backend_latency,
                 chunk_cache_max_bytes: config.chunk_cache_max_bytes,
@@ -264,12 +272,12 @@ impl ResourceResolver {
     /// Routes a non-PMTiles provider resource by a stable HRW key.
     ///
     /// Returns `None` when the local node should fetch the resource itself.
-    pub async fn route_provider_resource(
+    pub(crate) async fn route_provider_resource(
         &self,
         key: &str,
         internal_path: &str,
         kind: &str,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<InternalFetchResponse>> {
         self.peer_backend
             .route_fetch_optional_by_key(key, internal_path, kind)
             .await
@@ -840,6 +848,7 @@ mod tests {
                 tileset_sources,
                 chunk_size_bytes: 1024 * 1024,
                 max_fetch_chunks: 4,
+                chunk_fetch_merge_window: Duration::from_millis(10),
                 backend_fetch_concurrency: 32,
                 backend_latency: BackendLatencyModel::fixed(0),
                 tile_cache_max_bytes: 1024 * 1024,

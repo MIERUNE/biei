@@ -1,10 +1,16 @@
 //! MapLibre sprite JSON/PNG provider endpoint.
 
-use axum::{body::Body, http::StatusCode, response::Response};
+use axum::{
+    body::Body,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
 
 use crate::server::{
-    AppState, HttpError, bytes_response, cache, provider::path_percent_encode_segments,
-    style::validate_style_key, upstream::fetch_limited_bytes_with_content_type,
+    AppState, HttpError, bytes_response,
+    provider::path_percent_encode_segments,
+    style::validate_style_key,
+    upstream::{ProviderResource, fetch_limited_bytes_with_content_type, fetch_limited_json},
 };
 
 const MAX_SPRITE_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -17,16 +23,18 @@ pub(crate) async fn serve_sprite(
     state: AppState,
     style_key: String,
     suffix: String,
+    headers: &HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     validate_style_key(&style_key)?;
     let upstream = resolve_sprite_url(&state, &style_key, &suffix)?;
-    let (body, content_type) = route_sprite_bytes(&state, &style_key, &suffix, &upstream).await?;
-
-    Ok(bytes_response(
-        body,
-        content_type,
-        Some(cache::GLYPH_SPRITE),
-    ))
+    let (resource, content_type) =
+        route_sprite_bytes(&state, &style_key, &suffix, &upstream).await?;
+    if resource.not_modified(headers) {
+        return Ok(resource.not_modified_response());
+    }
+    let mut response = bytes_response(resource.bytes().clone(), content_type, None);
+    resource.apply_public_headers(response.headers_mut());
+    Ok(response)
 }
 
 pub(crate) async fn serve_sprite_local(
@@ -36,9 +44,13 @@ pub(crate) async fn serve_sprite_local(
 ) -> Result<Response<Body>, HttpError> {
     validate_style_key(&style_key)?;
     let upstream = resolve_sprite_url(&state, &style_key, &suffix)?;
-    let (body, content_type) = fetch_sprite_bytes_local(&state, upstream, &suffix).await?;
-    state.metrics.add_internal_bytes(body.len() as u64);
-    Ok(bytes_response(body, content_type, None))
+    let (resource, content_type) = fetch_sprite_bytes_local(&state, upstream, &suffix).await?;
+    state
+        .metrics
+        .add_internal_bytes(resource.bytes().len() as u64);
+    let mut response = bytes_response(resource.bytes().clone(), content_type, None);
+    resource.apply_internal_headers(response.headers_mut());
+    Ok(response)
 }
 
 fn resolve_sprite_url(
@@ -62,14 +74,14 @@ async fn route_sprite_bytes(
     style_key: &str,
     suffix: &str,
     upstream: &str,
-) -> Result<(bytes::Bytes, &'static str), HttpError> {
+) -> Result<(ProviderResource, &'static str), HttpError> {
     let key = format!("sprite:{suffix}:{upstream}");
     let path = format!(
         "/_internal/provider/styles/{}/sprite{}",
         path_percent_encode_segments(style_key),
         suffix
     );
-    if let Some(bytes) = state
+    if let Some(response) = state
         .resource_resolver
         .route_provider_resource(&key, &path, "sprite")
         .await
@@ -80,7 +92,10 @@ async fn route_sprite_bytes(
             )
         })?
     {
-        return Ok((bytes, sprite_content_type(suffix)));
+        return Ok((
+            ProviderResource::from_peer(response),
+            sprite_content_type(suffix),
+        ));
     }
     fetch_sprite_bytes_local(state, upstream.to_string(), suffix).await
 }
@@ -89,7 +104,7 @@ async fn fetch_sprite_bytes_local(
     state: &AppState,
     upstream: String,
     suffix: &str,
-) -> Result<(bytes::Bytes, &'static str), HttpError> {
+) -> Result<(ProviderResource, &'static str), HttpError> {
     let is_png = suffix.ends_with(".png");
     let max_bytes = if is_png {
         MAX_SPRITE_PNG_BYTES
@@ -101,16 +116,20 @@ async fn fetch_sprite_bytes_local(
     } else {
         SPRITE_JSON_CONTENT_TYPES
     };
-    let body = fetch_limited_bytes_with_content_type(
-        state,
-        upstream,
-        max_bytes,
-        "sprite",
-        accepted_content_types,
-    )
-    .await?;
+    let resource = if is_png {
+        fetch_limited_bytes_with_content_type(
+            state,
+            upstream,
+            max_bytes,
+            "sprite",
+            accepted_content_types,
+        )
+        .await?
+    } else {
+        fetch_limited_json(state, upstream, max_bytes, "sprite", accepted_content_types).await?
+    };
 
-    Ok((body, sprite_content_type(suffix)))
+    Ok((resource, sprite_content_type(suffix)))
 }
 
 fn sprite_content_type(suffix: &str) -> &'static str {

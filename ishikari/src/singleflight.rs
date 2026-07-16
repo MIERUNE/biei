@@ -42,7 +42,7 @@ where
         Flight::Leader(LeaderGuard {
             entries: Arc::clone(&self.entries),
             key,
-            error: None,
+            outcome: None,
         })
     }
 }
@@ -63,9 +63,9 @@ impl<E> Follower<E>
 where
     E: Clone,
 {
-    /// Waits for the leader to finish. A returned error was produced by the
-    /// leader and should be shared rather than retried serially by followers.
-    /// `None` means success (read the cache) or cancellation (retry election).
+    /// Waits for the leader to finish. A returned value is an outcome that
+    /// cannot be recovered from the shared cache. `None` means cached success
+    /// (read the cache) or cancellation (retry election).
     pub(crate) async fn wait(mut self) -> Option<E> {
         let _ = self.receiver.changed().await;
         self.receiver.borrow().clone()
@@ -78,17 +78,23 @@ where
 {
     entries: Arc<Mutex<HashMap<K, watch::Sender<Option<E>>>>>,
     key: K,
-    error: Option<E>,
+    outcome: Option<E>,
 }
 
 impl<K, E> LeaderGuard<K, E>
 where
     K: Eq + Hash,
 {
+    /// Publishes a leader result that cannot be recovered from the shared
+    /// cache (for example an intentionally uncacheable successful response).
+    pub(crate) fn complete_with(mut self, value: E) {
+        self.outcome = Some(value);
+    }
+
     /// Publishes a transient leader error to every current follower. The key is
     /// removed immediately on drop, so a later independent request can retry.
-    pub(crate) fn complete_with_error(mut self, error: E) {
-        self.error = Some(error);
+    pub(crate) fn complete_with_error(self, error: E) {
+        self.complete_with(error);
     }
 }
 
@@ -103,9 +109,9 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.key);
         if let Some(sender) = sender
-            && let Some(error) = self.error.take()
+            && let Some(outcome) = self.outcome.take()
         {
-            let _ = sender.send(Some(error));
+            let _ = sender.send(Some(outcome));
         }
     }
 }

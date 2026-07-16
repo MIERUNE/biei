@@ -1,6 +1,6 @@
 //! Object-store and cache backed chunked byte-range reader.
 
-use std::{collections::HashMap, ops::RangeInclusive};
+use std::{collections::HashMap, ops::RangeInclusive, time::Duration};
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -26,6 +26,7 @@ pub(crate) struct ChunkedStoreConfig {
     pub tileset_sources: String,
     pub chunk_size: u64,
     pub max_fetch_chunks: u64,
+    pub chunk_fetch_merge_window: Duration,
     pub backend_fetch_concurrency: usize,
     pub backend_latency: BackendLatencyModel,
     pub chunk_cache_max_bytes: u64,
@@ -61,7 +62,12 @@ impl ChunkedStore {
         )?;
         Ok(Self {
             cache: ChunkCache::new(config.chunk_cache_max_bytes),
-            coordinator: ChunkFetchCoordinator::new(fetcher, config.max_fetch_chunks, metrics),
+            coordinator: ChunkFetchCoordinator::new(
+                fetcher,
+                config.max_fetch_chunks,
+                config.chunk_fetch_merge_window,
+                metrics,
+            ),
         })
     }
 

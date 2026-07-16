@@ -35,7 +35,14 @@ impl ObjectStoreRegistry {
             if let Some(store) = stores.get(&key) {
                 store.clone()
             } else {
-                let (store, _path) = parse_url_opts(url, std::env::vars())
+                // The HTTP backend refuses plain-text HTTP by default, but
+                // `http://` is an accepted provider-template scheme (local and
+                // dev upstreams). The URL scheme already states the intent, so
+                // enable it here instead of requiring an ALLOW_HTTP env var.
+                let allow_http = (url.scheme() == "http")
+                    .then_some(("allow_http".to_string(), "true".to_string()));
+                let options = std::env::vars().chain(allow_http);
+                let (store, _path) = parse_url_opts(url, options)
                     .with_context(|| format!("failed to parse object store URL {url}"))?;
                 let store: Arc<dyn ObjectStore> = store.into();
                 stores.insert(key, store.clone());

@@ -5,15 +5,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use image::ImageFormat;
 
-use crate::pmtiles::TileData;
-
 const MIN_VALID_ELEVATION: f32 = -12_000.0;
 const MAX_VALID_ELEVATION: f32 = 9_000.0;
 /// Maximum accepted DEM source-tile edge (px). Real tiles are 256/512.
 const MAX_DEM_TILE_DIM: u32 = 2048;
 
 #[derive(Debug)]
-pub(crate) struct DemTile {
+pub struct DemTile {
     width: usize,
     height: usize,
     elevations: Vec<f32>,
@@ -25,7 +23,7 @@ impl DemTile {
     }
 
     /// Approximate heap footprint, for cache weighing.
-    pub(crate) fn byte_size(&self) -> usize {
+    pub fn byte_size(&self) -> usize {
         self.elevations.len() * std::mem::size_of::<f32>() + std::mem::size_of::<Self>()
     }
 }
@@ -34,14 +32,14 @@ impl DemTile {
 /// shared `Arc`s so decoded DEMs can live in a cross-product, cross-request
 /// cache (neighboring derived tiles reuse six of the nine).
 #[derive(Debug)]
-pub(super) struct DemNeighborhood {
+pub struct DemNeighborhood {
     tiles: [Option<Arc<DemTile>>; 9],
     width: usize,
     height: usize,
 }
 
 impl DemNeighborhood {
-    pub(super) fn from_tiles(tiles: [Option<Arc<DemTile>>; 9]) -> Result<Self> {
+    pub fn from_tiles(tiles: [Option<Arc<DemTile>>; 9]) -> Result<Self> {
         let center = tiles[4]
             .as_ref()
             .context("center Mapterhorn DEM tile is missing")?;
@@ -65,17 +63,17 @@ impl DemNeighborhood {
         })
     }
 
-    pub(super) fn width(&self) -> usize {
+    pub fn width(&self) -> usize {
         self.width
     }
 
-    pub(super) fn height(&self) -> usize {
+    pub fn height(&self) -> usize {
         self.height
     }
 
     /// Reads through a one-tile border. A missing sparse detail neighbor falls
     /// back to the center edge; the requested center tile itself is mandatory.
-    pub(super) fn get(&self, x: i32, y: i32) -> f32 {
+    pub(crate) fn get(&self, x: i32, y: i32) -> f32 {
         let width = self.width as i32;
         let height = self.height as i32;
         let (column, local_x) = tile_axis(x, width);
@@ -94,7 +92,7 @@ impl DemNeighborhood {
 
     /// Converts pixel-center samples to a grid-point elevation by averaging the
     /// four adjacent samples, matching maplibre-contour's seam-safe input.
-    pub(super) fn grid_elevation(&self, x: i32, y: i32) -> f32 {
+    pub(crate) fn grid_elevation(&self, x: i32, y: i32) -> f32 {
         let values = [
             self.get(x - 1, y - 1),
             self.get(x, y - 1),
@@ -127,17 +125,11 @@ fn tile_axis(value: i32, size: i32) -> (i32, i32) {
     }
 }
 
-pub(super) fn decode_terrarium(tile: TileData) -> Result<DemTile> {
-    if tile.content_encoding.is_some() {
-        bail!(
-            "compressed Mapterhorn image payload is not supported: {:?}",
-            tile.content_encoding
-        );
-    }
+pub fn decode_terrarium(bytes: &[u8]) -> Result<DemTile> {
     // Cap decode dimensions so a crafted WebP declaring huge dimensions cannot
     // expand a tiny payload into a multi-gigabyte buffer. Real DEM source tiles
     // are 256/512 px; the bound leaves generous headroom.
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(tile.bytes.as_ref()));
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.set_format(ImageFormat::WebP);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DEM_TILE_DIM);
@@ -199,27 +191,22 @@ impl DemNeighborhood {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
     use std::io::Cursor;
 
     use super::*;
 
-    fn webp_tile(rgb: [u8; 3], width: u32, height: u32) -> TileData {
+    fn webp_tile(rgb: [u8; 3], width: u32, height: u32) -> Vec<u8> {
         let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(width, height, Rgb(rgb)));
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, ImageFormat::WebP).unwrap();
-        TileData {
-            bytes: Bytes::from(bytes.into_inner()),
-            content_type: "image/webp",
-            content_encoding: None,
-        }
+        bytes.into_inner()
     }
 
     #[test]
     fn decodes_terrarium_elevation() {
         // 128*256 + 10 + 128/256 - 32768 = 10.5m.
-        let tile = decode_terrarium(webp_tile([128, 10, 128], 3, 3)).unwrap();
+        let tile = decode_terrarium(&webp_tile([128, 10, 128], 3, 3)).unwrap();
         assert_eq!(tile.get(1, 1), 10.5);
     }
 
@@ -227,10 +214,10 @@ mod tests {
     fn reads_neighbor_and_falls_back_for_missing_neighbor() {
         let mut tiles: [Option<Arc<DemTile>>; 9] = std::array::from_fn(|_| None);
         tiles[4] = Some(Arc::new(
-            decode_terrarium(webp_tile([128, 0, 0], 3, 3)).unwrap(),
+            decode_terrarium(&webp_tile([128, 0, 0], 3, 3)).unwrap(),
         ));
         tiles[5] = Some(Arc::new(
-            decode_terrarium(webp_tile([128, 1, 0], 3, 3)).unwrap(),
+            decode_terrarium(&webp_tile([128, 1, 0], 3, 3)).unwrap(),
         ));
         let neighborhood = DemNeighborhood::from_tiles(tiles).unwrap();
         assert_eq!(neighborhood.get(3, 1), 1.0);

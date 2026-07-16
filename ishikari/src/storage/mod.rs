@@ -7,9 +7,14 @@ mod resolver;
 mod routing;
 mod store_registry;
 
-pub(crate) use peer::TILE_SOURCE_HEADER;
+#[cfg(not(feature = "simulator-support"))]
+pub(crate) use peer::InternalFetchResponse;
 #[cfg(not(feature = "simulator-support"))]
 pub(crate) use peer::{InternalTileSource, internal_resource_kind};
+pub(crate) use peer::{
+    PROVIDER_AGE_HEADER, PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER,
+    PROVIDER_LAST_MODIFIED_HEADER, TILE_SOURCE_HEADER,
+};
 pub use resolver::{
     ResourceResolver, ResourceResolverConfig, TileSource, TilesetError, TilesetInfo,
 };

@@ -23,6 +23,8 @@ pub struct Config {
     pub router_tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
+    /// Delay used to collect nearby missing chunks before dispatching a range fetch.
+    pub chunk_fetch_merge_window: Duration,
     /// Maximum concurrent object-storage range fetches across all tilesets.
     pub backend_fetch_concurrency: usize,
     pub artificial_backend_delay_ms: u64,
@@ -101,6 +103,14 @@ pub struct Cli {
     chunk_size_bytes: u64,
     #[arg(long, env = "ISKR_MAX_FETCH_CHUNKS", default_value_t = 4)]
     max_fetch_chunks: u64,
+    /// Scheduler delay used to collect nearby missing chunks before dispatch.
+    /// Zero removes the intentional delay while preserving pending/inflight sharing.
+    #[arg(
+        long = "chunk-fetch-merge-window-ms",
+        env = "ISKR_CHUNK_FETCH_MERGE_WINDOW_MS",
+        default_value_t = 10
+    )]
+    chunk_fetch_merge_window_ms: u64,
     /// Process-wide object-storage range-fetch limit. This complements the
     /// per-tileset coordinator cap and prevents distinct-id enumeration from
     /// multiplying backend concurrency.
@@ -246,6 +256,7 @@ impl Config {
             router_tile_group_size: cli.router_tile_group_size,
             chunk_size_bytes: cli.chunk_size_bytes,
             max_fetch_chunks: cli.max_fetch_chunks.max(1),
+            chunk_fetch_merge_window: Duration::from_millis(cli.chunk_fetch_merge_window_ms),
             backend_fetch_concurrency: cli.backend_fetch_concurrency.max(1),
             artificial_backend_delay_ms: cli.artificial_backend_delay_ms,
             tile_cache_max_bytes: cli.tile_cache_max_bytes,
@@ -307,6 +318,7 @@ mod tests {
             gossip_interval_ms: 200,
             chunk_size_bytes: 1024 * 1024,
             max_fetch_chunks: 4,
+            chunk_fetch_merge_window_ms: 10,
             backend_fetch_concurrency: 32,
             artificial_backend_delay_ms: 0,
             tile_cache_max_bytes: 512 * 1024 * 1024,
@@ -364,6 +376,14 @@ mod tests {
         cli.cpu_work_concurrency = Some(0);
         let config = Config::from_cli(cli).expect("zero concurrency is clamped");
         assert_eq!(config.cpu_work_concurrency, 1);
+    }
+
+    #[test]
+    fn zero_chunk_fetch_merge_window_is_allowed() {
+        let mut cli = cli();
+        cli.chunk_fetch_merge_window_ms = 0;
+        let config = Config::from_cli(cli).expect("zero merge window is valid");
+        assert_eq!(config.chunk_fetch_merge_window, Duration::ZERO);
     }
 
     #[test]

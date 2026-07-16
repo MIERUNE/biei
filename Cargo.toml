@@ -1,6 +1,5 @@
 [workspace]
-members = ["ishikari", "ishikari-sim"]
-default-members = ["ishikari"]
+members = ["ishikari", "ishikari-sim", "ishikari-terrain"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -14,8 +13,10 @@ clap = { version = "4.6", features = ["derive", "env"] }
 fast_hilbert = "2"
 fast-mvt = { version = "0.5", default-features = false, features = ["writer"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["webp", "jpeg"] }
 internment = { version = "0.8", default-features = false, features = ["arc"] }
+ishikari-terrain = { path = "ishikari-terrain" }
 mlt-core = { version = "0.12", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
 object_store = { version = "0.14", features = ["aws", "gcp", "http"] }

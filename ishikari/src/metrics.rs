@@ -720,7 +720,7 @@ impl NodeMetrics {
         self.0.max_fetch_chunks.set(max_fetch_chunks as i64);
     }
 
-    /// Exposes the fixed merge window used by the chunk fetch scheduler.
+    /// Exposes the configured merge window used by the chunk fetch scheduler.
     pub fn set_chunk_fetch_merge_window(&self, duration: Duration) {
         self.0
             .chunk_fetch_merge_window_seconds
