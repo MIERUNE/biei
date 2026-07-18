@@ -15,6 +15,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+      # Reuse the Cargo registry and target graph across otherwise ephemeral
+      # GitHub-hosted runners. Pin the v2 action to an immutable commit.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

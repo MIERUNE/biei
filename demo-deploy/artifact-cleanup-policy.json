@@ -1,0 +1,11 @@
+[
+  {
+    "name": "delete-stale-ishikari-build-cache",
+    "action": { "type": "Delete" },
+    "condition": {
+      "tagState": "untagged",
+      "packageNamePrefixes": ["ishikari-buildcache"],
+      "olderThan": "1d"
+    }
+  }
+]

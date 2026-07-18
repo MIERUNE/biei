@@ -26,6 +26,26 @@ Build and push the demo image:
 gcloud builds submit --config demo-deploy/cloudbuild.yaml .
 ```
 
+The first build populates a BuildKit `mode=max` cache in the separate
+`ishikari-buildcache:latest` Artifact Registry package. `cargo-chef` makes the
+dependency build reusable across ephemeral Cloud Build workers; simulator
+source, documentation, and deployment-only changes do not recompile the
+production binary. Simulator manifest changes still invalidate dependency
+resolution, as they must for workspace lockfile validation. Install the
+narrowly scoped cleanup policy once so superseded, untagged cache manifests do
+not accumulate:
+
+```sh
+gcloud artifacts repositories set-cleanup-policies ishikari \
+  --location=asia-northeast1 \
+  --policy=demo-deploy/artifact-cleanup-policy.json
+```
+
+BuildKit pushes the runtime image directly to Artifact Registry, avoiding a
+local image load followed by Cloud Build's second push. The final Cloud Build
+summary therefore shows `IMAGES: -`; the `${_IMAGE}` tag is the output and the
+build log records its digest.
+
 Create or bind the GCS reader identity once:
 
 ```sh
