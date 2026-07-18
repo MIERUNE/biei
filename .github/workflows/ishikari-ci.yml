@@ -1,11 +1,29 @@
-name: CI
+name: Ishikari CI
 
 on:
   push:
+    branches:
+      - main
+    paths:
+      - "services/ishikari/**"
+      - "crates/**"
+      - ".github/workflows/ishikari-ci.yml"
   pull_request:
+    paths:
+      - "services/ishikari/**"
+      - "crates/**"
+      - ".github/workflows/ishikari-ci.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: services/ishikari
 
 jobs:
   rust:
@@ -18,6 +36,8 @@ jobs:
       # Reuse the Cargo registry and target graph across otherwise ephemeral
       # GitHub-hosted runners. Pin the v2 action to an immutable commit.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: services/ishikari -> target
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
