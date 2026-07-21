@@ -19,6 +19,7 @@ done
 
 # Preserve the more detailed service-specific policy checks.
 bash "$root/biei/runtime/check-hpa.sh"
+bash "$root/biei/runtime/check-shutdown-budget.sh"
 bash "$root/ishikari/runtime/check-network-policy.sh"
 
 rendered="$(KUBECONFIG=/dev/null kubectl kustomize "$root")"

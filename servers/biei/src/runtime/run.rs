@@ -7,7 +7,12 @@ use crate::options::Options;
 use crate::runtime::Runtime;
 use mmpf_cluster::{BootstrapReadinessGate, DEFAULT_BOOTSTRAP_GRACE};
 
+/// GKE Spot leaves 22 seconds after the checked-in 3-second `preStop`.
+/// Finish application-owned work in 21 seconds, reserving one second for
+/// process and kubelet overhead before the 25-second platform force-kill.
+const PROCESS_SHUTDOWN_BUDGET: Duration = Duration::from_secs(21);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+const MEMBERSHIP_SHUTDOWN_RESERVE: Duration = Duration::from_secs(2);
 
 /// Run a configured Biei node until the supplied shutdown future resolves.
 pub(crate) async fn run<F>(options: Options, shutdown_requested: F) -> anyhow::Result<()>
@@ -77,14 +82,17 @@ where
     } else {
         crate::http::adapter::serve_with_shutdown(ingress, options.http_bind, Some(shutdown)).await
     };
-    finish_shutdown(shutdown_observer, shutdown_task).await;
+    let process_deadline = finish_shutdown(shutdown_observer, shutdown_task)
+        .await
+        .unwrap_or_else(|| tokio::time::Instant::now() + PROCESS_SHUTDOWN_BUDGET);
     // HTTP is stopped and in-flight requests drained; now close render admission
-    // and join the renderer workers within a bound. A native render still running
-    // at the deadline is detached (never aborted) and reported, so the pod's
-    // shutdown is bounded and its cleanliness is observable rather than silent.
+    // and join the renderer workers within the process-wide deadline. Preserve a
+    // small membership teardown window instead of letting worker cleanup consume
+    // every remaining millisecond. A native render still running at its deadline
+    // is detached (never aborted) and reported.
     let worker_shutdown = runtime
         .node()
-        .shutdown(tokio::time::Instant::now() + DRAIN_GRACE)
+        .shutdown(worker_shutdown_deadline(process_deadline))
         .await;
     if worker_shutdown.is_complete() {
         tracing::info!(
@@ -99,7 +107,7 @@ where
         );
     }
     let membership_shutdown_result = if let Some(owner) = membership_owner {
-        owner.shutdown().await
+        shutdown_membership(owner, process_deadline).await
     } else {
         Ok(())
     };
@@ -112,7 +120,7 @@ fn install_shutdown_handler<F>(
     shutdown_requested: F,
 ) -> (
     crate::http::adapter::ShutdownSignal,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<tokio::time::Instant>,
 )
 where
     F: Future<Output = ()> + Send + 'static,
@@ -120,23 +128,29 @@ where
     let (tx, signal) = crate::http::adapter::shutdown_channel();
     let task = tokio::spawn(async move {
         shutdown_requested.await;
+        let process_deadline = tokio::time::Instant::now() + PROCESS_SHUTDOWN_BUDGET;
+        tx.begin(process_deadline);
         tracing::info!(
-            drain_grace_ms = DRAIN_GRACE.as_millis(),
+            shutdown_budget_ms = PROCESS_SHUTDOWN_BUDGET.as_millis(),
             "shutdown signal received"
         );
-        runtime.begin_draining().await;
+        runtime.begin_draining(process_deadline).await;
         tracing::info!("notifying HTTP listener to shut down");
-        let _ = tx.send(true);
+        tx.stop_http();
+        let drain_budget = process_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(DRAIN_GRACE);
         tracing::info!(
-            drain_grace_ms = DRAIN_GRACE.as_millis(),
+            drain_budget_ms = drain_budget.as_millis(),
             "waiting for in-flight requests to drain"
         );
-        let drained = runtime.wait_for_drain(DRAIN_GRACE).await;
+        let drained = runtime.wait_for_drain(drain_budget).await;
         if drained {
             tracing::info!("in-flight requests drained");
         } else {
             tracing::warn!("drain grace elapsed with in-flight requests remaining");
         }
+        process_deadline
     });
     (signal, task)
 }
@@ -146,17 +160,51 @@ where
 /// the separately spawned, non-cancellable render still owns a drain permit.
 async fn finish_shutdown(
     signal: crate::http::adapter::ShutdownSignal,
-    mut task: tokio::task::JoinHandle<()>,
-) {
-    if signal.is_triggered() {
-        if let Err(error) = (&mut task).await {
-            tracing::error!(%error, "shutdown coordinator terminated unexpectedly");
-        }
-    } else {
+    mut task: tokio::task::JoinHandle<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let Some(process_deadline) = signal.deadline() else {
         // Listener failure before SIGTERM must surface immediately rather than
         // waiting forever for a shutdown signal that may never arrive.
         task.abort();
         let _ = task.await;
+        return None;
+    };
+
+    match tokio::time::timeout_at(process_deadline, &mut task).await {
+        Ok(Ok(task_deadline)) => {
+            debug_assert_eq!(task_deadline, process_deadline);
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "shutdown coordinator terminated unexpectedly");
+        }
+        Err(_) => {
+            tracing::warn!("process shutdown deadline elapsed while waiting for drain coordinator");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    Some(process_deadline)
+}
+
+fn worker_shutdown_deadline(process_deadline: tokio::time::Instant) -> tokio::time::Instant {
+    let membership_deadline = process_deadline
+        .checked_sub(MEMBERSHIP_SHUTDOWN_RESERVE)
+        .unwrap_or(process_deadline);
+    membership_deadline.min(tokio::time::Instant::now() + DRAIN_GRACE)
+}
+
+async fn shutdown_membership(
+    owner: mmpf_cluster::ClusterOwner,
+    process_deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout_at(process_deadline, owner.shutdown()).await {
+        Ok(result) => result,
+        Err(_) => {
+            // Dropping ClusterOwner initiates shutdown even if its watcher did
+            // not complete. Do not wait past the process-wide platform budget.
+            tracing::warn!("process shutdown deadline elapsed while stopping cluster membership");
+            Ok(())
+        }
     }
 }
 
@@ -166,18 +214,35 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use super::finish_shutdown;
+    use super::{
+        DRAIN_GRACE, MEMBERSHIP_SHUTDOWN_RESERVE, PROCESS_SHUTDOWN_BUDGET, finish_shutdown,
+        worker_shutdown_deadline,
+    };
+
+    #[test]
+    fn shutdown_budget_leaves_worker_and_platform_reserves() {
+        let fixed_before_workers = super::super::MEMBERSHIP_DRAIN_PUBLISH_TIMEOUT
+            + crate::http::adapter::HTTP_SHUTDOWN_GRACE;
+        assert!(
+            fixed_before_workers + MEMBERSHIP_SHUTDOWN_RESERVE < PROCESS_SHUTDOWN_BUDGET,
+            "drain publication, HTTP, and membership reserve must leave worker time"
+        );
+        assert!(DRAIN_GRACE < PROCESS_SHUTDOWN_BUDGET);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn main_lifecycle_waits_for_drain_coordinator_after_http_stops() {
         let (tx, signal) = crate::http::adapter::shutdown_channel();
-        tx.send(true).expect("trigger shutdown");
+        let process_deadline = tokio::time::Instant::now() + PROCESS_SHUTDOWN_BUDGET;
+        tx.begin(process_deadline);
+        tx.stop_http();
         let completed = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let completed = Arc::clone(&completed);
             async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 completed.store(true, Ordering::Release);
+                process_deadline
             }
         });
         let finish = tokio::spawn(finish_shutdown(signal, task));
@@ -185,7 +250,58 @@ mod tests {
         tokio::time::advance(Duration::from_secs(9)).await;
         assert!(!finish.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
-        finish.await.expect("finish task");
+        assert_eq!(finish.await.expect("finish task"), Some(process_deadline));
         assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_failure_after_sigterm_keeps_original_deadline() {
+        let (tx, signal) = crate::http::adapter::shutdown_channel();
+        let process_deadline = tokio::time::Instant::now() + PROCESS_SHUTDOWN_BUDGET;
+        tx.begin(process_deadline);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            process_deadline
+        });
+        let finish = tokio::spawn(finish_shutdown(signal, task));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert_eq!(finish.await.expect("finish task"), Some(process_deadline));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_coordinator_cannot_outlive_process_deadline() {
+        let (tx, signal) = crate::http::adapter::shutdown_channel();
+        let process_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tx.begin(process_deadline);
+        tx.stop_http();
+        let completed = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                completed.store(true, Ordering::Release);
+                process_deadline
+            }
+        });
+        let finish = tokio::spawn(finish_shutdown(signal, task));
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(finish.await.expect("finish task"), Some(process_deadline));
+        assert!(!completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_deadline_preserves_membership_reserve() {
+        let process_deadline = tokio::time::Instant::now() + PROCESS_SHUTDOWN_BUDGET;
+        tokio::time::advance(Duration::from_secs(15)).await;
+
+        assert_eq!(
+            worker_shutdown_deadline(process_deadline),
+            process_deadline - MEMBERSHIP_SHUTDOWN_RESERVE
+        );
     }
 }

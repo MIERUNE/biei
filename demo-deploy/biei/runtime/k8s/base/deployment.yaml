@@ -30,8 +30,8 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      # 10s preStop endpoint propagation + 12s HTTP shutdown grace still leaves
-      # time for membership publication and sequential native actor teardown.
+      # Portable budget: 10s preStop + the app's shared 21s shutdown deadline +
+      # process/kubelet overhead. Platform overlays may use a shorter preStop.
       terminationGracePeriodSeconds: 35
       topologySpreadConstraints:
         - maxSkew: 1

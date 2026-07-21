@@ -1,6 +1,6 @@
 # Specifications
 
-This directory records durable product, component, and fidelity contracts. Active implementation work belongs in [`../issues/`](../issues/README.md) or the cross-cutting [`../refactor.md`](../refactor.md) queue.
+This directory records durable product, component, and fidelity contracts. Active implementation work belongs in [`../issues/`](../issues/README.md), including the cross-cutting [`refactor.md`](../issues/refactor.md) queue. `auth-sketch.md` is an unadopted proposal; `resource-layout-sketch.md` clearly separates its adopted PMTiles template contract from proposed publishing conventions.
 
 | Document | Status | Scope |
 |---|---|---|
@@ -9,5 +9,6 @@ This directory records durable product, component, and fidelity contracts. Activ
 | [`ishikari-sim-spec.md`](ishikari-sim-spec.md) | Current simulator contract | Model, fidelity boundaries, calibration, and implemented simulator behavior |
 | [`isoline-and-hillshade-spec.md`](isoline-and-hillshade-spec.md) | Experimental component contract | Derived terrain products and their bounded algorithms and HTTP representations |
 | [`auth-sketch.md`](auth-sketch.md) | Exploratory; not adopted | Possible access-token design; not an implementation contract |
+| [`resource-layout-sketch.md`](resource-layout-sketch.md) | Partly adopted | Implemented PMTiles source-template contract plus proposed content publishing layout |
 
-Code and tests are authoritative when they diverge from these documents. When an intentional contract changes, update the relevant specification and regression tests together. Do not turn specifications into progress logs or duplicate their open work here.
+Code and tests are authoritative when they diverge from these documents. When an intentional contract changes, update the relevant specification and regression tests together. Specifications define behavior and fidelity boundaries; queues own unresolved actions and decisions.

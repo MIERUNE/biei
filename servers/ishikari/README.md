@@ -64,13 +64,29 @@ single-flight coordination to absorb cold concurrent renders. Stale provider
 entries revalidate conditionally, so an unchanged HTTP or object-store origin
 can refresh freshness without sending the body again.
 
-`ISKR_TILESET_SOURCES` (the PMTiles tile source) accepts the same `namespace=url;…;default=url`
-form, so tilesets can be backed by multiple object-store roots. A namespaced key
-is served from the matching root with the namespace stripped
-(`regional/streets` → `{regional-root}/streets.pmtiles`); any other key falls to
-the default root with its full path (`analysis/hrnowc` →
-`{default-root}/analysis/hrnowc.pmtiles`). A single bare `ISKR_TILESET_SOURCES` stays the
-default root.
+`ISKR_TILESET_SOURCES` accepts `namespace=value;…;default=value`, so tilesets can
+be backed by multiple object-store locations. A value may be a root or an
+absolute URL template. Roots preserve the original behavior: a namespace match
+strips the namespace before appending `.pmtiles`, while the default root receives
+the complete logical id. A bare value remains the default root.
+
+Templates require `{tileset_id}` and may use `{namespace}` as a complete optional
+path segment. A default template without `{namespace}` expands `{tileset_id}` to
+the complete logical id, making the compact form preserve namespaces. In a named
+template, or when `{namespace}` is explicit, `{tileset_id}` means the id after
+the namespace:
+
+```text
+regional=gs://regional-bucket/maps/{tileset_id}.pmtiles;
+default=gs://main-bucket/tilesets/{tileset_id}.pmtiles
+```
+
+This maps `regional/streets` to
+`gs://regional-bucket/maps/streets.pmtiles`, `analysis/hrnowc` to
+`gs://main-bucket/tilesets/analysis/hrnowc.pmtiles`, and a flat `planet` id to
+`gs://main-bucket/tilesets/planet.pmtiles`. The explicit default form
+`tilesets/{namespace}/{tileset_id}.pmtiles` resolves to the same paths;
+`{namespace}` is omitted for a flat id and is never replaced with `default`.
 
 ## Composite Mapterhorn tileset
 

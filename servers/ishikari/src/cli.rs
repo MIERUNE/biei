@@ -63,6 +63,9 @@ struct Cli {
         default_value_t = false
     )]
     require_gossip_bootstrap: bool,
+    /// Semicolon-separated namespace roots or URL templates. A default template
+    /// without `{namespace}` expands `{tileset_id}` to the complete logical id;
+    /// other templates may use `{namespace}` as an optional whole segment.
     #[arg(long, env = "ISKR_TILESET_SOURCES", default_value = "data")]
     tileset_sources: String,
     #[arg(long, env = "ISKR_ROUTER_TOP_K", default_value_t = 3)]

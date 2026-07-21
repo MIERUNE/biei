@@ -35,29 +35,54 @@ use biei_core::types::RequestId;
 
 const MAX_INTERNAL_FORWARD_BODY_BYTES: usize = 10 * 1024 * 1024;
 const INTERNAL_FORWARD_BODY_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(12);
+pub(crate) const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(12);
 const MAX_PUBLIC_PATH_BYTES: usize = 8192;
+
+#[derive(Clone, Copy, Default)]
+struct ShutdownState {
+    deadline: Option<Instant>,
+    stop_http: bool,
+}
+
+pub(crate) struct ShutdownTrigger {
+    tx: watch::Sender<ShutdownState>,
+}
 
 #[derive(Clone)]
 pub(crate) struct ShutdownSignal {
-    rx: watch::Receiver<bool>,
+    rx: watch::Receiver<ShutdownState>,
 }
 
-pub(crate) fn shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
-    let (tx, rx) = watch::channel(false);
-    (tx, ShutdownSignal { rx })
+pub(crate) fn shutdown_channel() -> (ShutdownTrigger, ShutdownSignal) {
+    let (tx, rx) = watch::channel(ShutdownState::default());
+    (ShutdownTrigger { tx }, ShutdownSignal { rx })
+}
+
+impl ShutdownTrigger {
+    pub(crate) fn begin(&self, deadline: Instant) {
+        self.tx.send_modify(|state| state.deadline = Some(deadline));
+    }
+
+    pub(crate) fn stop_http(&self) {
+        self.tx.send_modify(|state| state.stop_http = true);
+    }
 }
 
 impl ShutdownSignal {
-    pub(crate) fn is_triggered(&self) -> bool {
-        *self.rx.borrow()
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.rx.borrow().deadline
     }
 
-    async fn wait(mut self) {
-        if *self.rx.borrow() {
-            return;
+    async fn wait(mut self) -> Option<Instant> {
+        loop {
+            let state = *self.rx.borrow();
+            if state.stop_http {
+                return state.deadline;
+            }
+            if self.rx.changed().await.is_err() {
+                return self.deadline();
+            }
         }
-        let _ = self.rx.changed().await;
     }
 }
 
@@ -176,7 +201,9 @@ async fn serve_with_state(
         if let Some(signal) = shutdown {
             let force_shutdown = signal.clone();
             tokio::select! {
-                result = server.with_graceful_shutdown(signal.wait()) => {
+                result = server.with_graceful_shutdown(async move {
+                    let _ = signal.wait().await;
+                }) => {
                     result.context("serve HTTP listener")?;
                 }
                 () = shutdown_grace_elapsed(force_shutdown) => tracing::warn!(
@@ -206,7 +233,9 @@ async fn serve_with_state(
     let force_grace = shutdown.as_ref().map(|_| HTTP_SHUTDOWN_GRACE);
     let shutdown = async move {
         match shutdown {
-            Some(signal) => signal.wait().await,
+            Some(signal) => {
+                let _ = signal.wait().await;
+            }
             None => std::future::pending::<()>().await,
         }
     };
@@ -220,8 +249,10 @@ async fn serve_with_state(
 }
 
 async fn shutdown_grace_elapsed(signal: ShutdownSignal) {
-    signal.wait().await;
-    tokio::time::sleep(HTTP_SHUTDOWN_GRACE).await;
+    let process_deadline = signal.wait().await;
+    let local_deadline = Instant::now() + HTTP_SHUTDOWN_GRACE;
+    let deadline = process_deadline.map_or(local_deadline, |deadline| deadline.min(local_deadline));
+    tokio::time::sleep_until(deadline).await;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1646,10 +1677,26 @@ mod tests {
         tokio::time::advance(HTTP_SHUTDOWN_GRACE + Duration::from_secs(1)).await;
         assert!(!task.is_finished());
 
-        tx.send(true).expect("send shutdown");
+        tx.begin(Instant::now() + HTTP_SHUTDOWN_GRACE);
+        tx.stop_http();
         tokio::task::yield_now().await;
         tokio::time::advance(HTTP_SHUTDOWN_GRACE).await;
         tokio::task::yield_now().await;
+        assert!(task.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_shutdown_grace_honors_earlier_process_deadline() {
+        let (tx, signal) = shutdown_channel();
+        let task = tokio::spawn(shutdown_grace_elapsed(signal));
+        let remaining = Duration::from_secs(3);
+
+        tx.begin(Instant::now() + remaining);
+        tx.stop_http();
+        tokio::task::yield_now().await;
+        tokio::time::advance(remaining).await;
+        tokio::task::yield_now().await;
+
         assert!(task.is_finished());
     }
 

@@ -24,17 +24,25 @@ and [`ishikari-spec.md`](ishikari-spec.md) remain authoritative for what exists.
 
 ## 2. Core decision: verify in-process, issue out-of-band
 
-Token **verification** happens inside biei/ishikari: self-contained HMAC-signed
-tokens, verified in ~µs with no I/O. Start with an implementation in the
+Built-in credential **verification** happens inside biei/ishikari from one
+immutable in-memory registry snapshot: high-entropy API-key verifiers, locally
+verified asymmetric session tokens, or compact capability MACs depending on the
+tier. External JWT, `TrustedHeader`, or `ForwardAuth` authenticate independently
+of that registry, but normalized principals still pass one captured server-local
+policy snapshot. There is no request-path object-store, database, KMS, or
+secret-manager lookup for built-in schemes. Start with an implementation in the
 owning server; extract shared verification primitives only after both servers
-have real implementations with the same contract (§8).
+have real implementations with
+the same contract (§8).
 No per-request hop to an external auth service — at tile QPS an extra network
 round trip per request dominates latency and creates a single point of failure
 in front of everything (the correlated-outage failure mode again).
 
-The auth *service* still exists, but off the hot path: it **issues and
-manages** tokens (mint, rotate keys, revoke) at per-session or per-epoch
-frequency. Hops are spent per session, never per request.
+An out-of-band management plane starts as an admin CLI for static API keys and
+registry updates; no service is required for that phase. A later issuer may mint
+asymmetric session tokens or capabilities and rotate signing material, but it
+remains off the hot path. Hops are spent per issuance/management operation,
+never per data request.
 
 Rejected for the request path: ext_authz-style callout services, managed API
 gateways (per-request hop, SPOF, cost), IAP (Google identities, wrong fit for
@@ -61,8 +69,16 @@ embeds a **capability token** into the tile/glyph/sprite URL templates:
 
 ```
 /t/{cap}/{z}/{x}/{y}.png
-cap = truncated HMAC(master_secret, key_id, epoch_index)
+payload = canonical(version, audience, kid, key_id, epoch, policy_revision)
+cap = base64url(payload) "." base64url(HMAC(epoch_subkey, payload)[0..16])
 ```
+
+The concrete encoding remains open, but the authenticated payload is not. It
+must be length-bounded and canonically encoded, identify the format version and
+verification key (`kid`), bind the deployment audience, customer key, epoch, and
+bounded policy revision. The MAC must provide at least 128 effective bits; a
+shorter opaque digest without audience, `kid`, epoch, or policy revision would
+require unbounded key trials or ambiguous policy lookup during rotation.
 
 - Verified statelessly at origin (pure computation; no hop).
 - Cache-sharing unit is **(customer key, epoch)** — all visitors of one
@@ -71,17 +87,57 @@ cap = truncated HMAC(master_secret, key_id, epoch_index)
   users or sessions. (Per-session tokens in the cache key would make every
   session cold; that combination is dead on arrival with a dumb CDN.)
 - Origin accepts the current and previous epoch (no thundering herd at
-  rotation). CDN object TTL ≤ epoch length keeps "expired but still cached"
-  bounded.
+  rotation). A capability minted near the start of an epoch can therefore
+  remain usable for almost two epoch lengths, not one. CDN object TTL ≤ epoch
+  length bounds cached survival separately; emergency revocation also requires
+  a CDN purge policy.
 
 ### 3.3 Accepted weaknesses
 
 With a dumb CDN, a cached object is served to anyone presenting a matching
 URL. The effective protection of cached content is therefore *capability
-possession* with a lifetime of one epoch — acceptable for commodity base-map
-tiles. **Escape hatch:** any tileset carrying private data is marked
-`no-store` per scope and always takes the strong-auth path; this must be a
-per-scope cache policy from day one.
+possession* for up to the accepted epoch window (almost two epochs when current
+and previous are accepted) — acceptable only for commodity base-map tiles.
+Capability URLs are bearer credentials and will appear in ordinary CDN,
+Gateway, browser-history, and client logs; retention, access, and redaction
+policy are part of the security boundary. **Escape hatch:** any tileset carrying
+private data is marked `no-store` per scope and always takes the strong-auth
+path; this must be a per-scope cache policy from day one.
+
+### 3.4 Verification material and signer isolation
+
+The tiers differ in what verifiers must hold. §2's local-verification decision
+is preserved in every case, but the registry should carry the weakest material
+that supports the selected credential:
+
+- **Static API keys (§3.1).** Generate a high-entropy random secret and return it
+  once. The registry stores a bounded key identifier and a one-way verifier
+  digest, not the recoverable key and normally not a secret-manager reference.
+  A fast digest is acceptable only because the secret has cryptographic entropy;
+  human-chosen passwords would require a different scheme. Exact syntax and
+  verifier construction remain open.
+- **Entry-document / session tokens (§3.1).** Sign with a rotating private key
+  held only by the issuer (KMS/HSM, never exported) and put the corresponding
+  bounded public-key set in the registry. A compromised verifier cannot mint
+  session tokens. Asymmetric verification cost and signature size are acceptable
+  for this low-volume tier.
+- **Tile / glyph / sprite `cap` (§3.2).** A short MAC keeps every tile URL and CDN
+  key smaller, but any pod that can verify a symmetric MAC also holds material
+  capable of minting one. Per-`(key_id, epoch)` subkeys limit time but not a
+  whole-pod compromise to one customer: a pod serving the complete registry will
+  hold active subkeys for many keys. A shared epoch key reduces registry and
+  secret-manager fan-out but has the same broad live-epoch forgery boundary;
+  asymmetric capabilities avoid verifier minting but add signature bytes and
+  CPU. This topology is unresolved and blocks capability adoption.
+
+Long-lived issuer masters and private signing keys never enter object storage or
+verifier pods. If symmetric capability keys are eventually selected, the object
+registry contains only version-pinned external secret references and bounded
+metadata; verifiers resolve the complete current/previous material set during snapshot
+refresh, never per request. Rotation publishes verification material at least
+one refresh interval before use. Do not claim a per-customer compromise boundary
+unless deployment sharding actually ensures that a pod receives only that
+customer's material.
 
 ## 4. CDN contract
 
@@ -106,6 +162,11 @@ per-scope cache policy from day one.
   decides whether absent is acceptable (§5). A future authenticated preview
   must use an appropriate key tier for same-origin tile GETs; a referrer policy
   does not manufacture an `Origin` header.
+- Origin-local token buckets see cache misses only. They cannot limit requests
+  or bytes served as CDN cache hits, so the deployment contract must include
+  CDN-side request/egress limits or equivalent alerts and kill switches.
+  Expensive entry routes require an auditable edge tenant/IP abuse boundary
+  even when origin admission is bounded. Authentication is not that boundary.
 
 ## 5. Origin binding (anti-hotlink)
 
@@ -124,7 +185,8 @@ site's cached variants are unreachable to them. (This closes the classic
 
 Honest scope: `Origin` is client-supplied and trivially forged by non-browser
 scrapers. This control is **anti-hotlink, not anti-scraper**. Scraping is
-controlled by rate limiting (§6), not by header checks.
+controlled by edge request/egress policy plus origin protection (§6), not by
+header checks.
 
 ## 6. Long-lived clients (car navigation)
 
@@ -138,10 +200,12 @@ Design response — stop defending freshness, bound *volume* instead:
   epoch length can vary per key: web keys ~1 day; SDK/nav keys ~30 days, with
   the previous epoch accepted (≥ one full epoch of residual validity). Long
   epochs also *improve* CDN hit rate for fleets sharing road corridors.
-- **Per-cap rate limits at origin** (local per-pod token buckets — approximate
-  global limits, no hop). Legitimate nav traffic is a few tiles/sec; scrapers
-  are orders of magnitude above. This is the actual anti-abuse control; a
-  leaked nav cap is worth "one vehicle's fetch rate for one epoch".
+- **Two-layer volume controls.** Local per-pod token buckets cheaply protect
+  origin capacity on misses, but HPA changes their aggregate allowance and CDN
+  hits bypass them entirely. CDN-side request/egress controls (or at minimum
+  usage alerts plus a fast disable/purge path) bound cached delivery. Do not
+  claim that a leaked nav cap is limited to one vehicle's fetch rate unless the
+  edge enforces that property.
 - **Error contract for renewal-capable clients**: 403 bodies distinguish
   `cap_expired` / `cap_invalid` / `origin_forbidden`. SDKs we control re-fetch
   TileJSON on `cap_expired` (one hop per epoch per device).
@@ -183,6 +247,12 @@ common:
 identity headers at the edge, and proxy→app traffic is authenticated by a
 shared-secret header, mTLS, or internal-only binding. The 403 error contract
 (§6) is fixed across all implementations.
+
+Application credentials authorize data-plane actions only. They never authorize
+registry writes, key issuance, rollback, or secret access. The initial admin CLI
+uses cloud/workload identity and object-store conditional writes; if a public
+management API is ever added, it needs a separate strong administrator identity,
+audit contract, and CSRF/replay boundary rather than an `admin` content scope.
 
 **Cluster-internal listener paths are exempt from public authentication** and
 remain protected by network policy (or a stronger transport identity when one
@@ -228,7 +298,13 @@ representations may share an entry. If two principals can receive different
 bytes for the same parsed resource, derive a bounded, non-secret
 **representation partition** (for example a policy or tenant revision) and
 include that in the relevant cache identity. Never use the raw credential or
-capability as the partition.
+capability as the partition. For built-in registry-backed credentials,
+authentication, authorization, Origin policy, and representation partitioning
+for one request all come from the same captured `Arc<KeyRegistry>` revision; do
+not combine a key accepted under one snapshot with grants from a later refresh.
+For `TrustedHeader` or external JWT, the identity verifier may have its own
+immutable cache, but the normalized principal is authorized entirely against one
+captured policy revision.
 
 For Ishikari entry documents, cache the provider representation below auth,
 then perform Origin-dependent and capability-dependent URL rewriting on the
@@ -302,11 +378,14 @@ behavior differ, so combining them would blur a security boundary.
   parsed logical `TilesetId` or provider resource identity, and keep capability
   embedding in the style.json / TileJSON response path above the shared
   provider cache.
-- **Key registry**: `key_id`, secret ref (`kid` for rotation), `scopes`
-  (style/tileset prefixes), `allowed_origins`, tier (web/SDK), epoch schedule,
-  rate tier. Rotation = accept multiple `kid`s during rollover. Immediate
-  revocation of a key stops new entry documents and cap verification at
-  origin; already-cached tiles survive at most the CDN TTL.
+- **Key registry**: deployment `registry_id`/audience, monotonic registry
+  revision, `key_id`, credential verifier(s), `kid`, optional secret/subkey
+  reference, explicit status, logical action/resource grants, `allowed_origins`,
+  tier (web/SDK), epoch schedule, rate tier, and policy revision. Rotation accepts
+  a bounded current/previous key set. Revocation reaches origins only after their
+  next successful registry refresh; already-cached tiles additionally require
+  expiry or purge. Tokens and capabilities bind the deployment audience so a
+  credential copied between environments is rejected even if identifiers match.
 - **Metering**: origin counters undercount by design (CDN hits never arrive);
   true usage requires CDN log post-processing, on a separate async path.
   Prometheus labels per `key_id` are bounded (registered keys only); reject
@@ -314,11 +393,185 @@ behavior differ, so combining them would blur a security boundary.
   customers are visible ("your traffic is uncacheable — check client Origin
   handling and the CDN cache-key configuration").
 
-## 10. Open questions
+### 9.1 Registry storage: object storage first
 
-- Issuance service shape and key-registry storage (static file vs small DB).
-- Exact wire format: compact custom (`base64url(payload).base64url(mac)`) vs
-  JWT (tooling familiarity, ~300 chars in a query param).
-- Per-pod rate-limit constants and how they interact with HPA scale changes.
-- Whether ishikari's style rewriting should also rewrite third-party provider
-  URLs or only self-hosted tile endpoints.
+The registry is a small object-storage **control plane**, never a data-plane
+lookup. Each process is configured with one fixed registry-root URL, resolves it
+once at composition time, and refreshes an immutable `Arc<KeyRegistry>` snapshot.
+Normal requests perform no object-store, database, KMS, secret-manager, list, or
+metadata operation.
+
+Distribution is per-pod polling of the conditional head; the head CAS is the sole
+linearization point, so pods never run pod-to-pod consensus. Raft is rejected and
+gossip is at most an optional advisory revision hint (never authoritative). Read
+scopes have a loose revocation SLA, which biases the read tier toward fail-open on
+prolonged refresh failure. See [`../issues/auth-todo.md`](../issues/auth-todo.md)
+"Distribution and propagation".
+
+#### 9.1.1 Relationship to existing object-store conventions
+
+Ishikari currently separates a backend's scheme+authority (bucket/host) from the
+object path, reuses one store client per authority, and maps a configured
+matching logical namespace to its physical root by stripping the first segment;
+a default root instead preserves the complete logical key. Preserve the useful
+mechanism but not the domain coupling:
+
+- The auth loader may follow the same **configured root → reused store + base
+  path** pattern, with ambient workload credentials supplied at the server/CLI
+  composition root. Do not make auth depend on Ishikari's read-oriented
+  `ObjectStoreRegistry`, move that type out of `ishikari-core`, or reuse
+  `NamespacedEntries` before two real auth consumers establish shared code.
+- Auth has exactly one registry root per process/environment, not
+  `namespace=url;default=url` routing. A registry document cannot name another
+  bucket, absolute URL, or path outside that root.
+- Logical resource namespaces are authorization input; object-store buckets and
+  prefixes are storage placement only. For example, authorizing logical
+  `regional/streets` is checked before Ishikari strips `regional/` and resolves
+  `{regional-root}/streets.pmtiles`. Possession of a bucket prefix never grants a
+  logical scope, and a default physical root never creates a default grant.
+- Production registry backends must provide authenticated reads and conditional
+  writes (`gs://`, `s3://`, or an equivalent deployment adapter). `file://` and
+  `memory://` are development/test options. Arbitrary HTTP(S), especially the
+  content loader's plain-HTTP escape hatch, is not an acceptable production auth
+  registry.
+
+This is a reason to reuse the `object_store` crate and URL/path discipline, not a
+reason to create a generic repository-wide storage framework.
+
+#### 9.1.2 Immutable revisions plus a conditional head
+
+Use a fixed layout below the configured root:
+
+```text
+v1/head.json
+v1/revisions/{monotonic_revision}-{sha256}.json
+```
+
+`head.json` is the only mutable object. It contains bounded `schema_version`,
+`registry_id`/audience, monotonic revision, relative revision-object name,
+content digest, and creation metadata. A revision is a complete immutable
+registry snapshot. The object name and digest make accidental replacement or a
+wrong head target detectable; the relative path is validated to remain under
+`v1/revisions/`.
+
+The admin writer uses a create-then-publish protocol whose **publication point**
+is one compare-and-swap of head; the two object operations are not a transaction:
+
+1. read and validate the current head plus its backend version/ETag/generation;
+2. build and fully validate the next complete revision locally;
+3. create the revision object with create-only semantics;
+4. conditionally replace `head.json` using the observed backend version;
+5. report a conflict instead of merging or using last-write-wins.
+
+A failed head CAS may leave an unreachable immutable revision; that is harmless
+and can be garbage-collected after a retention window. Rollback never points
+head to a lower revision. It creates a **new higher revision** from historical
+content, but forward numbering alone is not revocation safety: the planner must
+preserve every disable/revocation tombstone introduced after the selected
+revision and require an explicit separately audited reactivation to remove one.
+A running pod rejects a lower revision than it has observed. A fresh pod has no
+trusted revision floor, so defending against malicious bucket rollback requires
+an external monotonic/transparency anchor or bounded signed expiry; object-store
+IAM and audit are the initial trust boundary, not a claim of cryptographic
+anti-replay. Runtime readers never list the prefix or infer the newest revision
+from object names.
+
+Pods conditional-GET `head.json`; when unchanged they do no second read. On a
+new head they fetch the named immutable revision, verify its digest, bounds,
+audience, monotonicity, and every referenced verifier/secret, construct the
+complete candidate snapshot, and then perform one `Arc` swap. Every secret
+reference is pinned to an immutable provider version (never a mutable `latest`
+alias), and that version is retained for at least the registry revision and
+rollback-retention window. There is no partially applied manifest: an invalid
+entry or unavailable required secret
+rejects the whole candidate and retains the last-good snapshot. Revocation is an
+explicit valid key status, not a malformed entry. Startup behavior and maximum
+last-good age remain policy decisions in [`../issues/auth-todo.md`](../issues/auth-todo.md).
+
+#### 9.1.3 IAM and secret boundary
+
+Prefer a dedicated auth-registry bucket/container per environment over the demo
+content bucket. A path prefix is organization, not a portable IAM or encryption
+boundary; sharing a bucket can accidentally let a content reader enumerate auth
+policy or let a content publisher alter it.
+
+- Server identities get read-only access to `head.json` and revision objects.
+- The admin writer gets object create/update permissions but no data-plane
+  service credential. Create-only revision writes and conditional head updates
+  are enforced by writer behavior plus verified backend capabilities; ordinary
+  bucket IAM does not generally force callers to send `If-Match`. Provider
+  versioning/Object Lock is optional defense in depth. Cloud audit logs identify
+  the real writer; a self-reported `created_by` field is informational only.
+- Issuer/KMS identities are separate from registry readers and writers. Raw API
+  keys, capability keys, HMAC masters, and private signing keys never appear in
+  object bytes. Public keys and high-entropy API-key verifier digests may appear
+  inline. If symmetric capabilities are adopted, verifier pods receive a
+  separate least-privilege secret-read role limited to the pinned
+  current/previous key versions; that role cannot mint through the issuer or
+  read the master.
+- Biei and Ishikari use separate workload identities even when both can read the
+  registry. Do not reuse Ishikari's broad content-bucket reader merely because
+  its object-store client already exists.
+
+#### 9.1.4 Authorization and management integration
+
+Authorization grants are typed logical policy, not object paths or free-form URL
+prefixes. The schema should represent an allow-only set of:
+
+- service/audience (`biei`, `ishikari`, or an explicitly reviewed shared value);
+- action (for example entry read, tile read, tile render, static render);
+- resource kind (`style`, `tileset`, or an explicit glyph/sprite policy);
+- exact id or segment-aware subtree selector; glyphs/sprites must either inherit
+  from a named style grant by a deterministic rule or have their own kind—never
+  fall through because they lack a tileset id;
+- bounded policy/representation revision where bytes can differ by principal.
+
+Segment-aware matching prevents a grant for `carto` from matching `cartography`.
+It also accommodates Biei's arbitrary-depth `StyleId` and Ishikari's
+`namespace/id` `TilesetId` without treating their physical source roots as the
+same security domain.
+
+A request using a built-in credential captures one registry snapshot,
+authenticates the key, authorizes the parsed logical id and action, validates
+Origin policy, and derives any representation partition from that same revision
+before expensive parsing, admission, or storage resolution. External AuthN may
+use its own immutable verifier cache, but the resulting normalized principal
+still uses exactly one policy snapshot.
+
+Registry management is a separate control-plane authorization system. The first
+admin CLI relies on cloud/workload identity, conditional object writes, and
+provider audit logs; application API keys and content grants cannot call it. A
+future management API, if justified, must serialize the same CAS workflow and
+add a distinct administrator identity and audit/replay contract rather than
+introducing an `admin` data-plane scope.
+
+Object storage backs only our built-in key/capability policy. `TrustedHeader` and
+external JWT deployments bring their own identity source, though normalized
+principals must still pass the same server-local logical AuthZ boundary.
+
+### 9.2 Staged adoption if this sketch is approved
+
+Approval should authorize one bounded phase at a time:
+
+1. Define the versioned registry schema and build an admin CLI/object writer for
+   the immutable-revision + conditional-head workflow in §9.1. Include local
+   validation, conflict-safe apply, audit output, and forward-only rollback.
+   Prefer this narrow operator tool over a public management API.
+2. Implement strong `StaticApiKeys` protection for Biei's expensive `static`
+   route and authenticated entry documents. Keep edge rate limiting as a
+   separate deployment prerequisite.
+3. Implement the same externally observable auth behavior in the second server;
+   only then extract proven service-independent verification code.
+4. Add capability URLs only after the exact wire format, scope partition,
+   epoch lifetime, CDN cache-key/log policy, edge abuse controls, and emergency
+   purge semantics are settled and tested.
+
+This ordering deliberately does **not** start with Ishikari capability auth: the
+registry and strong entry tier are useful without accepting the capability/CDN
+trade-offs.
+
+## 10. Decision queue
+
+Unresolved choices and adoption gates are tracked once in
+[`../issues/auth-todo.md`](../issues/auth-todo.md). Their presence does not
+change this document's exploratory status or authorize implementation.

@@ -310,8 +310,7 @@ are hard-bounded. The current overlay limit is 64.
 
 Pins are generated as 2x bitmaps and registered with a pixel ratio of 2. Their
 shape, shadow, label placement, and black/white label contrast are handled in
-Rust. Provider-specific built-in icon names are not supported. URL marker
-images remain optional future work.
+Provider-specific built-in icon names and URL marker images are not supported.
 
 `addlayer` accepts a policy-validated style layer JSON object. The JSON path via
 `AnyLayer::from_json_str` lets MapLibre Native parse paint/layout expressions,
@@ -378,7 +377,10 @@ The service assumes adversarial high-cardinality misses are possible. Defenses:
 - Bound render output cache weight and lifetime.
 - Keep attacker-controlled identifiers out of metric labels.
 - Rely on an outer gateway for tenant/IP rate limiting, while retaining local
-  hard limits for configuration failures at that layer.
+  hard limits for configuration failures at that layer. Biei's own backpressure
+  is a global semaphore, not per-client, so on an open network a single client
+  can saturate the shared render queue; the upstream rate limiter is a
+  deployment prerequisite, not an enhancement.
 
 ### 7.6 Response caching
 
@@ -399,6 +401,13 @@ latency, and no synthetic native-render residency sample.
 
 Successful tile responses carry `Cache-Control: public, max-age=3600`.
 Static-render responses and preview HTML carry `Cache-Control: private, no-store`.
+The node-local five-minute output TTL and this one-hour downstream `max-age` are
+intentionally different budgets rather than an inconsistency: the short internal
+TTL bounds cache memory and lets Biei pick up changed stable-URL data quickly on
+its own misses, while the longer downstream value offloads tile serving to a CDN
+where an hour of tile staleness is acceptable and can be cut short by gateway
+invalidation. Downstream freshness is deliberately not tied to the internal
+cadence, so a CDN may serve a render staler than Biei's own refresh interval.
 Application-generated ETags and public `If-None-Match`/304 handling are not
 implemented. CDN or gateway validators may still operate outside Biei.
 
@@ -464,6 +473,14 @@ retiring actor is joined and replaced without requiring another admitted task.
 Repeated repair attempts do not repeatedly increment replacement-exhaustion
 accounting.
 
+Orphans are bounded by count, not by memory: a detached render keeps its full
+per-renderer working set (parsed style, glyph/sprite atlases, tessellation)
+until the non-cancellable render returns, which under a slow provider can be
+long. Pod memory sizing must therefore budget for orphaned plus replacement
+renderers, not only the configured slots; a slow-render load can transiently
+approach twice the steady-state native footprint before the orphan budget
+closes admission.
+
 Renderer health has three states:
 
 - `full`: every configured slot is available;
@@ -506,6 +523,15 @@ admission first, so a degraded renderer does no wasted profile I/O).
 the ordinary Kubernetes probe grace before restart. This is direct runtime
 evidence, not inference from scraped Prometheus rates. Ordinary saturation and
 successfully replaced orphaning remain `full`.
+
+Because `external_degraded` stays ready and live by design, a full provider
+outage that costs every slot is invisible to the Kubernetes probes: cold renders
+return 502 while readiness stays green. Render-failure detection therefore
+depends on out-of-band alerting on actor-health state and 502 rate, not on the
+probes. The same process-global, non-causal evidence means an internally wedged
+slot can be misclassified as `external_degraded` while ambient provider retries
+supply coincidental evidence, keeping a genuinely broken pod in rotation; that
+alerting is the only signal for this case as well.
 
 A native segfault still kills the process. Version 1 relies on pod/process
 restart and cluster failover. Subprocess isolation is a possible future design,
@@ -585,9 +611,12 @@ Network behavior:
 - Cross-renderer single-flight within each priority lane.
 - Correct gzip/deflate handling without forwarding stale encoding metadata.
 - Public-address-only SSRF policy by default, including DNS and redirect
-  validation; explicitly configured private hosts are the only exception. Keep
-  that allowlist to the narrowest exact hosts possible: broad private-domain
-  wildcards can expose unrelated internal services to untrusted resource URLs.
+  validation; explicitly configured private hosts are the only exception. The
+  current exception matches a host (or optional wildcard suffix), not an exact
+  `(scheme, host, port)` authority, so enabling it permits HTTP(S) resource
+  requests to any port on that private host. Keep it to the narrowest exact
+  hosts and trusted resource templates; broad private-domain wildcards can
+  expose unrelated internal services to untrusted resource URLs.
 
 Database behavior:
 
@@ -816,13 +845,32 @@ Shutdown:
    A render still running at the deadline is detached (never aborted) and
    counted as a forced teardown, so worker shutdown is bounded and its outcome
    (clean join vs. forced detach) is logged rather than left implicit in a drop.
-5. Let runtime ownership drop membership and any remaining actor resources as
-   the server exits.
+5. Await membership-owner shutdown only until the process-wide deadline. If it
+   does not complete, dropping the owner still initiates Chitchat shutdown and
+   the process continues exiting.
 6. Exit even if a bounded orphan native thread cannot be joined.
 
 Endpoint propagation delay is an orchestration concern. A deployment may use a
 preStop delay before SIGTERM; biei should not silently spend an undocumented
 portion of the application drain budget on a platform-specific sleep.
+
+The full shutdown budget includes any `preStop` delay, drain-state publication,
+HTTP drain/shutdown, worker join, membership-owner shutdown, and process/kubelet
+overhead. Application phases consume one monotonic deadline created when
+SIGTERM is observed rather than stacking independent maximum waits. Biei's
+application budget is 21 seconds: drain publication is locally capped at one
+second, HTTP shutdown at 12 seconds, and in-flight drain/worker cleanup at 10
+seconds, but every phase is also clipped by the shared deadline. Worker cleanup
+preserves the final two seconds for membership teardown.
+
+The GKE overlay's 25-second contract is 3 seconds of `preStop`, at most 21
+seconds of application shutdown, and one second of process/kubelet reserve. A
+render still running at the worker deadline is detached, never aborted, after
+drain publication; membership waiting is likewise abandoned at the process
+deadline and owner drop initiates shutdown. A rendered-manifest assertion keeps
+these values from drifting beyond the platform cap. This makes deadline expiry
+safe rather than lossy, but controlled termination with in-flight work remains
+the operational proof of a clean exit.
 
 ## 11. Internal Security Boundary
 
@@ -833,6 +881,15 @@ The trust boundary is the network layer: Kubernetes namespace and
 NetworkPolicy, VPC/firewall rules, or a service mesh. If authenticated peer
 identity is required, use mTLS/SPIFFE or a mesh rather than adding a partial
 application token scheme.
+
+This boundary is a hard prerequisite, not an assumption: the internal listener
+is safe only where a NetworkPolicy (enforced by a NetworkPolicy-capable CNI),
+VPC/firewall rule, or mesh actually restricts the internal port to peers. Note
+that pod-label plus namespace reachability is not peer identity — any
+in-namespace workload that can wear the peer label reaches the unauthenticated
+forward path. That is the same identity gap that makes a shared bearer token
+pointless, and the reason mTLS/SPIFFE or a mesh is the upgrade when identity is
+actually required.
 
 ## 12. Observability
 
@@ -940,7 +997,7 @@ controlled measurements, not as sizing evidence.
 
 ## 14. Work Tracking
 
-Statements in this specification describe the current contract unless explicitly marked otherwise. Biei-specific unresolved work lives in [`../issues/biei-todo.md`](../issues/biei-todo.md), missing binding capabilities live in [`../issues/mln-rs-wishlist.md`](../issues/mln-rs-wishlist.md), and cross-cutting structural work lives in [`../refactor.md`](../refactor.md).
+Statements in this specification describe the current contract unless explicitly marked otherwise. Biei-specific unresolved work lives in [`../issues/biei-todo.md`](../issues/biei-todo.md), missing binding capabilities live in [`../issues/mln-rs-wishlist.md`](../issues/mln-rs-wishlist.md), and cross-cutting structural work lives in [`../issues/refactor.md`](../issues/refactor.md).
 
 ## 15. Production Sizing
 

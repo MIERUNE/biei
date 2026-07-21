@@ -17,7 +17,7 @@ spec:
           imagePullPolicy: Always
           env:
             - name: ISKR_TILESET_SOURCES
-              value: "gs://mappf-experiment-demo/tilesets"
+              value: "gs://mappf-experiment-demo/tilesets/{tileset_id}.pmtiles"
             - name: ISKR_STYLE_TEMPLATES
               value: "gs://mappf-experiment-demo/styles/{style_id}/style.json"
             - name: ISKR_GLYPH_URL_TEMPLATE

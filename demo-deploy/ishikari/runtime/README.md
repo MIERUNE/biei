@@ -165,7 +165,7 @@ kubectl -n map-demo rollout status deploy/ishikari
 
 The GKE overlay is configured for the demo bucket:
 
-- PMTiles root: `ISKR_TILESET_SOURCES`
+- PMTiles source roots/templates: `ISKR_TILESET_SOURCES`
 - styles: `ISKR_STYLE_TEMPLATES`
 - glyphs: `ISKR_GLYPH_URL_TEMPLATE`
 - sprites: `ISKR_SPRITE_TEMPLATES`

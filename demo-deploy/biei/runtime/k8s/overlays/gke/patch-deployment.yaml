@@ -7,6 +7,13 @@ spec:
   # removes `/spec/replicas` from the base, so setting it would be dead config.
   template:
     spec:
+      # GKE Autopilot hard-caps Spot-pod termination at 25s and silently ignores
+      # a larger request, so declare the real ceiling instead of inheriting the
+      # portable base's 35s. The in-app shutdown is bounded and detach-safe (see
+      # biei-spec.md shutdown sequence: a render still running at the deadline is
+      # detached, never aborted, after drain state is published), so reaching
+      # this ceiling is safe, not lossy.
+      terminationGracePeriodSeconds: 25
       nodeSelector:
         cloud.google.com/gke-spot: "true"
       tolerations:
@@ -17,6 +24,16 @@ spec:
       containers:
         - name: biei
           imagePullPolicy: Always
+          # Trim the portable base's 10s endpoint-propagation sleep so the whole
+          # sequence fits the 25s cap: 3s propagation + the app's shared 21s
+          # deadline + 1s process/kubelet reserve. The app closes render admission
+          # the instant it begins draining, so a short sleep does not admit new work.
+          # NOTE: 3s is a demo best-effort; a real deployment should confirm
+          # endpoint propagation with a controlled termination test.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 3"]
           env:
             - name: BIEI_STYLE_TEMPLATES
               value: "http://ishikari:8080/styles/{style_id}/style.json"

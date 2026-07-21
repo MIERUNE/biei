@@ -14,6 +14,6 @@ They can run independently or together, with Ishikari supplying resources either
 
 - [Specifications and design status](specs/README.md)
 - [Product-specific work queues](issues/README.md)
-- [Cross-cutting refactoring queue](refactor.md)
+- [Cross-cutting refactoring queue](issues/refactor.md)
 
 LICENSE: MIT OR Apache-2.0

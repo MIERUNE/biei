@@ -102,15 +102,12 @@ impl Runtime {
         self.renderer_supervisor.clone()
     }
 
-    pub(crate) async fn begin_draining(&self) {
+    pub(crate) async fn begin_draining(&self, process_deadline: Instant) {
         self.drain.begin_draining();
         if let Some(membership) = &self.membership {
-            match tokio::time::timeout(
-                MEMBERSHIP_DRAIN_PUBLISH_TIMEOUT,
-                membership.set_draining(true),
-            )
-            .await
-            {
+            let publish_deadline =
+                process_deadline.min(Instant::now() + MEMBERSHIP_DRAIN_PUBLISH_TIMEOUT);
+            match tokio::time::timeout_at(publish_deadline, membership.set_draining(true)).await {
                 Ok(()) => {
                     tracing::info!("published draining state to membership");
                 }
@@ -459,7 +456,9 @@ mod tests {
         let runtime = Runtime::spawn_single_node(&options).expect("runtime spawns");
         let ingress = runtime.http_ingress(Duration::from_secs(30));
 
-        runtime.begin_draining().await;
+        runtime
+            .begin_draining(Instant::now() + MEMBERSHIP_DRAIN_PUBLISH_TIMEOUT)
+            .await;
 
         let response = ingress
             .handle_path(

@@ -1,18 +1,23 @@
-# Biei Work Queue
+# Biei Decision Queue
 
-This file contains unresolved Biei-specific product and operational decisions. Durable behavior belongs in [`../specs/biei-spec.md`](../specs/biei-spec.md), cross-cutting structural work belongs in [`../refactor.md`](../refactor.md), and missing upstream bindings belong in [`mln-rs-wishlist.md`](mln-rs-wishlist.md). Delete completed items; git history is the archive.
+No Biei-specific implementation item is active. These entries are product or operational triggers, not a roadmap. Durable behavior belongs in [`../specs/biei-spec.md`](../specs/biei-spec.md), cross-cutting work belongs in [`refactor.md`](refactor.md), and missing upstream bindings belong in [`mln-rs-wishlist.md`](mln-rs-wishlist.md). Delete resolved entries; git history is the archive.
 
-## Evidence-gated product work
+## Compatibility and product triggers
 
-- Add URL marker images or optional text-layer pin labels only when a concrete compatibility requirement justifies the extra resource and lifecycle handling. Current pins intentionally render labels into request-local bitmaps.
-- Add public application-generated ETags and `If-None-Match`/`304` handling only if CDN or gateway validators are insufficient for measured traffic.
-- Add persistent FileSource caching only if restart measurements show enough benefit to justify a disk cache and its invalidation policy.
-- Add subprocess isolation only if process-level recovery proves insufficient for observed MapLibre Native crashes.
-- Propagate per-render context into the process-global FileSource callback only if aggregate resource metrics, cancellation, and global timeouts cannot explain real render behavior.
-- Add a per-peer gossip-age metric only if existing membership and readiness signals cannot diagnose an operational incident.
-- Optimize cold style JSON double parsing only if setup profiles show material CPU or latency cost.
-- Add Helm or broader production packaging policy only if Biei moves beyond the current deployment-demo scope.
+- **URL markers or text-layer pin labels:** add only for a concrete compatibility requirement. Current labels are intentionally rendered into request-local bitmaps.
+- **Public ETag/304 handling:** add only if CDN or gateway validators are insufficient for measured traffic.
+- **Standard throughput fixture:** choose a local, fast provider fixture before publishing reproducible throughput comparisons.
 
-## Unresolved decisions
+## Production security gates
 
-- Which local, fast provider fixture should be the standard for reproducible throughput measurements?
+- **Private-network resource authorities:** before accepting attacker-controlled style/resource URLs in a deployment that enables `BIEI_MLN_RESOURCE_PRIVATE_HOSTS`, replace host-only exceptions with exact allowed `(scheme, host, port)` authorities (or an equally narrow structured policy). The current exception permits every HTTP(S) port on an allowed private host; broad wildcard hosts expand that SSRF capability further.
+
+## Operational evidence gates
+
+- **Persistent FileSource cache:** require restart measurements showing enough benefit to justify disk state and invalidation policy.
+- **Native subprocess isolation:** require evidence that process-level recovery is insufficient for observed MapLibre Native crashes.
+- **Per-render FileSource context:** require a real diagnostic question that aggregate resource metrics, cancellation, and global timeouts cannot answer.
+- **Per-peer gossip-age metric:** require an incident that existing membership and readiness signals cannot diagnose.
+- **Cold style JSON parsing:** optimize only if setup profiles show material CPU or latency cost.
+- **Orphan render memory accounting:** add byte-level orphan admission only if a slow-render or distinct-key measurement shows the count-bounded orphan pool can approach the pod memory limit. Orphans are bounded by count, not bytes (see biei-spec §8.2).
+- **Production packaging:** add Helm or broader policy only if Biei moves beyond the current deployment-demo scope.

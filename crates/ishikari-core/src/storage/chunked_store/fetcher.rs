@@ -119,20 +119,84 @@ pub(crate) enum ChunkFetchError {
     Message(String),
 }
 
-/// One object-store root that backs some set of tilesets.
+/// One object-store source that backs some set of tilesets.
 struct TilesetSource {
     object_store: Arc<dyn ObjectStore>,
-    base_path: ObjectPath,
+    path: TilesetPath,
+}
+
+enum TilesetPath {
+    /// Backwards-compatible shorthand: append the namespace-relative key and
+    /// `.pmtiles` below this root. The default entry receives the complete key.
+    Root(ObjectPath),
+    Template(TilesetPathTemplate),
+}
+
+/// Startup-validated object-path template. `{namespace}` is an optional whole
+/// path segment. A default template without it expands `{tileset_id}` to the
+/// complete logical id; other templates expand the id after the namespace.
+struct TilesetPathTemplate {
+    parts: Box<[TilesetPathPart]>,
+    tileset_id_includes_namespace: bool,
+}
+
+enum TilesetPathPart {
+    Literal(String),
+    Namespace,
+    TilesetId { prefix: String, suffix: String },
+}
+
+impl TilesetPathTemplate {
+    fn render(&self, logical_id: &str) -> ObjectPath {
+        let (namespace, id_after_namespace) = logical_id
+            .split_once('/')
+            .map_or((None, logical_id), |(namespace, tileset_id)| {
+                (Some(namespace), tileset_id)
+            });
+        let tileset_id = if self.tileset_id_includes_namespace {
+            logical_id
+        } else {
+            id_after_namespace
+        };
+        let mut path = ObjectPath::default();
+        for part in &self.parts {
+            match part {
+                TilesetPathPart::Literal(segment) => path = path.join(segment.as_str()),
+                TilesetPathPart::Namespace => {
+                    if let Some(namespace) = namespace {
+                        path = path.join(namespace);
+                    }
+                }
+                TilesetPathPart::TilesetId { prefix, suffix } => {
+                    path = join_template_tileset_id(path, prefix, tileset_id, suffix);
+                }
+            }
+        }
+        path
+    }
+}
+
+fn join_template_tileset_id(
+    path: ObjectPath,
+    prefix: &str,
+    tileset_id: &str,
+    suffix: &str,
+) -> ObjectPath {
+    if let Some((namespace, tileset_id)) = tileset_id.split_once('/') {
+        path.join(format!("{prefix}{namespace}"))
+            .join(format!("{tileset_id}{suffix}"))
+    } else {
+        path.join(format!("{prefix}{tileset_id}{suffix}"))
+    }
 }
 
 /// Resolves a tileset key to the object-store root that backs it.
 ///
-/// `TILESET_SOURCES` accepts the same `namespace=url;…;default=url` form as the style
-/// and sprite templates (a bare URL is the default root). A namespaced tileset
-/// key whose first segment matches a configured namespace is served from that
-/// root with the namespace stripped (`regional/streets` → `{root}/streets.pmtiles`);
-/// any other key falls to the default root with its full path preserved
-/// (`analysis/hrnowc` → `{default}/analysis/hrnowc.pmtiles`).
+/// `TILESET_SOURCES` accepts `namespace=value;…;default=value` (a bare value is
+/// the default). A value may be a root shorthand or an explicit URL template
+/// containing `{tileset_id}` and optional whole-segment `{namespace}`. A
+/// default template without `{namespace}` receives the complete logical id in
+/// `{tileset_id}`. Otherwise `{tileset_id}` means the id after the namespace.
 #[derive(Clone)]
 struct TilesetSources {
     entries: NamespacedEntries<Arc<TilesetSource>>,
@@ -151,7 +215,7 @@ impl TilesetSources {
         .map_err(anyhow::Error::new)?
         .try_map(|namespace, source_url| {
             let source_name = namespace.unwrap_or("default");
-            build_source(&source_url, registry)
+            build_source(&source_url, namespace.is_none(), registry)
                 .with_context(|| format!("failed to configure tileset source {source_name:?}"))
                 .map(Arc::new)
         })?;
@@ -163,10 +227,11 @@ impl TilesetSources {
     fn resolve(&self, tileset_id: &str) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
         let selected = self.entries.select(tileset_id)?;
         let source = selected.value();
-        Some((
-            source.object_store.clone(),
-            object_path_under(&source.base_path, selected.relative_key()),
-        ))
+        let path = match &source.path {
+            TilesetPath::Root(base_path) => object_path_under(base_path, selected.relative_key()),
+            TilesetPath::Template(template) => template.render(tileset_id),
+        };
+        Some((source.object_store.clone(), path))
     }
 }
 
@@ -465,7 +530,14 @@ fn object_path_under(base: &ObjectPath, relative_key: &str) -> ObjectPath {
     path
 }
 
-fn build_source(source_url: &str, registry: &ObjectStoreRegistry) -> Result<TilesetSource> {
+fn build_source(
+    source_url: &str,
+    is_default: bool,
+    registry: &ObjectStoreRegistry,
+) -> Result<TilesetSource> {
+    if source_url.contains('{') || source_url.contains('}') {
+        return build_template_source(source_url, is_default, registry);
+    }
     let url = normalize_source_url(source_url)?;
     // The registry dedups stores by bucket/host, so multiple namespaces (or the
     // provider layer) backed by the same bucket share one store and pool.
@@ -474,8 +546,85 @@ fn build_source(source_url: &str, registry: &ObjectStoreRegistry) -> Result<Tile
         .with_context(|| format!("failed to resolve {}", redacted_source_label(&url)))?;
     Ok(TilesetSource {
         object_store,
-        base_path,
+        path: TilesetPath::Root(base_path),
     })
+}
+
+fn build_template_source(
+    source_template: &str,
+    is_default: bool,
+    registry: &ObjectStoreRegistry,
+) -> Result<TilesetSource> {
+    const NAMESPACE: &str = "{namespace}";
+    const TILESET_ID: &str = "{tileset_id}";
+
+    if source_template.matches(TILESET_ID).count() != 1 {
+        bail!("tileset source template must contain {TILESET_ID} exactly once");
+    }
+    if source_template.matches(NAMESPACE).count() > 1 {
+        bail!("tileset source template may contain {NAMESPACE} at most once");
+    }
+    let remainder = source_template
+        .replace(TILESET_ID, "")
+        .replace(NAMESPACE, "");
+    if remainder.contains('{') || remainder.contains('}') {
+        bail!("tileset source template contains an unsupported placeholder");
+    }
+
+    let namespace_marker = unique_template_marker(source_template, "mmpf-namespace-marker");
+    let tileset_id_marker = unique_template_marker(source_template, "mmpf-tileset-id-marker");
+    let sample = source_template
+        .replace(NAMESPACE, &namespace_marker)
+        .replace(TILESET_ID, &tileset_id_marker);
+    let url = Url::parse(&sample)
+        .map_err(|_| anyhow!("tileset source template must be an absolute URL"))?;
+    if !url.path().contains(&tileset_id_marker)
+        || (source_template.contains(NAMESPACE) && !url.path().contains(&namespace_marker))
+    {
+        bail!("tileset source placeholders must appear in the URL path");
+    }
+
+    let (object_store, sample_path) = registry
+        .resolve(&url)
+        .with_context(|| format!("failed to resolve {}", redacted_source_label(&url)))?;
+    let sample_parts = sample_path.as_ref().split('/').collect::<Vec<_>>();
+    let mut parts = Vec::with_capacity(sample_parts.len());
+    for segment in sample_parts {
+        if segment == namespace_marker {
+            parts.push(TilesetPathPart::Namespace);
+            continue;
+        }
+        if segment.contains(&namespace_marker) {
+            bail!("{NAMESPACE} must occupy a complete URL path segment");
+        }
+        if let Some((prefix, suffix)) = segment.split_once(&tileset_id_marker) {
+            parts.push(TilesetPathPart::TilesetId {
+                prefix: prefix.to_string(),
+                suffix: suffix.to_string(),
+            });
+        } else {
+            parts.push(TilesetPathPart::Literal(segment.to_string()));
+        }
+    }
+    if !sample_path.as_ref().ends_with(".pmtiles") {
+        bail!("tileset source template path must end in .pmtiles");
+    }
+
+    Ok(TilesetSource {
+        object_store,
+        path: TilesetPath::Template(TilesetPathTemplate {
+            parts: parts.into_boxed_slice(),
+            tileset_id_includes_namespace: is_default && !source_template.contains(NAMESPACE),
+        }),
+    })
+}
+
+fn unique_template_marker(template: &str, prefix: &str) -> String {
+    let mut marker = prefix.to_string();
+    while template.contains(&marker) {
+        marker.push('x');
+    }
+    marker
 }
 
 fn normalize_source_url(source_url: &str) -> Result<Url> {
@@ -553,6 +702,130 @@ mod tests {
             object_path_under(&ObjectPath::default(), "japan").as_ref(),
             "japan.pmtiles"
         );
+    }
+
+    #[test]
+    fn tileset_templates_keep_namespace_available_to_the_default() {
+        let sources = TilesetSources::parse(
+            concat!(
+                "regional=memory:///tenants/{namespace}/{tileset_id}.pmtiles;",
+                "default=memory:///tilesets/{namespace}/{tileset_id}.pmtiles"
+            ),
+            &ObjectStoreRegistry::without_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sources.resolve("regional/streets").unwrap().1.as_ref(),
+            "tenants/regional/streets.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("analysis/population").unwrap().1.as_ref(),
+            "tilesets/analysis/population.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("planet").unwrap().1.as_ref(),
+            "tilesets/planet.pmtiles"
+        );
+    }
+
+    #[test]
+    fn default_template_without_namespace_preserves_the_complete_logical_id() {
+        let sources = TilesetSources::parse(
+            concat!(
+                "regional=memory:///regional/{tileset_id}.pmtiles;",
+                "default=memory:///tilesets/{tileset_id}.pmtiles"
+            ),
+            &ObjectStoreRegistry::without_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sources.resolve("regional/streets").unwrap().1.as_ref(),
+            "regional/streets.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("aaa/bbb").unwrap().1.as_ref(),
+            "tilesets/aaa/bbb.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("planet").unwrap().1.as_ref(),
+            "tilesets/planet.pmtiles"
+        );
+    }
+
+    #[test]
+    fn default_template_supports_literals_between_namespace_and_tileset_id() {
+        let sources = TilesetSources::parse(
+            "default=memory:///tilesets/{namespace}/intermediate/{tileset_id}.pmtiles",
+            &ObjectStoreRegistry::without_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sources.resolve("aaa/bbb").unwrap().1.as_ref(),
+            "tilesets/aaa/intermediate/bbb.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("planet").unwrap().1.as_ref(),
+            "tilesets/intermediate/planet.pmtiles"
+        );
+    }
+
+    #[test]
+    fn root_sources_keep_the_existing_relative_key_shorthand() {
+        let sources = TilesetSources::parse(
+            "regional=memory:///regional;default=memory:///tilesets",
+            &ObjectStoreRegistry::without_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sources.resolve("regional/streets").unwrap().1.as_ref(),
+            "regional/streets.pmtiles"
+        );
+        assert_eq!(
+            sources.resolve("analysis/population").unwrap().1.as_ref(),
+            "tilesets/analysis/population.pmtiles"
+        );
+    }
+
+    #[test]
+    fn tileset_template_markers_cannot_collide_with_literal_path_text() {
+        let sources = TilesetSources::parse(
+            concat!(
+                "memory:///mmpf-namespace-marker/",
+                "mmpf-tileset-id-marker/{namespace}/{tileset_id}.pmtiles"
+            ),
+            &ObjectStoreRegistry::without_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sources.resolve("analysis/population").unwrap().1.as_ref(),
+            concat!(
+                "mmpf-namespace-marker/mmpf-tileset-id-marker/",
+                "analysis/population.pmtiles"
+            )
+        );
+    }
+
+    #[test]
+    fn tileset_templates_reject_ambiguous_or_unsafe_placeholders() {
+        let registry = ObjectStoreRegistry::without_options();
+        for invalid in [
+            "memory:///tilesets/{namespace}/fixed.pmtiles",
+            "memory://{namespace}/{tileset_id}.pmtiles",
+            "memory:///tilesets/prefix-{namespace}/{tileset_id}.pmtiles",
+            "memory:///tilesets/{tileset_id}.pmtiles?other={unknown}",
+            "memory:///tilesets/{tileset_id}/{tileset_id}.pmtiles",
+            "memory:///tilesets/{tileset_id}",
+        ] {
+            assert!(
+                TilesetSources::parse(invalid, &registry).is_err(),
+                "accepted invalid tileset template {invalid:?}"
+            );
+        }
     }
 
     #[test]

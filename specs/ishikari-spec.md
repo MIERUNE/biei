@@ -65,7 +65,12 @@ existing contract merely because it wins one benchmark.
   Positive tiles, PMTiles directories, metadata, and backend chunks are treated
   as immutable and may remain cached until byte-capacity eviction. Replacing an
   archive under the same id is unsupported until an explicit invalidation
-  contract exists; publish changed content under a versioned id instead.
+  contract exists; publish changed content under a new immutable logical id
+  instead. A revision suffix is a publisher naming convention inside that id,
+  not a separate Ishikari version field.
+  Runtime reads do not perform per-request object-generation checks, so the
+  publishing workflow—not eventual cache convergence—must prevent or detect
+  overwrite of a live id.
 - TileJSON is derived from the PMTiles header and metadata. Ordinary tile
   requests serve the archive's stored format and `Content-Encoding`. Explicit
   `.mlt` requests, or `Accept: application/vnd.maplibre-tile` where supported,
@@ -83,6 +88,14 @@ existing contract merely because it wins one benchmark.
   the positive tile policy.
 
 ### Distributed resolution and backend access
+
+- `ISKR_TILESET_SOURCES` selects a root or URL template by the optional first
+  segment of the logical tileset id. A default template without `{namespace}`
+  expands `{tileset_id}` to the complete logical id. Named templates, and
+  templates with an explicit whole-segment `{namespace}`, expand `{tileset_id}`
+  to the id after the namespace. For a flat id an explicit namespace segment is
+  omitted. Root-only values remain shorthand for appending the selected relative
+  key and `.pmtiles`.
 
 - Nodes use a stable HRW key per resource class so a converged membership view
   selects the same preferred owner. Peer unavailability may add fallback work
@@ -121,6 +134,12 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
 
 ## Provider Resource Caching
 
+- Every peer in one protocol cluster must use equivalent provider catalog and
+  URL-template configuration. The caller's HRW placement identity includes its
+  resolved upstream URL, but the current internal request carries only logical
+  style/glyph/sprite identity; a configuration-skewed peer can therefore resolve
+  a different upstream. Mixed provider revisions are unsupported until the wire
+  contract binds and validates a bounded configuration revision.
 - Style, glyph, and sprite fetches honor upstream `Cache-Control` in both the
   pod-local shared cache and the public response. The normalized policy and
   current age must survive an internal peer hop. HTTP `Age` and `Date` contribute

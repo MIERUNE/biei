@@ -96,7 +96,7 @@ batch completes, then the VU sleeps for `1.2 +/- 0.5 s`. The runner uses the
 real resolver, caches, peer transport, single-flight, merge window, and backend
 fetch concurrency limit. Fixed backend and peer delays are controlled sweep
 inputs; fitted lognormal backend profiles are implemented. Terrain generation
-and shared CPU-admission queueing remain future work.
+and shared CPU-admission queueing are outside the current model.
 
 ## 3. Workload model — population-driven viewport walk
 
@@ -435,8 +435,6 @@ load.
 Structured production scheduler histograms and aggregate node request-load
 skew are included in current JSON reports.
 
-Remaining implementation work is tracked once in
-`../issues/ishikari-todo.md`.
 
 ## 10. Phase 2 latency and queueing
 
