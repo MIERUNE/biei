@@ -40,6 +40,8 @@ Before implementation, explicitly decide that built-in authentication is a produ
 7. **Registry expiry and rollback safety:** define forward-only rollback that preserves intervening revocation tombstones and requires separately audited explicit reactivation. Decide whether head/revisions carry signed `not_before`/`expires_at`, clock-skew bounds, and break-glass behavior. Monotonic numbering protects a running pod from regression but does not give a fresh pod anti-replay; decide whether object-store IAM/audit is sufficient or an external monotonic/transparency anchor is required.
 8. **First and second server order:** confirm the initial route set and acceptance tests, then name the second implementation that must exist before shared extraction.
 
+**Sequencing note.** The backend-capability check (#4) is the first concrete task, not a parallel one: a short spike proving `PutMode::Create` conflicts on an existing key and version-conditional head replacement rejects a stale generation on the *actual* production backend (GCS) must pass before committing to the schema or any server code. It converts the foundational CAS assumption into a tested fact; if it fails, the immutable-revision + conditional-head model itself needs rework, so nothing downstream should start first.
+
 ## Deferred capability/CDN decisions
 
 These block capability implementation but do not block registry tooling or strong entry-route authentication:

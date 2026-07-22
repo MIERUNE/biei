@@ -30,9 +30,11 @@ pub(crate) fn parse_pin_overlay(overlay: &str) -> Result<PinOverlay, OverlayPars
 }
 
 pub(super) fn validate_pin_overlay(overlay: &PinOverlay) -> Result<(), OverlayParseError> {
-    if overlay.label.as_ref().is_some_and(|label| {
-        label.len() != 1 || !label.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    }) {
+    if overlay
+        .label
+        .as_ref()
+        .is_some_and(|label| normalize_pin_label(label).is_none())
+    {
         return Err(OverlayParseError::InvalidPinLabel);
     }
     parse_optional_color(Some(&overlay.color))?;
@@ -50,15 +52,25 @@ fn parse_pin_head(value: &str) -> Result<(PinSize, Option<String>), OverlayParse
         _ => return Err(OverlayParseError::InvalidPinSize),
     };
     let label = match label {
-        Some(label)
-            if label.len() == 1 && label.bytes().all(|byte| byte.is_ascii_alphanumeric()) =>
-        {
-            Some(label.to_ascii_lowercase())
-        }
-        Some(_) => return Err(OverlayParseError::InvalidPinLabel),
+        Some(label) => Some(normalize_pin_label(label).ok_or(OverlayParseError::InvalidPinLabel)?),
         None => None,
     };
     Ok((size, label))
+}
+
+/// Normalize the Mapbox-compatible generated-pin label subset.
+///
+/// Letters are case-insensitive at ingress and stored lowercase because they
+/// are rendered uppercase. Numeric labels use their canonical decimal spelling
+/// in the documented inclusive range 0..=99; leading-zero spellings would only
+/// create duplicate cache/image identities and are rejected.
+fn normalize_pin_label(value: &str) -> Option<String> {
+    match value.as_bytes() {
+        [byte] if byte.is_ascii_alphabetic() => Some(value.to_ascii_lowercase()),
+        [byte] if byte.is_ascii_digit() => Some(value.to_string()),
+        [b'1'..=b'9', second] if second.is_ascii_digit() => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn parse_lng_lat(value: &str) -> Result<LngLat, OverlayParseError> {

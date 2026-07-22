@@ -1,10 +1,39 @@
 # Biei Decision Queue
 
-No Biei-specific implementation item is active. These entries are product or operational triggers, not a roadmap. Durable behavior belongs in [`../specs/biei-spec.md`](../specs/biei-spec.md), cross-cutting work belongs in [`refactor.md`](refactor.md), and missing upstream bindings belong in [`mln-rs-wishlist.md`](mln-rs-wishlist.md). Delete resolved entries; git history is the archive.
+No Biei-specific implementation item is currently active. This queue records
+bounded planned work and evidence-gated product or operational triggers; it is
+not an ordered roadmap. Durable behavior belongs in
+[`../specs/biei-spec.md`](../specs/biei-spec.md), cross-cutting work belongs in
+[`refactor.md`](refactor.md), and missing upstream bindings belong in
+[`mln-rs-wishlist.md`](mln-rs-wishlist.md). Delete resolved entries; git history
+is the archive.
 
 ## Compatibility and product triggers
 
-- **URL markers or text-layer pin labels:** add only for a concrete compatibility requirement. Current labels are intentionally rendered into request-local bitmaps.
+- **Object-storage custom marker images (planned):** support managed marker
+  images without accepting arbitrary request-supplied URLs. The request carries
+  a bounded logical marker ID; deployment configuration resolves that ID through
+  an object-storage root/template. Prefer a content-addressed immutable ID and
+  object so decoded images and rendered outputs can be cached without an
+  invalidation protocol. Before implementation:
+  - choose the public overlay syntax and object layout; exact Mapbox `url-*`
+    compatibility is not a goal if it would expose an arbitrary fetch target;
+  - decide whether Ishikari owns object-store access and serves the bounded
+    asset to Biei (preferred, so Biei does not acquire content-store
+    credentials) or whether a reusable provider abstraction justifies direct
+    access;
+  - reject path traversal and request-controlled schemes, authorities, query
+    strings, or object-store options after template expansion;
+  - define encoded-byte, decoded-dimension, total-pixel, format, and decode-time
+    limits; do not enable SVG or other active/externally referencing formats;
+  - reuse bounded cache and single-flight behavior, and include marker-fetch
+    waiting in resource-I/O metrics and the render deadline;
+  - include marker identity and rendering parameters in render-output cache
+    keys while keeping coordinates and overlay ordering unchanged; and
+  - test cold/warm fetches, duplicate marker reuse, missing/corrupt/oversized
+    objects, scale behavior, auto-fit/anchor behavior, and mixed overlay z-order.
+- **Text-layer pin labels:** add only for a concrete compatibility requirement.
+  Current labels are intentionally rendered into request-local bitmaps.
 - **Public ETag/304 handling:** add only if CDN or gateway validators are insufficient for measured traffic.
 - **Standard throughput fixture:** choose a local, fast provider fixture before publishing reproducible throughput comparisons.
 

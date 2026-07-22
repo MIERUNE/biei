@@ -135,7 +135,7 @@ pub(super) fn render_pin_image(pin: &PinOverlay) -> Result<image::DynamicImage, 
     };
     pixmap.stroke_path(&body, &stroke_paint, &stroke, Transform::identity(), None);
 
-    let label = pin.label.as_deref().and_then(|value| value.chars().next());
+    let label = pin.label.as_deref();
     if label.is_none()
         && let Some(dot) = PathBuilder::from_circle(cx, cy, radius * 0.35)
     {
@@ -345,48 +345,86 @@ pub(crate) fn configure_pin_label_font_path(
         .map_err(|_| anyhow::anyhow!("pin label font path is already configured"))
 }
 
-fn draw_label(image: &mut image::RgbaImage, ch: char, cx: f32, cy: f32, radius: f32, rgb: [u8; 3]) {
-    use ab_glyph::{Font, Glyph, PxScale, point};
+fn draw_label(
+    image: &mut image::RgbaImage,
+    label: &str,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    rgb: [u8; 3],
+) {
+    use ab_glyph::{Font, Glyph, PxScale, ScaleFont, point};
 
     let Some(font) = PIN_LABEL_FONT.get_or_init(load_pin_label_font).as_ref() else {
         return;
     };
 
-    let scale = PxScale::from(radius * 1.28);
-    let glyph_id = font.glyph_id(ch.to_ascii_uppercase());
-    let origin = Glyph {
-        id: glyph_id,
-        scale,
-        position: point(0.0, 0.0),
-    };
-    let Some(origin) = font.outline_glyph(origin) else {
-        return;
-    };
-    let bounds = origin.px_bounds();
-    let x = cx - (bounds.min.x + bounds.width() / 2.0);
-    let y = cy - (bounds.min.y + bounds.height() / 2.0) + 1.0;
-    let glyph = Glyph {
-        id: glyph_id,
-        scale,
-        position: point(x, y),
-    };
-    let Some(outlined) = font.outline_glyph(glyph) else {
-        return;
-    };
+    let label = label.to_ascii_uppercase();
+    let scale = PxScale::from(radius * if label.len() == 1 { 1.28 } else { 0.95 });
+    let scaled_font = font.as_scaled(scale);
+    let mut glyphs = Vec::with_capacity(label.len());
+    let mut caret = 0.0;
+    let mut previous = None;
+    for ch in label.chars() {
+        let glyph_id = scaled_font.glyph_id(ch);
+        if let Some(previous) = previous {
+            caret += scaled_font.kern(previous, glyph_id);
+        }
+        glyphs.push(Glyph {
+            id: glyph_id,
+            scale,
+            position: point(caret, 0.0),
+        });
+        caret += scaled_font.h_advance(glyph_id);
+        previous = Some(glyph_id);
+    }
 
-    let bounds = outlined.px_bounds();
-    outlined.draw(|x, y, coverage| {
-        let px = bounds.min.x.floor() as i32 + x as i32;
-        let py = bounds.min.y.floor() as i32 + y as i32;
-        if px < 0 || py < 0 {
+    let mut union: Option<ab_glyph::Rect> = None;
+    for glyph in &glyphs {
+        let Some(outlined) = font.outline_glyph(glyph.clone()) else {
             return;
-        }
-        let (px, py) = (px as u32, py as u32);
-        if px >= image.width() || py >= image.height() {
+        };
+        let bounds = outlined.px_bounds();
+        union = Some(match union {
+            Some(current) => ab_glyph::Rect {
+                min: point(
+                    current.min.x.min(bounds.min.x),
+                    current.min.y.min(bounds.min.y),
+                ),
+                max: point(
+                    current.max.x.max(bounds.max.x),
+                    current.max.y.max(bounds.max.y),
+                ),
+            },
+            None => bounds,
+        });
+    }
+    let Some(bounds) = union else {
+        return;
+    };
+    let dx = cx - (bounds.min.x + bounds.width() / 2.0);
+    let dy = cy - (bounds.min.y + bounds.height() / 2.0) + 1.0;
+
+    for mut glyph in glyphs {
+        glyph.position.x += dx;
+        glyph.position.y += dy;
+        let Some(outlined) = font.outline_glyph(glyph) else {
             return;
-        }
-        blend_pixel(image.get_pixel_mut(px, py), rgb, coverage);
-    });
+        };
+        let bounds = outlined.px_bounds();
+        outlined.draw(|x, y, coverage| {
+            let px = bounds.min.x.floor() as i32 + x as i32;
+            let py = bounds.min.y.floor() as i32 + y as i32;
+            if px < 0 || py < 0 {
+                return;
+            }
+            let (px, py) = (px as u32, py as u32);
+            if px >= image.width() || py >= image.height() {
+                return;
+            }
+            blend_pixel(image.get_pixel_mut(px, py), rgb, coverage);
+        });
+    }
 }
 
 fn load_pin_label_font() -> Option<ab_glyph::FontArc> {
@@ -483,6 +521,22 @@ mod tests {
             .filter(|pixel| pixel[0] < 40 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] > 0)
             .count();
         assert!(dark_pixels > 20);
+    }
+
+    #[test]
+    fn render_pin_image_draws_both_digits_of_a_two_digit_label() {
+        let ten = render_pin_image(&pin(Some("10")))
+            .expect("first two-digit pin renders")
+            .to_rgba8();
+        let eleven = render_pin_image(&pin(Some("11")))
+            .expect("second two-digit pin renders")
+            .to_rgba8();
+
+        assert_ne!(
+            ten.as_raw(),
+            eleven.as_raw(),
+            "the second digit must affect the rendered bitmap"
+        );
     }
 
     #[test]

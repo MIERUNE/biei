@@ -84,6 +84,26 @@ fn parses_pin_overlay_with_label() {
 }
 
 #[test]
+fn parses_pin_overlay_with_mapbox_numeric_labels() {
+    for label in ["0", "9", "10", "99"] {
+        let pin = parse_pin_overlay(&format!("pin-s-{label}+9ed4bd(139,35)"))
+            .expect("Mapbox-compatible numeric pin label parses");
+        assert_eq!(pin.label.as_deref(), Some(label));
+    }
+}
+
+#[test]
+fn rejects_pin_labels_outside_the_mapbox_letter_or_0_to_99_contract() {
+    for label in ["aa", "a1", "01", "100", "-1"] {
+        assert_eq!(
+            parse_pin_overlay(&format!("pin-s-{label}+9ed4bd(139,35)")).map(|_| ()),
+            Err(OverlayParseError::InvalidPinLabel),
+            "label {label:?} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_pin_overlay() {
     assert_eq!(
         parse_pin_overlay("pin-x+9ed4bd(139,35)").map(|_| ()),

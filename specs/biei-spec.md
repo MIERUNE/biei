@@ -310,6 +310,9 @@ are hard-bounded. The current overlay limit is 64.
 
 Pins are generated as 2x bitmaps and registered with a pixel ratio of 2. Their
 shape, shadow, label placement, and black/white label contrast are handled in
+the renderer. Generated-pin labels accept one ASCII letter or a canonical
+decimal number from `0` through `99`; letters are rendered uppercase. Maki icon
+names are not generated-pin labels.
 Provider-specific built-in icon names and URL marker images are not supported.
 
 `addlayer` accepts a policy-validated style layer JSON object. The JSON path via

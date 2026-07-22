@@ -684,6 +684,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_static_pin_overlay_with_two_digit_label() {
+        let task =
+            parse_static("/voyager-gl-style/static/pin-l-99+9ed4bd(139,35)/auto/256x256.png")
+                .expect("two-digit pin overlay parses");
+
+        let RenderRequest::StaticImage { overlays, .. } = task.request else {
+            panic!("expected static image request");
+        };
+        assert!(matches!(
+            overlays.as_slice(),
+            [StaticOverlay::Pin(pin)] if pin.label.as_deref() == Some("99")
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_style() {
         let err =
             parse_static("/carto/unknown/static/auto/256x256.png").expect_err("style is unknown");

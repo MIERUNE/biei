@@ -62,7 +62,12 @@ impl std::fmt::Display for OverlayParseError {
                 )
             }
             Self::InvalidPinSize => write!(f, "pin size must be s, m, or l"),
-            Self::InvalidPinLabel => write!(f, "pin label must be 1 ASCII alphanumeric character"),
+            Self::InvalidPinLabel => {
+                write!(
+                    f,
+                    "pin label must be one ASCII letter or a number from 0 to 99"
+                )
+            }
         }
     }
 }
